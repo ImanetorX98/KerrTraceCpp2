@@ -181,6 +181,7 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
     double rh=g.r_horizon(), dlam=1.0, prev_cos=std::cos(s.theta);
     Vec4d fsal=Vec4d::nan_init();
     for (int it=0; it<500000; ++it) {
+        const GeodesicState s_prev = s;
         int rejects = 0;
         while (!adaptive_step(g, s, dlam, intg, fsal)) {
             if (!std::isfinite(dlam) || ++rejects > 64)
@@ -189,9 +190,15 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
         if (s.r < rh*1.03)  return {Outcome::HORIZON,  s.r, 0.0};
         if (s.r > r_escape)  return {Outcome::ESCAPED,  s.r, 1.0, s.theta, s.phi};
         double cc=std::cos(s.theta);
-        if (prev_cos*cc<=0.0 && s.r>=r_disk_in && s.r<=r_disk_out)
-            return {Outcome::DISK_HIT, s.r,
-                    clamp(disk_redshift(s.r, s.pt, s.pphi, g), 0.0, 20.0)};
+        if (prev_cos*cc<=0.0) {
+            const double denom = prev_cos - cc;
+            double w = (std::abs(denom) > 1e-14) ? (prev_cos / denom) : 0.5;
+            w = clamp(w, 0.0, 1.0);
+            const double r_hit = s_prev.r + w*(s.r - s_prev.r);
+            if (r_hit>=r_disk_in && r_hit<=r_disk_out)
+                return {Outcome::DISK_HIT, r_hit,
+                        clamp(disk_redshift(r_hit, s.pt, s.pphi, g), 0.0, 20.0)};
+        }
         prev_cos=cc;
     }
     return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};

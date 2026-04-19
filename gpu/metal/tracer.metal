@@ -236,6 +236,7 @@ kernel void trace_pixel(
     // ── Trace ─────────────────────────────────────────────────
     float r = r0, theta = th0;
     float dlam = 1.0f;
+    float prev_r = r0;
     float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
@@ -265,20 +266,30 @@ kernel void trace_pixel(
         if (r > cp.r_obs * 1.05f)     break;
 
         const float cos_th = cos(theta);
-        if (prev_cos*cos_th <= 0.0f && r >= kp.r_isco && r <= kp.r_disk_out) {
+        if (prev_cos*cos_th <= 0.0f) {
+            const float denom = prev_cos - cos_th;
+            float w = (abs(denom) > 1e-8f) ? (prev_cos / denom) : 0.5f;
+            w = clamp(w, 0.0f, 1.0f);
+            const float r_hit = prev_r + w*(r - prev_r);
+            if (!(r_hit >= kp.r_isco && r_hit <= kp.r_disk_out)) {
+                prev_cos = cos_th;
+                prev_r = r;
+                continue;
+            }
+
             // Disk hit
-            const float Omega = keplerian_omega(r, M, a, Q, L);
+            const float Omega = keplerian_omega(r_hit, M, a, Q, L);
             const float b_ip  = pphi / (-pt);
             float gll2[4][4];
-            gLL_BL(r, M_PI_2_F, M, a, Q, L, gll2);
+            gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
             const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
             const float dv = 1.0f - Omega*b_ip;
             float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
             red = clamp(red, 0.0f, 20.0f);
 
-            const float T0 = 2e6f * pow(r/(6.0f*M), -0.75f);
+            const float T0 = 2e6f * pow(r_hit/(6.0f*M), -0.75f);
             const float T  = T0 * clamp(red, 0.1f, 10.0f);
-            const float I  = clamp(pow(red, 4.0f)*pow(6.0f*M/r, 3.0f), 0.0f, 2.5f);
+            const float I  = clamp(pow(red, 4.0f)*pow(6.0f*M/r_hit, 3.0f), 0.0f, 2.5f);
             float4 c = blackbody_rgb(T) * I;
             c = clamp(c, 0.0f, 1.0f);
 
@@ -290,6 +301,7 @@ kernel void trace_pixel(
             break;
         }
         prev_cos = cos_th;
+        prev_r = r;
     }
 
     output[py * cp.width + px] = colour;

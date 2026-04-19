@@ -166,6 +166,7 @@ __global__ void trace_kernel(uint32_t*              output,
     }
 
     double r=r0, theta=th0, dlam=1.0;
+    double prev_r=r0;
     double prev_cos=cos(th0);
     uint32_t colour=0xFF000000u;
 
@@ -192,18 +193,28 @@ __global__ void trace_kernel(uint32_t*              output,
         if(r > cp.r_obs*1.05)     break;
 
         double cos_th=cos(theta);
-        if(prev_cos*cos_th<=0.0 && r>=kp.r_isco && r<=kp.r_disk_out){
-            double Omega=d_keplerian_omega(r, M, a, Q, L);
+        if(prev_cos*cos_th<=0.0){
+            double denom = prev_cos - cos_th;
+            double w = (fabs(denom) > 1e-12) ? (prev_cos / denom) : 0.5;
+            w = fmax(0.0, fmin(1.0, w));
+            double r_hit = prev_r + w*(r - prev_r);
+            if(!(r_hit>=kp.r_isco && r_hit<=kp.r_disk_out)){
+                prev_cos=cos_th;
+                prev_r=r;
+                continue;
+            }
+
+            double Omega=d_keplerian_omega(r_hit, M, a, Q, L);
             double b_=pphi/(-pt);
-            double gl2[4][4]; d_gLL(r, M_PI/2.0, M, a, Q, L, gl2);
+            double gl2[4][4]; d_gLL(r_hit, M_PI/2.0, M, a, Q, L, gl2);
             double d2=-(gl2[0][0]+2.0*gl2[0][3]*Omega+gl2[3][3]*Omega*Omega);
             double dv=1.0-Omega*b_;
             double red=(d2>0.0&&fabs(dv)>1e-10)?sqrt(d2)/dv:1.0;
             red=fmax(0.0,fmin(20.0,red));
 
-            double T0=2e6*pow(r/(6.0*M),-0.75);
+            double T0=2e6*pow(r_hit/(6.0*M),-0.75);
             double T =T0*fmax(0.1,fmin(10.0,red));
-            double I =fmax(0.0,fmin(2.5,pow(red,4.0)*pow(6.0*M/r,3.0)));
+            double I =fmax(0.0,fmin(2.5,pow(red,4.0)*pow(6.0*M/r_hit,3.0)));
 
             uchar4 c=d_blackbody(T);
             double R=fmin(c.x*I/255.0,1.0)*255;
@@ -213,6 +224,7 @@ __global__ void trace_kernel(uint32_t*              output,
             break;
         }
         prev_cos=cos_th;
+        prev_r=r;
     }
     output[py*cp.width+px]=colour;
 }

@@ -316,6 +316,7 @@ static BundleResult trace_bundle(int px, int py,
     double prev_cos  = std::cos(bs.geo.theta);
 
     for (int iter = 0; iter < 500000; ++iter) {
+        const BundleState bs_prev = bs;
         int rejects = 0;
         while (!bundle_adaptive(g, bs, dlam)) {
             if (!std::isfinite(dlam) || ++rejects > 64) return {};
@@ -329,12 +330,21 @@ static BundleResult trace_bundle(int px, int py,
         const double cos_th = std::cos(bs.geo.theta);
         const bool crossed  = (prev_cos * cos_th <= 0.0);
 
-        if (crossed && r >= r_disk_in && r <= r_disk_out) {
+        if (crossed) {
+            const double denom = prev_cos - cos_th;
+            double w = (std::abs(denom) > 1e-14) ? (prev_cos / denom) : 0.5;
+            w = w < 0.0 ? 0.0 : w > 1.0 ? 1.0 : w;
+            const double r_hit = bs_prev.geo.r + w*(bs.geo.r - bs_prev.geo.r);
+            if (!(r_hit >= r_disk_in && r_hit <= r_disk_out)) {
+                prev_cos = cos_th;
+                continue;
+            }
+
             // ── Redshift ──────────────────────────────────────
-            const double Omega = g.keplerian_omega(r);
+            const double Omega = g.keplerian_omega(r_hit);
             const double b     = bs.geo.pphi / (-bs.geo.pt);
             double gLL[4][4];
-            g.covariant_BL(r, M_PI/2.0, gLL);
+            g.covariant_BL(r_hit, M_PI/2.0, gLL);
             const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
             const double dv = 1.0 - Omega*b;
             double red = (d2 > 0.0 && std::abs(dv) > 1e-10)
@@ -348,15 +358,15 @@ static BundleResult trace_bundle(int px, int py,
             // via the disk metric: dφ ≈ (dθ/dr_disk) · W[1] ... complex.
             // Simpler: use only the 2×2 sub-block (δr, δθ) as proxy for
             // (δr_disk, δφ_disk)  — gives the right shape up to a constant.
-            const double J00 = bs.W[0][0];   // ∂r_disk / ∂α
-            const double J01 = bs.W[0][1];   // ∂r_disk / ∂β
-            const double J10 = bs.W[1][0];   // ∂θ      / ∂α  (≈ ∂φ proxy)
-            const double J11 = bs.W[1][1];   // ∂θ      / ∂β
+            const double J00 = bs_prev.W[0][0] + w*(bs.W[0][0] - bs_prev.W[0][0]);
+            const double J01 = bs_prev.W[0][1] + w*(bs.W[0][1] - bs_prev.W[0][1]);
+            const double J10 = bs_prev.W[1][0] + w*(bs.W[1][0] - bs_prev.W[1][0]);
+            const double J11 = bs_prev.W[1][1] + w*(bs.W[1][1] - bs_prev.W[1][1]);
 
             double det = std::abs(J00*J11 - J01*J10);
             det = det < 1e-12 ? 1e-12 : det;
 
-            return {true, r, red, det};
+            return {true, r_hit, red, det};
         }
         prev_cos = cos_th;
     }
