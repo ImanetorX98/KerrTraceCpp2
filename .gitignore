@@ -1,0 +1,25 @@
+# Build outputs
+build/
+out/*.ppm
+out/*.png
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Node
+server/node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.angular/
+
+# C++ compiled
+*.o
+*.a
+*.dylib
+*.so
+
+# Editor
+.vscode/
+.idea/
+*.swp

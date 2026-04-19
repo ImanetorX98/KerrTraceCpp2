@@ -1,0 +1,181 @@
+<div class="page">
+
+  <!-- ── Header ─────────────────────────────────────────────── -->
+  <header style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+    <div>
+      <h1 style="margin:0;font-size:20px;font-weight:700;letter-spacing:-.02em">
+        KNdS Ray Tracer
+      </h1>
+      <div style="font-size:12px;color:#8b949e;margin-top:2px">
+        Kerr-Newman-de Sitter relativistic renderer
+      </div>
+    </div>
+    <span class="status-chip" [class]="status()">
+      <span *ngIf="status()==='idle'">Idle</span>
+      <span *ngIf="status()==='running'">Rendering…</span>
+      <span *ngIf="status()==='done'">Done</span>
+      <span *ngIf="status()==='error'">Error</span>
+    </span>
+  </header>
+
+  <div class="grid">
+
+    <!-- ── Left panel: parameters ──────────────────────────── -->
+    <div>
+
+      <!-- Resolution -->
+      <div class="panel" style="margin-bottom:16px">
+        <h2>Resolution</h2>
+        <mat-button-toggle-group [(ngModel)]="params.resolution" style="width:100%">
+          <mat-button-toggle *ngFor="let r of info?.resolutions ?? []" [value]="r"
+                             style="flex:1;min-width:50px;font-size:12px">
+            {{r}}
+          </mat-button-toggle>
+        </mat-button-toggle-group>
+      </div>
+
+      <!-- Black hole parameters -->
+      <div class="panel" style="margin-bottom:16px">
+        <h2>Black Hole</h2>
+
+        <div class="param-row">
+          <label>Spin <i>a/M</i></label>
+          <mat-slider min="0" max="0.9999" step="0.001" style="flex:1">
+            <input matSliderThumb [(ngModel)]="params.a">
+          </mat-slider>
+          <span class="val">{{fmt(params.a, 3)}}</span>
+        </div>
+
+        <div class="param-row">
+          <label>Disk r<sub>out</sub></label>
+          <mat-slider min="6" max="60" step="0.5" style="flex:1">
+            <input matSliderThumb [(ngModel)]="params.disk_out">
+          </mat-slider>
+          <span class="val">{{fmt(params.disk_out, 1)}} M</span>
+        </div>
+      </div>
+
+      <!-- Camera parameters -->
+      <div class="panel" style="margin-bottom:16px">
+        <h2>Camera</h2>
+
+        <div class="param-row">
+          <label>Inclination</label>
+          <mat-slider min="1" max="89" step="1" style="flex:1">
+            <input matSliderThumb [(ngModel)]="params.theta">
+          </mat-slider>
+          <span class="val">{{fmt(params.theta, 0)}}°</span>
+        </div>
+
+        <div class="param-row">
+          <label><i>r</i><sub>obs</sub></label>
+          <mat-slider min="5" max="500" step="1" style="flex:1">
+            <input matSliderThumb [(ngModel)]="params.r_obs">
+          </mat-slider>
+          <span class="val">{{fmt(params.r_obs, 0)}} M</span>
+        </div>
+      </div>
+
+      <!-- Render options -->
+      <div class="panel" style="margin-bottom:16px">
+        <h2>Options</h2>
+
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <mat-slide-toggle [(ngModel)]="params.bundles">
+            Ray bundles (antialiasing + magnification)
+          </mat-slide-toggle>
+          <mat-slide-toggle [(ngModel)]="params.dopri5">
+            DOPRI5 integrator (instead of RK4)
+          </mat-slide-toggle>
+        </div>
+
+        <hr class="divider">
+
+        <!-- Background selector -->
+        <h2>Background HDRI</h2>
+        <mat-select [(ngModel)]="params.background" placeholder="None">
+          <mat-option value="">None</mat-option>
+          <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg">
+            {{bg}}
+          </mat-option>
+        </mat-select>
+      </div>
+
+      <!-- Actions -->
+      <div class="actions">
+        <button mat-flat-button color="primary"
+                [disabled]="status()==='running'"
+                (click)="startRender()"
+                style="flex:1">
+          <mat-icon>play_arrow</mat-icon>
+          Render
+        </button>
+        <button mat-stroked-button color="warn"
+                [disabled]="status()!=='running'"
+                (click)="cancelRender()">
+          <mat-icon>stop</mat-icon>
+          Cancel
+        </button>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-wrap" *ngIf="status()==='running'">
+        <div class="progress-info">
+          <span>{{progress()}}%</span>
+          <span *ngIf="eta() > 0">ETA {{fmt(eta(), 0)}}s · {{fmt(elapsed(), 0)}}s elapsed</span>
+        </div>
+        <mat-progress-bar mode="determinate" [value]="progress()"></mat-progress-bar>
+      </div>
+
+      <!-- Log -->
+      <div *ngIf="logLines().length > 0"
+           style="margin-top:12px;background:#010409;border:1px solid #30363d;
+                  border-radius:6px;padding:8px;max-height:120px;overflow-y:auto;
+                  font-size:11px;font-family:monospace;color:#8b949e;line-height:1.5">
+        <div *ngFor="let l of logLines()">{{l}}</div>
+      </div>
+    </div>
+
+    <!-- ── Right panel: viewer + gallery ───────────────────── -->
+    <div>
+
+      <!-- Render viewer -->
+      <div class="render-view">
+        <img *ngIf="previewUrl()" [src]="previewUrl()!" alt="render" />
+        <span class="render-placeholder" *ngIf="!previewUrl()">
+          No render yet — press Render to start
+        </span>
+      </div>
+
+      <!-- Gallery -->
+      <div class="panel" style="margin-top:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <h2 style="margin:0">Render history</h2>
+          <button mat-icon-button matTooltip="Refresh" (click)="loadRenders()">
+            <mat-icon>refresh</mat-icon>
+          </button>
+        </div>
+
+        <div class="gallery" *ngIf="renders.length > 0; else noRenders">
+          <div class="gallery-thumb"
+               *ngFor="let r of renders"
+               [class.active]="r.name === activeRender"
+               (click)="selectRender(r.name)">
+            <img [src]="svc.renderUrl(r.name)" [alt]="r.name"
+                 loading="lazy" />
+            <div class="fname" [title]="r.name">
+              {{r.name}} · {{fmtSize(r.size)}}
+            </div>
+          </div>
+        </div>
+
+        <ng-template #noRenders>
+          <div style="color:#8b949e;font-size:13px;margin-top:8px">
+            No renders yet.
+          </div>
+        </ng-template>
+      </div>
+    </div>
+
+  </div>
+</div>

@@ -1,0 +1,195 @@
+@use '@angular/material' as mat;
+
+html, body {
+  height: 100%;
+  margin: 0;
+  font-family: Roboto, "Helvetica Neue", sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+// ── Material dark theme ────────────────────────────────────────
+@include mat.theme((
+  color: (
+    theme-type: dark,
+    primary: mat.$violet-palette,
+    tertiary: mat.$cyan-palette
+  ),
+  typography: Roboto,
+  density: 0
+));
+
+// ── Layout ─────────────────────────────────────────────────────
+.page {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 24px;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .grid { grid-template-columns: 1fr; }
+}
+
+// ── Panel card ─────────────────────────────────────────────────
+.panel {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 20px;
+}
+
+.panel h2 {
+  margin: 0 0 16px;
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: #8b949e;
+}
+
+// ── Sliders ────────────────────────────────────────────────────
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.param-row label {
+  width: 90px;
+  font-size: 13px;
+  color: #8b949e;
+  flex-shrink: 0;
+}
+
+.param-row mat-slider { flex: 1; }
+
+.param-row .val {
+  width: 52px;
+  font-size: 13px;
+  text-align: right;
+  color: #e6edf3;
+  font-family: monospace;
+}
+
+// ── Progress bar ───────────────────────────────────────────────
+.progress-wrap {
+  margin-top: 16px;
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #8b949e;
+  margin-bottom: 4px;
+}
+
+// ── Image viewer ───────────────────────────────────────────────
+.render-view {
+  position: relative;
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+}
+
+.render-view img {
+  max-width: 100%;
+  max-height: 70vh;
+  display: block;
+}
+
+.render-placeholder {
+  color: #30363d;
+  font-size: 14px;
+  user-select: none;
+}
+
+// ── Gallery ────────────────────────────────────────────────────
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.gallery-thumb {
+  cursor: pointer;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 2px solid transparent;
+  transition: border-color .15s;
+}
+
+.gallery-thumb:hover,
+.gallery-thumb.active {
+  border-color: #6e40c9;
+}
+
+.gallery-thumb img {
+  width: 100%;
+  aspect-ratio: 16/9;
+  object-fit: cover;
+  display: block;
+}
+
+.gallery-thumb .fname {
+  font-size: 10px;
+  color: #8b949e;
+  padding: 2px 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: #161b22;
+}
+
+// ── Status chip ────────────────────────────────────────────────
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-chip.idle    { background: #21262d; color: #8b949e; }
+.status-chip.running { background: #1f3a1f; color: #56d364; }
+.status-chip.done    { background: #1a2c3d; color: #58a6ff; }
+.status-chip.error   { background: #3d1a1a; color: #f85149; }
+
+// ── Buttons ────────────────────────────────────────────────────
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+// ── Resolution selector ────────────────────────────────────────
+mat-button-toggle-group {
+  flex-wrap: wrap;
+}
+
+// ── Section divider ────────────────────────────────────────────
+.divider {
+  border: none;
+  border-top: 1px solid #30363d;
+  margin: 16px 0;
+}
