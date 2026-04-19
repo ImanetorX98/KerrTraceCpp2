@@ -73,7 +73,9 @@ public:
 
         const double pUr   = -ca*cb / sqrt_grr;
         const double pUth  = -sb    / sqrt_gthth;
-        const double pUphi =  sa*cb / sqrt_gphph;
+        // Keep image orientation consistent with the Metal backend and
+        // the expected spin convention: a>0 bright side on the left.
+        const double pUphi = -sa*cb / sqrt_gphph;
         const double pUt   =  1.0;
 
         // Covariant momenta  p_μ = g_μν p^ν  (only non-zero off-diag: g_tφ)

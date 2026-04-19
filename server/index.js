@@ -185,6 +185,8 @@ app.post('/api/render', (req, res) => {
 
   if (p.bundles)  args.push('--bundles');
   if (p.dopri5)   args.push('--dopri5');
+  if (p.integration_chart === 'bl') args.push('--bl');
+  else args.push('--ks');
 
   if (p.a      !== undefined) args.push('--a',       String(p.a));
   if (p.disk_out !== undefined) args.push('--disk-out', String(p.disk_out));

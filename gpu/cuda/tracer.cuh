@@ -14,8 +14,9 @@ struct KNdSParams_CUDA {
 };
 
 struct CameraParams_CUDA {
-    double r_obs, theta_obs, fov_h;
+    double r_obs, theta_obs, phi_obs, fov_h;
     int    width, height;
+    int    chart; // 0 = BL, 1 = KS
 };
 
 /// Launch the CUDA kernel and return the rendered RGBA buffer.

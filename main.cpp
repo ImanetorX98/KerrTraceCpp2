@@ -22,6 +22,7 @@
 #include "stb_image_write.h"
 
 #include <atomic>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -158,6 +159,7 @@ struct BackgroundImage {
 
 // ── Geodesic trace helpers ────────────────────────────────────
 enum class Outcome { ESCAPED, DISK_HIT, HORIZON };
+enum class CoordinateChart { KS, BL };
 struct TraceResult {
     Outcome out; double r, redshift;
     double theta_esc=0.0, phi_esc=0.0;
@@ -202,6 +204,302 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
         prev_cos=cc;
     }
     return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+}
+
+// ── KS single-ray tracing (CPU) ───────────────────────────────
+// Uses Kerr-Schild Cartesian coordinates (Lambda=0 chart) with
+// numerical Hamiltonian gradients in (X,Y,Z).
+struct KSState {
+    double X, Y, Z;
+    double pX, pY, pZ;
+    double pT; // conserved (stationary metric)
+};
+
+static constexpr bool KS_INGOING = true;
+
+static bool solve_3x3(const double A_in[3][3], const double b_in[3], double x[3]) {
+    double A[3][4] = {
+        {A_in[0][0], A_in[0][1], A_in[0][2], b_in[0]},
+        {A_in[1][0], A_in[1][1], A_in[1][2], b_in[1]},
+        {A_in[2][0], A_in[2][1], A_in[2][2], b_in[2]},
+    };
+
+    for (int col = 0; col < 3; ++col) {
+        int piv = col;
+        double best = std::abs(A[piv][col]);
+        for (int r = col + 1; r < 3; ++r) {
+            const double v = std::abs(A[r][col]);
+            if (v > best) { best = v; piv = r; }
+        }
+        if (best < 1e-14) return false;
+        if (piv != col) {
+            for (int k = col; k < 4; ++k) std::swap(A[col][k], A[piv][k]);
+        }
+
+        const double inv = 1.0 / A[col][col];
+        for (int k = col; k < 4; ++k) A[col][k] *= inv;
+        for (int r = 0; r < 3; ++r) {
+            if (r == col) continue;
+            const double f = A[r][col];
+            for (int k = col; k < 4; ++k) A[r][k] -= f * A[col][k];
+        }
+    }
+
+    x[0] = A[0][3];
+    x[1] = A[1][3];
+    x[2] = A[2][3];
+    return true;
+}
+
+static void jacobian_bl_to_ks(double r, double theta, double phi, double a_spin, double J[3][3]) {
+    const double er  = 1e-6 * (std::abs(r) + 1.0);
+    const double eth = 1e-6;
+    const double eph = 1e-6;
+
+    auto f = [&](double rr, double tt, double pp) {
+        double X, Y, Z;
+        KNdSMetric::BL_to_KS_spatial(rr, tt, pp, a_spin, X, Y, Z);
+        return std::array<double, 3>{X, Y, Z};
+    };
+
+    const auto xr_p = f(r + er, theta, phi);
+    const auto xr_m = f(r - er, theta, phi);
+    const auto xt_p = f(r, theta + eth, phi);
+    const auto xt_m = f(r, theta - eth, phi);
+    const auto xp_p = f(r, theta, phi + eph);
+    const auto xp_m = f(r, theta, phi - eph);
+
+    for (int i = 0; i < 3; ++i) {
+        J[i][0] = (xr_p[i] - xr_m[i]) / (2.0 * er);   // d(X,Y,Z)/dr
+        J[i][1] = (xt_p[i] - xt_m[i]) / (2.0 * eth);  // d(X,Y,Z)/dtheta
+        J[i][2] = (xp_p[i] - xp_m[i]) / (2.0 * eph);  // d(X,Y,Z)/dphi
+    }
+}
+
+static bool bl_covector_to_ks(double r, double theta, double phi, double a_spin,
+                              double pr, double ptheta, double pphi,
+                              double& pX, double& pY, double& pZ) {
+    double J[3][3];
+    jacobian_bl_to_ks(r, theta, phi, a_spin, J);
+
+    // p_q = J^T p_xyz
+    double A[3][3];
+    for (int j = 0; j < 3; ++j)
+        for (int i = 0; i < 3; ++i)
+            A[j][i] = J[i][j];
+    const double b[3] = {pr, ptheta, pphi};
+    double x[3];
+    if (!solve_3x3(A, b, x)) return false;
+    pX = x[0]; pY = x[1]; pZ = x[2];
+    return true;
+}
+
+static std::array<double, 3> ks_covector_to_bl(double r, double theta, double phi, double a_spin,
+                                                double pX, double pY, double pZ) {
+    double J[3][3];
+    jacobian_bl_to_ks(r, theta, phi, a_spin, J);
+    std::array<double, 3> pbl{};
+    const double pxyz[3] = {pX, pY, pZ};
+    // p_q = J^T p_xyz
+    for (int j = 0; j < 3; ++j)
+        for (int i = 0; i < 3; ++i)
+            pbl[j] += J[i][j] * pxyz[i];
+    return pbl;
+}
+
+static bool init_ks_state(const GeodesicState& s_bl, const KNdSMetric& g, KSState& s_ks) {
+    if (std::abs(g.Lambda) > 1e-15) return false;
+
+    KNdSMetric::BL_to_KS_spatial(s_bl.r, s_bl.theta, s_bl.phi, g.a, s_ks.X, s_ks.Y, s_ks.Z);
+    if (!bl_covector_to_ks(s_bl.r, s_bl.theta, s_bl.phi, g.a,
+                           s_bl.pr, s_bl.ptheta, s_bl.pphi,
+                           s_ks.pX, s_ks.pY, s_ks.pZ)) {
+        return false;
+    }
+
+    double gUU[4][4];
+    g.contravariant_KS(0.0, s_ks.X, s_ks.Y, s_ks.Z, KS_INGOING, gUU);
+    const double A = gUU[0][0];
+    const double B = 2.0 * (gUU[0][1] * s_ks.pX + gUU[0][2] * s_ks.pY + gUU[0][3] * s_ks.pZ);
+    const double C =
+        gUU[1][1] * s_ks.pX * s_ks.pX + gUU[2][2] * s_ks.pY * s_ks.pY + gUU[3][3] * s_ks.pZ * s_ks.pZ +
+        2.0 * gUU[1][2] * s_ks.pX * s_ks.pY + 2.0 * gUU[1][3] * s_ks.pX * s_ks.pZ + 2.0 * gUU[2][3] * s_ks.pY * s_ks.pZ;
+    const double disc = B * B - 4.0 * A * C;
+    if (disc < 0.0 || std::abs(A) < 1e-15) return false;
+
+    const double sq = std::sqrt(disc);
+    const double pT1 = (-B - sq) / (2.0 * A);
+    const double pT2 = (-B + sq) / (2.0 * A);
+    s_ks.pT = (pT1 < 0.0) ? pT1 : pT2;
+    if (s_ks.pT > 0.0) s_ks.pT = std::min(pT1, pT2);
+    return std::isfinite(s_ks.pT);
+}
+
+static void geodesic_rhs_ks(const KNdSMetric& g, const KSState& s,
+                            double& dX, double& dY, double& dZ,
+                            double& dpX, double& dpY, double& dpZ) {
+    double gUU[4][4];
+    g.contravariant_KS(0.0, s.X, s.Y, s.Z, KS_INGOING, gUU);
+
+    dX = gUU[1][0] * s.pT + gUU[1][1] * s.pX + gUU[1][2] * s.pY + gUU[1][3] * s.pZ;
+    dY = gUU[2][0] * s.pT + gUU[2][1] * s.pX + gUU[2][2] * s.pY + gUU[2][3] * s.pZ;
+    dZ = gUU[3][0] * s.pT + gUU[3][1] * s.pX + gUU[3][2] * s.pY + gUU[3][3] * s.pZ;
+
+    auto Hxyz = [&](double X, double Y, double Z) {
+        double p[4] = {s.pT, s.pX, s.pY, s.pZ};
+        return g.hamiltonian_KS(0.0, X, Y, Z, p, KS_INGOING);
+    };
+
+    const double eX = 1e-5 * (std::abs(s.X) + 0.1);
+    const double eY = 1e-5 * (std::abs(s.Y) + 0.1);
+    const double eZ = 1e-5 * (std::abs(s.Z) + 0.1);
+
+    dpX = -(Hxyz(s.X + eX, s.Y, s.Z) - Hxyz(s.X - eX, s.Y, s.Z)) / (2.0 * eX);
+    dpY = -(Hxyz(s.X, s.Y + eY, s.Z) - Hxyz(s.X, s.Y - eY, s.Z)) / (2.0 * eY);
+    dpZ = -(Hxyz(s.X, s.Y, s.Z + eZ) - Hxyz(s.X, s.Y, s.Z - eZ)) / (2.0 * eZ);
+}
+
+static void rk4_step_ks(const KNdSMetric& g, KSState& s, double dlam) {
+    double dX1, dY1, dZ1, dpX1, dpY1, dpZ1;
+    double dX2, dY2, dZ2, dpX2, dpY2, dpZ2;
+    double dX3, dY3, dZ3, dpX3, dpY3, dpZ3;
+    double dX4, dY4, dZ4, dpX4, dpY4, dpZ4;
+
+    const KSState s0 = s;
+
+    geodesic_rhs_ks(g, s0, dX1, dY1, dZ1, dpX1, dpY1, dpZ1);
+    KSState s2{s0.X + 0.5 * dlam * dX1, s0.Y + 0.5 * dlam * dY1, s0.Z + 0.5 * dlam * dZ1,
+               s0.pX + 0.5 * dlam * dpX1, s0.pY + 0.5 * dlam * dpY1, s0.pZ + 0.5 * dlam * dpZ1,
+               s0.pT};
+    geodesic_rhs_ks(g, s2, dX2, dY2, dZ2, dpX2, dpY2, dpZ2);
+
+    KSState s3{s0.X + 0.5 * dlam * dX2, s0.Y + 0.5 * dlam * dY2, s0.Z + 0.5 * dlam * dZ2,
+               s0.pX + 0.5 * dlam * dpX2, s0.pY + 0.5 * dlam * dpY2, s0.pZ + 0.5 * dlam * dpZ2,
+               s0.pT};
+    geodesic_rhs_ks(g, s3, dX3, dY3, dZ3, dpX3, dpY3, dpZ3);
+
+    KSState s4{s0.X + dlam * dX3, s0.Y + dlam * dY3, s0.Z + dlam * dZ3,
+               s0.pX + dlam * dpX3, s0.pY + dlam * dpY3, s0.pZ + dlam * dpZ3,
+               s0.pT};
+    geodesic_rhs_ks(g, s4, dX4, dY4, dZ4, dpX4, dpY4, dpZ4);
+
+    s.X  += dlam / 6.0 * (dX1 + 2.0 * dX2 + 2.0 * dX3 + dX4);
+    s.Y  += dlam / 6.0 * (dY1 + 2.0 * dY2 + 2.0 * dY3 + dY4);
+    s.Z  += dlam / 6.0 * (dZ1 + 2.0 * dZ2 + 2.0 * dZ3 + dZ4);
+    s.pX += dlam / 6.0 * (dpX1 + 2.0 * dpX2 + 2.0 * dpX3 + dpX4);
+    s.pY += dlam / 6.0 * (dpY1 + 2.0 * dpY2 + 2.0 * dpY3 + dpY4);
+    s.pZ += dlam / 6.0 * (dpZ1 + 2.0 * dpZ2 + 2.0 * dpZ3 + dpZ4);
+}
+
+static bool rk4_adaptive_ks(const KNdSMetric& g, KSState& s, double& dlam, double tol = 1e-7) {
+    const KSState s0 = s;
+    KSState sA = s0;
+    rk4_step_ks(g, sA, dlam);
+    KSState sB = s0;
+    rk4_step_ks(g, sB, 0.5 * dlam);
+    rk4_step_ks(g, sB, 0.5 * dlam);
+
+    const double err = std::sqrt(
+        (sA.X  - sB.X)  * (sA.X  - sB.X)  +
+        (sA.Y  - sB.Y)  * (sA.Y  - sB.Y)  +
+        (sA.Z  - sB.Z)  * (sA.Z  - sB.Z)  +
+        (sA.pX - sB.pX) * (sA.pX - sB.pX) +
+        (sA.pY - sB.pY) * (sA.pY - sB.pY) +
+        (sA.pZ - sB.pZ) * (sA.pZ - sB.pZ)) / 15.0;
+
+    if (!std::isfinite(err)) {
+        s = s0;
+        dlam = (std::isfinite(dlam) && dlam > 1e-10) ? dlam * 0.5 : 1e-6;
+        if (dlam < 1e-10) dlam = 1e-10;
+        return false;
+    }
+
+    const bool accepted = (err < tol || dlam < 1e-10);
+    if (accepted) {
+        s = sB;
+        const double scale = (err > 1e-14) ? 0.9 * std::pow(tol / err, 0.2) : 4.0;
+        double hnew = dlam * scale;
+        if (!std::isfinite(hnew)) hnew = dlam;
+        dlam = clamp(hnew, 1e-10, 100.0);
+    } else {
+        s = s0;
+        const double half = dlam * 0.5;
+        double hnew = dlam * 0.9 * std::pow(tol / err, 0.25);
+        if (!std::isfinite(hnew)) hnew = half;
+        dlam = hnew;
+        if (dlam > half) dlam = half;
+        if (dlam < 1e-10) dlam = 1e-10;
+    }
+    return accepted;
+}
+
+static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
+                                   double r_disk_in, double r_disk_out,
+                                   double r_escape,
+                                   Integrator intg=Integrator::RK4_DOUBLING) {
+    KSState s{};
+    if (!init_ks_state(s_bl, g, s))
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg);
+
+    if (intg == Integrator::DOPRI5) {
+        static bool warned_dopri5_ks = false;
+        if (!warned_dopri5_ks) {
+            std::cerr << "Info: KS chart currently uses RK4-doubling; ignoring --dopri5.\n";
+            warned_dopri5_ks = true;
+        }
+    }
+
+    const double rh = g.r_horizon();
+    double dlam = 1.0;
+    double prev_Z = s.Z;
+
+    for (int it = 0; it < 500000; ++it) {
+        const KSState s_prev = s;
+        int rejects = 0;
+        while (!rk4_adaptive_ks(g, s, dlam)) {
+            if (!std::isfinite(dlam) || ++rejects > 64) {
+                double r_tmp, th_tmp, ph_tmp;
+                KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_tmp, th_tmp, ph_tmp);
+                return {Outcome::ESCAPED, r_tmp, 1.0, th_tmp, ph_tmp};
+            }
+        }
+
+        const double r_now = KNdSMetric::r_KS(s.X, s.Y, s.Z, g.a);
+        if (r_now < rh * 1.03) return {Outcome::HORIZON, r_now, 0.0};
+
+        if (r_now > r_escape) {
+            double r_esc, th_esc, ph_esc;
+            KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_esc, th_esc, ph_esc);
+            return {Outcome::ESCAPED, r_esc, 1.0, th_esc, ph_esc};
+        }
+
+        if (prev_Z * s.Z <= 0.0) {
+            const double denom = prev_Z - s.Z;
+            double w = (std::abs(denom) > 1e-14) ? (prev_Z / denom) : 0.5;
+            w = clamp(w, 0.0, 1.0);
+
+            const double Xh = s_prev.X + w * (s.X - s_prev.X);
+            const double Yh = s_prev.Y + w * (s.Y - s_prev.Y);
+            const double Zh = s_prev.Z + w * (s.Z - s_prev.Z);
+            const double pXh = s_prev.pX + w * (s.pX - s_prev.pX);
+            const double pYh = s_prev.pY + w * (s.pY - s_prev.pY);
+            const double pZh = s_prev.pZ + w * (s.pZ - s_prev.pZ);
+            const double pTh = s_prev.pT + w * (s.pT - s_prev.pT);
+
+            double r_hit, th_hit, ph_hit;
+            KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
+            if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
+                const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
+                const double red = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
+                return {Outcome::DISK_HIT, r_hit, red};
+            }
+        }
+        prev_Z = s.Z;
+    }
+
+    double r_end, th_end, ph_end;
+    KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_end, th_end, ph_end);
+    return {Outcome::ESCAPED, r_end, 1.0, th_end, ph_end};
 }
 
 // ── Colorization (Phase 2) ────────────────────────────────────
@@ -291,11 +589,30 @@ static std::vector<GeoPixel> trace_geodesics(
     int W, int H,
     const FrameParams& fp,
     bool use_bundles,
+    CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
     KGeoMeta* meta_out = nullptr)
 {
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
+    CoordinateChart eff_chart = chart;
+    if (eff_chart == CoordinateChart::KS && std::abs(Lam) > 1e-15) {
+        static bool warned_lam_ks = false;
+        if (!warned_lam_ks) {
+            std::cerr << "Info: KS chart currently supports Lambda=0 only; falling back to BL.\n";
+            warned_lam_ks = true;
+        }
+        eff_chart = CoordinateChart::BL;
+    }
+    if (use_bundles && eff_chart == CoordinateChart::KS) {
+        static bool warned_bundle_ks = false;
+        if (!warned_bundle_ks) {
+            std::cerr << "Info: Ray bundles currently run in BL chart; falling back to BL for --bundles.\n";
+            warned_bundle_ks = true;
+        }
+        eff_chart = CoordinateChart::BL;
+    }
+
     const double r_isco   = g.r_isco();
     Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
     const double r_disk_in  = r_isco;
@@ -329,7 +646,9 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.phi_esc   = (float)res.phi_esc;
             } else {
                 auto s   = cam.pixel_ray(px_, py, g);
-                auto res = trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg);
+                auto res = (eff_chart == CoordinateChart::KS)
+                         ? trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg)
+                         : trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg);
                 pix.outcome   = (res.out==Outcome::DISK_HIT) ? 1
                               : (res.out==Outcome::HORIZON)   ? 2 : 0;
                 pix.r         = (float)res.r;
@@ -356,19 +675,24 @@ static std::vector<RGB> render_image(
     const FrameParams& fp,
     const BackgroundImage& bg,
     bool use_bundles,
+    CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
     const ColorParams& cp = ColorParams{},
     std::vector<GeoPixel>* geo_out = nullptr)
 {
 #if defined(USE_METAL)
-    if (!use_bundles) {
+    const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
+    const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
+                              (chart == CoordinateChart::KS && ks_chart_supported);
+    if (!use_bundles && gpu_chart_ok) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
         KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
                          (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
-        CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,W,H};
+        CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,
+                           W,H,(chart==CoordinateChart::KS)?1:0};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -382,35 +706,61 @@ static std::vector<RGB> render_image(
         return image;
     }
 
-    static bool warned_bundle_fallback = false;
-    if (!warned_bundle_fallback) {
-        std::cerr << "Info: Metal backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
-        warned_bundle_fallback = true;
+    static bool warned_metal_fallback = false;
+    if (!warned_metal_fallback) {
+        if (use_bundles)
+            std::cerr << "Info: Metal backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
+        else if (chart == CoordinateChart::KS && !ks_chart_supported)
+            std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
+        else
+            std::cerr << "Info: Metal backend using CPU fallback.\n";
+        warned_metal_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 
 #elif defined(USE_CUDA)
-    KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
-    const double r_isco = g.r_isco();
-    Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
-    KNdSParams_CUDA kpcuda{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,fp.disk_out};
-    CameraParams_CUDA cpcuda{cam.r_obs,cam.theta_obs,cam.fov_h,W,H};
-    auto px32 = cuda_render(kpcuda, cpcuda);
-    std::vector<RGB> image(W*H);
-    for (int i=0;i<W*H;++i) {
-        image[i].r=(px32[i])    &0xFF;
-        image[i].g=(px32[i]>>8) &0xFF;
-        image[i].b=(px32[i]>>16)&0xFF;
+    const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
+    const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
+                              (chart == CoordinateChart::KS && ks_chart_supported);
+    if (!use_bundles && gpu_chart_ok) {
+        KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
+        const double r_isco = g.r_isco();
+        Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
+        KNdSParams_CUDA kpcuda{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,fp.disk_out};
+        CameraParams_CUDA cpcuda{cam.r_obs,cam.theta_obs,cam.phi_obs,cam.fov_h,
+                                 W,H,(chart==CoordinateChart::KS)?1:0};
+        auto px32 = cuda_render(kpcuda, cpcuda);
+        std::vector<RGB> image(W*H);
+        for (int i=0;i<W*H;++i) {
+            image[i].r=(px32[i])    &0xFF;
+            image[i].g=(px32[i]>>8) &0xFF;
+            image[i].b=(px32[i]>>16)&0xFF;
+        }
+        return image;
     }
-    return image;
+
+    static bool warned_cuda_fallback = false;
+    if (!warned_cuda_fallback) {
+        if (use_bundles)
+            std::cerr << "Info: CUDA backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
+        else if (chart == CoordinateChart::KS && !ks_chart_supported)
+            std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
+        else
+            std::cerr << "Info: CUDA backend using CPU fallback.\n";
+        warned_cuda_fallback = true;
+    }
+    KGeoMeta meta;
+    auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg, M_bh, Q_bh, Lam, &meta);
+    if (geo_out) *geo_out = geo;
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 
 #else
     // CPU: two-phase
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 #endif
@@ -439,6 +789,7 @@ int main(int argc, char** argv) {
     bool res_720p=false, res_2k=false, res_4k=false;
     int  custom_w=0, custom_h=0;
     Integrator intg=Integrator::RK4_DOUBLING;
+    CoordinateChart chart=CoordinateChart::KS;
     std::string bg_path;
 
     // ── Single-frame / base params ───────────────────────────
@@ -473,6 +824,13 @@ int main(int argc, char** argv) {
         // Resolution
         if (arg=="--bundles")  use_bundles=true;
         if (arg=="--dopri5")   intg=Integrator::DOPRI5;
+        if (arg=="--bl")       chart=CoordinateChart::BL;
+        if (arg=="--ks")       chart=CoordinateChart::KS;
+        if (arg=="--chart" && i+1<argc) {
+            const std::string c = argv[++i];
+            if (c=="bl" || c=="BL") chart=CoordinateChart::BL;
+            else if (c=="ks" || c=="KS") chart=CoordinateChart::KS;
+        }
         if (arg=="--preview")  preview=true;
         if (arg=="--hd")       hd_preview=true;
         if (arg=="--720p")     res_720p=true;
@@ -605,6 +963,7 @@ int main(int argc, char** argv) {
                   << "  r₊=" << g_info.r_horizon()
                   << "  r_ISCO=" << g_info.r_isco() << "\n"
                   << "Mode: " << (use_bundles?"ray bundles":"single ray")
+                  << "  chart=" << (chart==CoordinateChart::KS?"KS":"BL")
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
                   << "  " << W << "x" << H << "\n"
                   << "ColorParams: exp=" << cp.exposure
@@ -616,7 +975,7 @@ int main(int argc, char** argv) {
         if (geo_only) {
             // Phase 1 only: trace and save .kgeo
             KGeoMeta meta;
-            auto geo = trace_geodesics(W, H, fp, use_bundles, intg,
+            auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg,
                                        M_bh, Q_bh, Lam, &meta);
             double elapsed=get_time()-t0;
             std::cout << "Trace: " << elapsed << "s  ("
@@ -633,7 +992,7 @@ int main(int argc, char** argv) {
         } else {
             // Full render (Phase 1 + Phase 2, optionally save .kgeo)
             std::vector<GeoPixel> geo;
-            auto image = render_image(W, H, fp, bg, use_bundles, intg,
+            auto image = render_image(W, H, fp, bg, use_bundles, chart, intg,
                                       M_bh, Q_bh, Lam, cp,
                                       geo_file.empty() ? nullptr : &geo);
             double elapsed=get_time()-t0;
@@ -734,7 +1093,7 @@ int main(int argc, char** argv) {
                  <<"°  r="<<std::setprecision(2)<<fp.r_obs
                  <<"  a="<<std::setprecision(4)<<fp.a<<" ...\n"<<std::flush;
 
-        auto image=render_image(W,H,fp,bg,use_bundles,intg,M_bh,Q_bh,Lam,cp);
+        auto image=render_image(W,H,fp,bg,use_bundles,chart,intg,M_bh,Q_bh,Lam,cp);
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;

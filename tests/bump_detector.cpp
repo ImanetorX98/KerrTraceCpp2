@@ -165,25 +165,42 @@ double bump_score(const ImageRGB& img) {
         v_peak.push_back(best_v);
     }
 
-    const double v_thr = percentile(v_peak, 85.0);
-    std::vector<int> bright_idx;
-    for (int i = 0; i < (int)v_peak.size(); ++i)
-        if (v_peak[i] >= v_thr) bright_idx.push_back(i);
-    if (bright_idx.size() < 12) return std::numeric_limits<double>::quiet_NaN();
-
     // Longest contiguous bright run (approaching-side hotspot arc).
-    int best_a = bright_idx.front(), best_b = bright_idx.front();
-    int a = bright_idx.front(), b = bright_idx.front();
-    for (size_t k = 1; k < bright_idx.size(); ++k) {
-        if (bright_idx[k] == b + 1) {
-            b = bright_idx[k];
-        } else {
-            if ((b - a) > (best_b - best_a)) { best_a = a; best_b = b; }
-            a = b = bright_idx[k];
+    // Fallback across percentiles for images where the top bright band is short.
+    int best_a = -1, best_b = -1;
+    auto try_percentile = [&](double p, int min_run_len) -> bool {
+        const double v_thr = percentile(v_peak, p);
+        std::vector<int> bright_idx;
+        for (int i = 0; i < (int)v_peak.size(); ++i)
+            if (v_peak[i] >= v_thr) bright_idx.push_back(i);
+        if ((int)bright_idx.size() < min_run_len) return false;
+
+        int a = bright_idx.front(), b = bright_idx.front();
+        int la = a, lb = b;
+        for (size_t k = 1; k < bright_idx.size(); ++k) {
+            if (bright_idx[k] == b + 1) {
+                b = bright_idx[k];
+            } else {
+                if ((b - a) > (lb - la)) { la = a; lb = b; }
+                a = b = bright_idx[k];
+            }
         }
+        if ((b - a) > (lb - la)) { la = a; lb = b; }
+        const int run_len = lb - la + 1;
+        if (run_len < min_run_len) return false;
+        const int w = std::max(5, ((run_len / 20) | 1));
+        const int m = std::max(3, w);
+        if (run_len < 2 * m + 5) return false;
+        best_a = la;
+        best_b = lb;
+        return true;
+    };
+    if (!try_percentile(85.0, 12) &&
+        !try_percentile(80.0, 10) &&
+        !try_percentile(75.0, 8)  &&
+        !try_percentile(70.0, 8)) {
+        return std::numeric_limits<double>::quiet_NaN();
     }
-    if ((b - a) > (best_b - best_a)) { best_a = a; best_b = b; }
-    if (best_b - best_a + 1 < 12) return std::numeric_limits<double>::quiet_NaN();
 
     std::vector<double> y_seg(y_peak.begin() + best_a, y_peak.begin() + best_b + 1);
     const int w = std::max(5, (((int)y_seg.size() / 20) | 1));

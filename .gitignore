@@ -1,5 +1,7 @@
 # Build outputs
 build/
+build-ci/
+build-cuda/
 out/*.ppm
 out/*.png
 

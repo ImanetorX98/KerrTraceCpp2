@@ -29,6 +29,7 @@ struct CameraParams {
     float fov_h;       // radians
     int   width;
     int   height;
+    int   chart;       // 0 = BL, 1 = KS
 };
 
 struct RenderParams {
@@ -171,6 +172,234 @@ static void gLL_BL(float r, float theta,
     gll[3][3] = st2*(dth*r2a2*r2a2 - dr*a*a*st2) / pre;
 }
 
+// ── Kerr-Schild (Lambda=0) helpers ────────────────────────────
+static float r_KS(float X, float Y, float Z, float a) {
+    const float R2 = X*X + Y*Y + Z*Z;
+    const float a2 = a*a;
+    const float b  = R2 - a2;
+    return sqrt(0.5f * (b + sqrt(b*b + 4.0f*a2*Z*Z)));
+}
+
+static void BL_to_KS_spatial(float r, float theta, float phi, float a,
+                             thread float& X, thread float& Y, thread float& Z) {
+    const float st = sin(theta), ct = cos(theta);
+    const float sf = sin(phi),   cf = cos(phi);
+    X = st * (r*cf + a*sf);
+    Y = st * (r*sf - a*cf);
+    Z = r * ct;
+}
+
+static void KS_to_BL_spatial(float X, float Y, float Z, float a,
+                             thread float& r, thread float& theta, thread float& phi) {
+    r = r_KS(X, Y, Z, a);
+    const float Zr = (abs(r) > 1e-10f) ? (Z / r) : 1.0f;
+    theta = acos(clamp(Zr, -1.0f, 1.0f));
+    const float r2 = max(r*r, 1e-12f);
+    const float st = sqrt(max(1.0f - (Z*Z)/r2, 0.0f));
+    const float r2a2 = r*r + a*a;
+    if (st > 1e-10f && r2a2 > 1e-10f) {
+        const float cf = (X*r + Y*a) / (st * r2a2);
+        const float sf = (Y*r - X*a) / (st * r2a2);
+        phi = atan2(sf, cf);
+    } else {
+        phi = 0.0f;
+    }
+}
+
+static void jacobian_BL_to_KS(float r, float theta, float phi, float a,
+                              thread float J[3][3]) {
+    const float st = sin(theta), ct = cos(theta);
+    const float sf = sin(phi),   cf = cos(phi);
+    const float rcfa = r*cf + a*sf;
+    const float rsfa = r*sf - a*cf;
+
+    // Columns: (dr, dtheta, dphi), rows: (X,Y,Z)
+    J[0][0] = st * cf;
+    J[1][0] = st * sf;
+    J[2][0] = ct;
+
+    J[0][1] = ct * rcfa;
+    J[1][1] = ct * rsfa;
+    J[2][1] = -r * st;
+
+    J[0][2] = -st * rsfa;
+    J[1][2] =  st * rcfa;
+    J[2][2] = 0.0f;
+}
+
+static bool solve3x3(thread float A[3][3], thread float b[3], thread float x[3]) {
+    for (int col = 0; col < 3; ++col) {
+        int piv = col;
+        float best = abs(A[piv][col]);
+        for (int r = col + 1; r < 3; ++r) {
+            const float v = abs(A[r][col]);
+            if (v > best) { best = v; piv = r; }
+        }
+        if (best < 1e-12f) return false;
+
+        if (piv != col) {
+            for (int k = col; k < 3; ++k) {
+                const float tmp = A[col][k];
+                A[col][k] = A[piv][k];
+                A[piv][k] = tmp;
+            }
+            const float tb = b[col];
+            b[col] = b[piv];
+            b[piv] = tb;
+        }
+
+        const float inv = 1.0f / A[col][col];
+        for (int k = col; k < 3; ++k) A[col][k] *= inv;
+        b[col] *= inv;
+
+        for (int r = 0; r < 3; ++r) {
+            if (r == col) continue;
+            const float f = A[r][col];
+            for (int k = col; k < 3; ++k) A[r][k] -= f * A[col][k];
+            b[r] -= f * b[col];
+        }
+    }
+    x[0] = b[0]; x[1] = b[1]; x[2] = b[2];
+    return true;
+}
+
+static bool BL_covector_to_KS(float r, float theta, float phi, float a,
+                              float pr, float ptheta, float pphi,
+                              thread float& pX, thread float& pY, thread float& pZ) {
+    float J[3][3];
+    jacobian_BL_to_KS(r, theta, phi, a, J);
+
+    float A[3][3];
+    // A = J^T, solve A * p_xyz = p_bl
+    for (int j = 0; j < 3; ++j)
+        for (int i = 0; i < 3; ++i)
+            A[j][i] = J[i][j];
+
+    float b[3] = {pr, ptheta, pphi};
+    float x[3];
+    if (!solve3x3(A, b, x)) return false;
+    pX = x[0]; pY = x[1]; pZ = x[2];
+    return true;
+}
+
+static void KS_covector_to_BL(float r, float theta, float phi, float a,
+                              float pX, float pY, float pZ,
+                              thread float& pr, thread float& ptheta, thread float& pphi) {
+    float J[3][3];
+    jacobian_BL_to_KS(r, theta, phi, a, J);
+    const float pxyz[3] = {pX, pY, pZ};
+    pr = ptheta = pphi = 0.0f;
+    for (int j = 0; j < 3; ++j) {
+        float s = 0.0f;
+        for (int i = 0; i < 3; ++i) s += J[i][j] * pxyz[i];
+        if (j == 0) pr = s;
+        if (j == 1) ptheta = s;
+        if (j == 2) pphi = s;
+    }
+}
+
+static void gUU_KS(float X, float Y, float Z, float M, float a, float Q,
+                   thread float guu[4][4]) {
+    const float r = r_KS(X, Y, Z, a);
+    const float rr = max(r*r, 1e-12f);
+    const float rho2 = rr + a*a*Z*Z/rr;
+    const float H = (2.0f*M*r - Q*Q) / rho2;
+    const float r2a2 = rr + a*a;
+
+    // Ingoing KS null covector
+    const float l0 = 1.0f;
+    const float l1 = (r*X + a*Y) / r2a2;
+    const float l2 = (r*Y - a*X) / r2a2;
+    const float l3 = Z / max(r, 1e-6f);
+
+    // l^a = eta^{ab} l_b
+    const float lU[4] = {-l0, l1, l2, l3};
+    for (int i=0;i<4;i++) for (int j=0;j<4;j++) guu[i][j]=0.0f;
+    guu[0][0]=-1.0f; guu[1][1]=1.0f; guu[2][2]=1.0f; guu[3][3]=1.0f;
+    for (int mu=0; mu<4; ++mu)
+        for (int nu=0; nu<4; ++nu)
+            guu[mu][nu] -= H * lU[mu] * lU[nu];
+}
+
+static float hamiltonian_KS(float X, float Y, float Z,
+                            float pT, float pX, float pY, float pZ,
+                            float M, float a, float Q) {
+    float guu[4][4];
+    gUU_KS(X, Y, Z, M, a, Q, guu);
+    return 0.5f * (
+        guu[0][0]*pT*pT + 2.0f*guu[0][1]*pT*pX + 2.0f*guu[0][2]*pT*pY + 2.0f*guu[0][3]*pT*pZ +
+        guu[1][1]*pX*pX + guu[2][2]*pY*pY + guu[3][3]*pZ*pZ +
+        2.0f*guu[1][2]*pX*pY + 2.0f*guu[1][3]*pX*pZ + 2.0f*guu[2][3]*pY*pZ
+    );
+}
+
+static void geodesic_rhs_KS(float X, float Y, float Z,
+                            float pT, float pX, float pY, float pZ,
+                            float M, float a, float Q,
+                            thread float& dX, thread float& dY, thread float& dZ,
+                            thread float& dpX, thread float& dpY, thread float& dpZ) {
+    float guu[4][4];
+    gUU_KS(X, Y, Z, M, a, Q, guu);
+    dX = guu[1][0]*pT + guu[1][1]*pX + guu[1][2]*pY + guu[1][3]*pZ;
+    dY = guu[2][0]*pT + guu[2][1]*pX + guu[2][2]*pY + guu[2][3]*pZ;
+    dZ = guu[3][0]*pT + guu[3][1]*pX + guu[3][2]*pY + guu[3][3]*pZ;
+
+    const float eX = 1e-5f*(abs(X)+0.1f);
+    const float eY = 1e-5f*(abs(Y)+0.1f);
+    const float eZ = 1e-5f*(abs(Z)+0.1f);
+    dpX = -(hamiltonian_KS(X+eX, Y, Z, pT, pX, pY, pZ, M, a, Q)
+          - hamiltonian_KS(X-eX, Y, Z, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eX);
+    dpY = -(hamiltonian_KS(X, Y+eY, Z, pT, pX, pY, pZ, M, a, Q)
+          - hamiltonian_KS(X, Y-eY, Z, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eY);
+    dpZ = -(hamiltonian_KS(X, Y, Z+eZ, pT, pX, pY, pZ, M, a, Q)
+          - hamiltonian_KS(X, Y, Z-eZ, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eZ);
+}
+
+static void rk4_KS(thread float& X, thread float& Y, thread float& Z,
+                   thread float& pX, thread float& pY, thread float& pZ,
+                   float pT, float M, float a, float Q, float dlam) {
+    float dX1,dY1,dZ1,dpX1,dpY1,dpZ1;
+    float dX2,dY2,dZ2,dpX2,dpY2,dpZ2;
+    float dX3,dY3,dZ3,dpX3,dpY3,dpZ3;
+    float dX4,dY4,dZ4,dpX4,dpY4,dpZ4;
+
+    geodesic_rhs_KS(X, Y, Z, pT, pX, pY, pZ, M, a, Q, dX1,dY1,dZ1,dpX1,dpY1,dpZ1);
+    geodesic_rhs_KS(X+0.5f*dlam*dX1, Y+0.5f*dlam*dY1, Z+0.5f*dlam*dZ1,
+                    pT, pX+0.5f*dlam*dpX1, pY+0.5f*dlam*dpY1, pZ+0.5f*dlam*dpZ1,
+                    M, a, Q, dX2,dY2,dZ2,dpX2,dpY2,dpZ2);
+    geodesic_rhs_KS(X+0.5f*dlam*dX2, Y+0.5f*dlam*dY2, Z+0.5f*dlam*dZ2,
+                    pT, pX+0.5f*dlam*dpX2, pY+0.5f*dlam*dpY2, pZ+0.5f*dlam*dpZ2,
+                    M, a, Q, dX3,dY3,dZ3,dpX3,dpY3,dpZ3);
+    geodesic_rhs_KS(X+dlam*dX3, Y+dlam*dY3, Z+dlam*dZ3,
+                    pT, pX+dlam*dpX3, pY+dlam*dpY3, pZ+dlam*dpZ3,
+                    M, a, Q, dX4,dY4,dZ4,dpX4,dpY4,dpZ4);
+
+    X  += dlam/6.0f*(dX1  +2.0f*dX2  +2.0f*dX3  +dX4);
+    Y  += dlam/6.0f*(dY1  +2.0f*dY2  +2.0f*dY3  +dY4);
+    Z  += dlam/6.0f*(dZ1  +2.0f*dZ2  +2.0f*dZ3  +dZ4);
+    pX += dlam/6.0f*(dpX1 +2.0f*dpX2 +2.0f*dpX3 +dpX4);
+    pY += dlam/6.0f*(dpY1 +2.0f*dpY2 +2.0f*dpY3 +dpY4);
+    pZ += dlam/6.0f*(dpZ1 +2.0f*dpZ2 +2.0f*dpZ3 +dpZ4);
+}
+
+// ── Emissivity / tonemap helpers ──────────────────────────────
+// Page-Thorne emissivity f(r) = (1 − √(r_isco/r)) / r³, normalised to 1
+// at its peak r = 3·r_isco  (matches CPU disk_colour exactly)
+static float page_thorne_norm(float r, float r_isco) {
+    if (r <= r_isco) return 0.0f;
+    float pt      = (1.0f - sqrt(r_isco / r)) / (r*r*r);
+    float r_peak  = 3.0f * r_isco;
+    float pt_peak = (1.0f - sqrt(r_isco / r_peak)) / (r_peak*r_peak*r_peak);
+    return (pt_peak > 0.0f) ? (pt / pt_peak) : 0.0f;
+}
+
+// Reinhard tonemap with gamma  (exposure = 1.0 default, matches CPU ColorParams)
+static float tonemap_ch(float x, float exposure, float gamma) {
+    x = x * exposure;
+    x = x / (1.0f + x);
+    return pow(clamp(x, 0.0f, 1.0f), 1.0f / gamma);
+}
+
 // ── Colour helpers ────────────────────────────────────────────
 static float4 blackbody_rgb(float T) {
     T = clamp(T, 800.0f, 4e4f);
@@ -243,7 +472,7 @@ kernel void trace_pixel(
 
     const float pUr   = -ca*cb / sqrt_grr;
     const float pUth  = -sb    / sqrt_gthth;
-    const float pUphi =  sa*cb / sqrt_gphph;
+    const float pUphi = -sa*cb / sqrt_gphph;
 
     float pt   = gll[0][0]*1.0f + gll[0][3]*pUphi;
     float pr   = gll[1][1]*pUr;
@@ -272,6 +501,140 @@ kernel void trace_pixel(
     float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
+
+    // ── KS chart path (Lambda=0 only) ─────────────────────────
+    const bool want_ks = (cp.chart == 1 && abs(L) <= 1e-8f);
+    if (want_ks) {
+        float X, Y, Z;
+        BL_to_KS_spatial(r0, th0, cp.phi_obs, a, X, Y, Z);
+        float pX, pY, pZ;
+        bool ks_ok = BL_covector_to_KS(r0, th0, cp.phi_obs, a, pr, pth, pphi, pX, pY, pZ);
+
+        float pT = pt;
+        if (ks_ok) {
+            float gu_ks[4][4];
+            gUU_KS(X, Y, Z, M, a, Q, gu_ks);
+            const float Aks = gu_ks[0][0];
+            const float Bks = 2.0f * (gu_ks[0][1]*pX + gu_ks[0][2]*pY + gu_ks[0][3]*pZ);
+            const float Cks = gu_ks[1][1]*pX*pX + gu_ks[2][2]*pY*pY + gu_ks[3][3]*pZ*pZ
+                            + 2.0f*gu_ks[1][2]*pX*pY + 2.0f*gu_ks[1][3]*pX*pZ + 2.0f*gu_ks[2][3]*pY*pZ;
+            const float dks = Bks*Bks - 4.0f*Aks*Cks;
+            if (dks >= 0.0f && abs(Aks) > 1e-12f) {
+                const float sq = sqrt(dks);
+                const float pT1 = (-Bks - sq) / (2.0f*Aks);
+                const float pT2 = (-Bks + sq) / (2.0f*Aks);
+                pT = (pT1 < 0.0f) ? pT1 : pT2;
+                if (pT > 0.0f) pT = min(pT1, pT2);
+                ks_ok = isfinite(pT);
+            } else {
+                ks_ok = false;
+            }
+        }
+
+        if (ks_ok) {
+            float dlam_ks = 1.0f;
+            float prevX = X, prevY = Y, prevZ = Z;
+            float prevPX = pX, prevPY = pY, prevPZ = pZ;
+            float prev_r_ks = r0;
+
+            for (int iter = 0; iter < 60000; ++iter) {
+                float X_h = X, Y_h = Y, Z_h = Z, pX_h = pX, pY_h = pY, pZ_h = pZ;
+                rk4_KS(X_h, Y_h, Z_h, pX_h, pY_h, pZ_h, pT, M, a, Q, dlam_ks);
+
+                float X_f = X, Y_f = Y, Z_f = Z, pX_f = pX, pY_f = pY, pZ_f = pZ;
+                rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, dlam_ks*0.5f);
+                rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, dlam_ks*0.5f);
+
+                const float err = sqrt(
+                    (X_h-X_f)*(X_h-X_f) + (Y_h-Y_f)*(Y_h-Y_f) + (Z_h-Z_f)*(Z_h-Z_f) +
+                    (pX_h-pX_f)*(pX_h-pX_f) + (pY_h-pY_f)*(pY_h-pY_f) + (pZ_h-pZ_f)*(pZ_h-pZ_f)
+                ) / 15.0f;
+                const float tol = 2e-5f;
+                if (err < tol || dlam_ks < 1e-6f) {
+                    X = X_f; Y = Y_f; Z = Z_f; pX = pX_f; pY = pY_f; pZ = pZ_f;
+                    const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
+                    dlam_ks = clamp(dlam_ks*sc, 1e-6f, 50.0f);
+                } else {
+                    dlam_ks = clamp(dlam_ks*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam_ks*0.5f);
+                    continue;
+                }
+
+                if (!(isfinite(X) && isfinite(Y) && isfinite(Z) &&
+                      isfinite(pX) && isfinite(pY) && isfinite(pZ))) {
+                    break;
+                }
+
+                const float r_now = r_KS(X, Y, Z, a);
+                if (r_now < kp.r_horizon * 1.03f) break;
+
+                if (r_now > cp.r_obs * 1.05f) {
+                    const float r_escape = cp.r_obs * 1.05f;
+                    const float denom = r_now - prev_r_ks;
+                    float w = (abs(denom) > 1e-8f) ? ((r_escape - prev_r_ks) / denom) : 1.0f;
+                    w = clamp(w, 0.0f, 1.0f);
+                    const float X_esc = prevX + w*(X - prevX);
+                    const float Y_esc = prevY + w*(Y - prevY);
+                    const float Z_esc = prevZ + w*(Z - prevZ);
+                    float r_esc, th_esc, ph_esc;
+                    KS_to_BL_spatial(X_esc, Y_esc, Z_esc, a, r_esc, th_esc, ph_esc);
+                    float4 bgc = clamp(sample_background(bg_tex, bg_samp, th_esc, ph_esc), 0.0f, 1.0f);
+                    colour = (0xFFu << 24)
+                           | (uint32_t(bgc.b*255.0f) << 16)
+                           | (uint32_t(bgc.g*255.0f) << 8)
+                           |  uint32_t(bgc.r*255.0f);
+                    break;
+                }
+
+                if (prevZ * Z <= 0.0f) {
+                    const float denom = prevZ - Z;
+                    float w = (abs(denom) > 1e-8f) ? (prevZ / denom) : 0.5f;
+                    w = clamp(w, 0.0f, 1.0f);
+                    const float Xh = prevX + w*(X - prevX);
+                    const float Yh = prevY + w*(Y - prevY);
+                    const float Zh = prevZ + w*(Z - prevZ);
+                    const float pXh = prevPX + w*(pX - prevPX);
+                    const float pYh = prevPY + w*(pY - prevPY);
+                    const float pZh = prevPZ + w*(pZ - prevPZ);
+                    float r_hit, th_hit, ph_hit;
+                    KS_to_BL_spatial(Xh, Yh, Zh, a, r_hit, th_hit, ph_hit);
+                    if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
+                        float pr_hit, pth_hit, pphi_hit;
+                        KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
+                                          pr_hit, pth_hit, pphi_hit);
+                        const float Omega = keplerian_omega(r_hit, M, a, Q, L);
+                        const float b_ip  = pphi_hit / (-pT);
+                        float gll2[4][4];
+                        gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
+                        const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
+                        const float dv = 1.0f - Omega*b_ip;
+                        float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
+                        red = clamp(red, 0.0f, 20.0f);
+
+                        const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
+                        float I = page_thorne_norm(r_hit, kp.r_isco);
+                        I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+                        float4 bb = blackbody_rgb(T);
+                        float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
+                                          tonemap_ch(bb.g * I, 1.0f, 2.2f),
+                                          tonemap_ch(bb.b * I, 1.0f, 2.2f),
+                                          1.0f);
+                        colour = (0xFFu << 24)
+                               | (uint32_t(c.b*255.0f) << 16)
+                               | (uint32_t(c.g*255.0f) << 8)
+                               |  uint32_t(c.r*255.0f);
+                        break;
+                    }
+                }
+
+                prevX = X; prevY = Y; prevZ = Z;
+                prevPX = pX; prevPY = pY; prevPZ = pZ;
+                prev_r_ks = r_now;
+            }
+
+            output[py * width + px] = colour;
+            return;
+        }
+    }
 
     for (int iter = 0; iter < 60000; ++iter) {
         // Adaptive step (simple: fixed tolerance)
@@ -339,11 +702,18 @@ kernel void trace_pixel(
             float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
             red = clamp(red, 0.0f, 20.0f);
 
-            const float T0 = 2e6f * pow(r_hit/(6.0f*M), -0.75f);
-            const float T  = T0 * clamp(red, 0.1f, 10.0f);
-            const float I  = clamp(pow(red, 4.0f)*pow(6.0f*M/r_hit, 3.0f), 0.0f, 2.5f);
-            float4 c = blackbody_rgb(T) * I;
-            c = clamp(c, 0.0f, 1.0f);
+            // Match CPU disk_colour():
+            //   T = 6500 * sqrt(6M/r) * clamp(red,0.2,5)
+            //   I = page_thorne_norm(r) * red^4
+            //   output = tonemap(blackbody(T) * I, exposure=1, gamma=2.2)
+            const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
+            float I = page_thorne_norm(r_hit, kp.r_isco);
+            I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+            float4 bb = blackbody_rgb(T);
+            float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
+                              tonemap_ch(bb.g * I, 1.0f, 2.2f),
+                              tonemap_ch(bb.b * I, 1.0f, 2.2f),
+                              1.0f);
 
             // Pack as ABGR (Metal standard)
             colour = (0xFFu << 24)

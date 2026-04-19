@@ -132,8 +132,9 @@ std::vector<uint32_t> metal_render(
     if (!queue)
         throw std::runtime_error("Failed to create Metal command queue");
 
-    // Split work into Y-tiles to avoid long command buffers (GPU watchdog timeout).
-    constexpr int TILE_ROWS = 2;
+    // Tile in 16-row slices to stay under GPU interactivity watchdog.
+    // The shader uses y_offset so each tile writes to the correct rows.
+    constexpr int TILE_ROWS = 16;
     MTLSize tg = MTLSizeMake(16, 16, 1);
     for (int y0 = 0; y0 < cp.height; y0 += TILE_ROWS) {
         const int tile_h = (cp.height - y0 < TILE_ROWS) ? (cp.height - y0) : TILE_ROWS;

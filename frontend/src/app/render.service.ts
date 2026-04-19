@@ -16,6 +16,7 @@ export interface RenderParams {
   fov: number;
   // Options
   backend: string;
+  integration_chart: 'ks' | 'bl';
   bundles: boolean;
   dopri5: boolean;
   background: string;
