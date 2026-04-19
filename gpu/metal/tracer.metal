@@ -79,7 +79,7 @@ static float hamiltonian(float r, float theta,
                          float pt, float pphi,
                          float M, float a, float Q, float L) {
     float gu[4][4];
-    guu(r, theta, M, a, Q, L, gu);
+    gUU(r, theta, M, a, Q, L, gu);
     return 0.5f*(gu[0][0]*pt*pt + 2.0f*gu[0][3]*pt*pphi
                + gu[1][1]*pr*pr + gu[2][2]*pth*pth
                + gu[3][3]*pphi*pphi);
@@ -93,7 +93,7 @@ static void geodesic_rhs(float r, float theta,
                           thread float& dr_out, thread float& dth_out,
                           thread float& dpr_out, thread float& dpth_out) {
     float gu[4][4];
-    guu(r, theta, M, a, Q, L, gu);
+    gUU(r, theta, M, a, Q, L, gu);
 
     dr_out  = gu[1][1]*pr;
     dth_out = gu[2][2]*pth;
@@ -194,7 +194,7 @@ kernel void trace_pixel(
     gLL_BL(r0, th0, M, a, Q, L, gll);
 
     float gu[4][4];
-    guu(r0, th0, M, a, Q, L, gu);
+    gUU(r0, th0, M, a, Q, L, gu);
 
     const float ca = cos(alpha), sa = sin(alpha);
     const float cb = cos(beta),  sb = sin(beta);
