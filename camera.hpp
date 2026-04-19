@@ -36,8 +36,9 @@ public:
 
     // ── pixel → initial geodesic state ───────────────────────
     GeodesicState pixel_ray(int px, int py, const KNdSMetric& g) const {
-        const double alpha = fov_h * (px - 0.5*(width-1))  / (width-1);
-        const double beta  = fov_h * (0.5*(height-1) - py) / (width-1);
+        const int span = (width > 1) ? (width - 1) : 1;
+        const double alpha = fov_h * (px - 0.5*(width-1))  / span;
+        const double beta  = fov_h * (0.5*(height-1) - py) / span;
         return angle_ray(alpha, beta, g);
     }
 

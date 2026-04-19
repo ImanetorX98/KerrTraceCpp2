@@ -165,7 +165,7 @@ struct TraceResult {
 
 static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& g) {
     double Omega = g.keplerian_omega(r);
-    double b     = pphi / pt;
+    double b     = pphi / (-pt);
     double gLL[4][4]; g.covariant_BL(r, M_PI/2.0, gLL);
     double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
     if (d2 <= 0.0) return 1.0;
@@ -181,7 +181,11 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
     double rh=g.r_horizon(), dlam=1.0, prev_cos=std::cos(s.theta);
     Vec4d fsal=Vec4d::nan_init();
     for (int it=0; it<500000; ++it) {
-        while (!adaptive_step(g, s, dlam, intg, fsal)) {}
+        int rejects = 0;
+        while (!adaptive_step(g, s, dlam, intg, fsal)) {
+            if (!std::isfinite(dlam) || ++rejects > 64)
+                return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+        }
         if (s.r < rh*1.03)  return {Outcome::HORIZON,  s.r, 0.0};
         if (s.r > r_escape)  return {Outcome::ESCAPED,  s.r, 1.0, s.theta, s.phi};
         double cc=std::cos(s.theta);

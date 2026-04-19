@@ -165,6 +165,8 @@ static void bundle_rhs(const KNdSMetric& g,
 
 // ── RK4 step for bundle ───────────────────────────────────────
 static void bundle_rk4(const KNdSMetric& g, BundleState& bs, double dlam) {
+    const GeodesicState s0 = bs.geo;
+
     double dz1[4], dW1[4][2];
     double dz2[4], dW2[4][2];
     double dz3[4], dW3[4][2];
@@ -182,33 +184,82 @@ static void bundle_rk4(const KNdSMetric& g, BundleState& bs, double dlam) {
              {nW[2][0],nW[2][1]},{nW[3][0],nW[3][1]}}});
     };
 
-    bundle_rhs(g, bs.geo, bs.W, dz1, dW1);
+    bundle_rhs(g, s0, bs.W, dz1, dW1);
 
-    auto [s2,W2] = make_state(bs.geo, dz1, 0.5*dlam, bs.W, dW1);
+    auto [s2,W2] = make_state(s0, dz1, 0.5*dlam, bs.W, dW1);
     double W2a[4][2]; for(int i=0;i<4;i++) for(int k=0;k<2;k++) W2a[i][k]=W2[i][k];
     bundle_rhs(g, s2, W2a, dz2, dW2);
 
-    auto [s3,W3] = make_state(bs.geo, dz2, 0.5*dlam, bs.W, dW2);
+    auto [s3,W3] = make_state(s0, dz2, 0.5*dlam, bs.W, dW2);
     double W3a[4][2]; for(int i=0;i<4;i++) for(int k=0;k<2;k++) W3a[i][k]=W3[i][k];
     bundle_rhs(g, s3, W3a, dz3, dW3);
 
-    auto [s4,W4] = make_state(bs.geo, dz3, dlam, bs.W, dW3);
+    auto [s4,W4] = make_state(s0, dz3, dlam, bs.W, dW3);
     double W4a[4][2]; for(int i=0;i<4;i++) for(int k=0;k<2;k++) W4a[i][k]=W4[i][k];
     bundle_rhs(g, s4, W4a, dz4, dW4);
+
+    // φ integration using the same RK stage points of the pre-step state.
+    const double dp1 = dphi_vel(g, s0.r, s0.theta, s0.pt, s0.pphi);
+    const double dp2 = dphi_vel(g, s2.r, s2.theta, s0.pt, s0.pphi);
+    const double dp3 = dphi_vel(g, s3.r, s3.theta, s0.pt, s0.pphi);
+    const double dp4 = dphi_vel(g, s4.r, s4.theta, s0.pt, s0.pphi);
 
     bs.geo.r      += dlam/6.0*(dz1[0]+2*dz2[0]+2*dz3[0]+dz4[0]);
     bs.geo.theta  += dlam/6.0*(dz1[1]+2*dz2[1]+2*dz3[1]+dz4[1]);
     bs.geo.pr     += dlam/6.0*(dz1[2]+2*dz2[2]+2*dz3[2]+dz4[2]);
     bs.geo.ptheta += dlam/6.0*(dz1[3]+2*dz2[3]+2*dz3[3]+dz4[3]);
-
-    // φ integration using the same 4 stage points
-    const double dp1 = dphi_vel(g, bs.geo.r, bs.geo.theta, bs.geo.pt, bs.geo.pphi);
-    const double dp2 = dphi_vel(g, s2.r,     s2.theta,     bs.geo.pt, bs.geo.pphi);
-    const double dp3 = dphi_vel(g, s3.r,     s3.theta,     bs.geo.pt, bs.geo.pphi);
-    const double dp4 = dphi_vel(g, s4.r,     s4.theta,     bs.geo.pt, bs.geo.pphi);
     bs.geo.phi += dlam/6.0*(dp1 + 2*dp2 + 2*dp3 + dp4);
     for(int i=0;i<4;i++) for(int k=0;k<2;k++)
         bs.W[i][k] += dlam/6.0*(dW1[i][k]+2*dW2[i][k]+2*dW3[i][k]+dW4[i][k]);
+}
+
+// ── Adaptive bundle step (RK4 + step-doubling) ───────────────
+static bool bundle_adaptive(const KNdSMetric& g, BundleState& bs,
+                            double& dlam, double tol = 1e-7) {
+    const BundleState s0 = bs;
+
+    BundleState sA = s0;
+    bundle_rk4(g, sA, dlam);
+
+    BundleState sB = s0;
+    bundle_rk4(g, sB, 0.5*dlam);
+    bundle_rk4(g, sB, 0.5*dlam);
+
+    const double err = std::sqrt(
+        (sA.geo.r      - sB.geo.r)      * (sA.geo.r      - sB.geo.r)      +
+        (sA.geo.theta  - sB.geo.theta)  * (sA.geo.theta  - sB.geo.theta)  +
+        (sA.geo.pr     - sB.geo.pr)     * (sA.geo.pr     - sB.geo.pr)     +
+        (sA.geo.ptheta - sB.geo.ptheta) * (sA.geo.ptheta - sB.geo.ptheta)
+    ) / 15.0;
+
+    if (!std::isfinite(err)) {
+        bs = s0;
+        dlam = (std::isfinite(dlam) && dlam > 1e-10) ? dlam * 0.5 : 1e-6;
+        if (dlam < 1e-10) dlam = 1e-10;
+        return false;
+    }
+
+    const bool accepted = (err < tol || dlam < 1e-10);
+    if (accepted) {
+        bs = sB;
+        const double scale = (err > 1e-14)
+                           ? 0.9 * std::pow(tol/err, 0.2)
+                           : 4.0;
+        double hnew = dlam * scale;
+        if (!std::isfinite(hnew)) hnew = dlam;
+        dlam = hnew;
+        if (dlam > 100.0) dlam = 100.0;
+        if (dlam < 1e-10) dlam = 1e-10;
+    } else {
+        bs = s0;
+        const double half = dlam * 0.5;
+        double hnew = dlam * 0.9 * std::pow(tol/err, 0.25);
+        if (!std::isfinite(hnew)) hnew = half;
+        dlam = hnew;
+        if (dlam > half)  dlam = half;
+        if (dlam < 1e-10) dlam = 1e-10;
+    }
+    return accepted;
 }
 
 // ── Bundle result ─────────────────────────────────────────────
@@ -252,8 +303,9 @@ static BundleResult trace_bundle(int px, int py,
                                   double r_disk_in,
                                   double r_disk_out,
                                   double r_escape) {
-    const double alpha = cam.fov_h*(px - 0.5*(cam.width-1))  / (cam.width-1);
-    const double beta  = cam.fov_h*(0.5*(cam.height-1) - py) / (cam.width-1);
+    const int span = (cam.width > 1) ? (cam.width - 1) : 1;
+    const double alpha = cam.fov_h*(px - 0.5*(cam.width-1))  / span;
+    const double beta  = cam.fov_h*(0.5*(cam.height-1) - py) / span;
 
     BundleState bs;
     bs.geo = cam.angle_ray(alpha, beta, g);
@@ -264,13 +316,10 @@ static BundleResult trace_bundle(int px, int py,
     double prev_cos  = std::cos(bs.geo.theta);
 
     for (int iter = 0; iter < 500000; ++iter) {
-        bundle_rk4(g, bs, dlam);
-
-        // Use geodesic adaptive logic on the main ray for step control
-        // (re-use the RK4 adaptive from geodesic.hpp on a copy)
-        GeodesicState tmp = bs.geo;
-        rk4_adaptive(g, tmp, dlam);
-        // (dlam updated by rk4_adaptive; ignore the state — bundle_rk4 used above)
+        int rejects = 0;
+        while (!bundle_adaptive(g, bs, dlam)) {
+            if (!std::isfinite(dlam) || ++rejects > 64) return {};
+        }
 
         const double r = bs.geo.r;
 
@@ -283,7 +332,7 @@ static BundleResult trace_bundle(int px, int py,
         if (crossed && r >= r_disk_in && r <= r_disk_out) {
             // ── Redshift ──────────────────────────────────────
             const double Omega = g.keplerian_omega(r);
-            const double b     = bs.geo.pphi / bs.geo.pt;  // pt<0; backward ray sign fix
+            const double b     = bs.geo.pphi / (-bs.geo.pt);
             double gLL[4][4];
             g.covariant_BL(r, M_PI/2.0, gLL);
             const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);

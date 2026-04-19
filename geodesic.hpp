@@ -128,6 +128,14 @@ inline bool rk4_adaptive(const KNdSMetric& g, GeodesicState& s,
         (sA.ptheta - sB.ptheta) * (sA.ptheta - sB.ptheta)
     ) / 15.0;   // Richardson factor 2^4 − 1
 
+    if (!std::isfinite(err)) {
+        // Degenerate step (typically near coordinate singularities): back off.
+        s = s0;
+        dlam = (std::isfinite(dlam) && dlam > 1e-10) ? dlam * 0.5 : 1e-6;
+        if (dlam < 1e-10) dlam = 1e-10;
+        return false;
+    }
+
     const bool accepted = (err < tol || dlam < 1e-10);
 
     if (accepted) {
@@ -135,14 +143,18 @@ inline bool rk4_adaptive(const KNdSMetric& g, GeodesicState& s,
         const double scale = (err > 1e-14)
                             ? 0.9 * std::pow(tol/err, 0.2)
                             : 4.0;
-        dlam = dlam * scale;
+        double hnew = dlam * scale;
+        if (!std::isfinite(hnew)) hnew = dlam;
+        dlam = hnew;
         if (dlam > 100.0) dlam = 100.0;
         if (dlam < 1e-10) dlam = 1e-10;
     } else {
         // Reject: restore state and shrink step
         s = s0;
         const double half = dlam * 0.5;
-        dlam = dlam * 0.9 * std::pow(tol/err, 0.25);
+        double hnew = dlam * 0.9 * std::pow(tol/err, 0.25);
+        if (!std::isfinite(hnew)) hnew = half;
+        dlam = hnew;
         if (dlam > half)  dlam = half;
         if (dlam < 1e-10) dlam = 1e-10;
     }
@@ -275,6 +287,13 @@ inline bool dopri5_adaptive(const KNdSMetric& g, GeodesicState& s,
     }
     const double err = std::sqrt(err2 / 4.0);
 
+    if (!std::isfinite(err)) {
+        h = (std::isfinite(h) && h > 1e-10) ? h * 0.5 : 1e-6;
+        if (h < 1e-10) h = 1e-10;
+        k1_fsal.v[0] = std::numeric_limits<double>::quiet_NaN();
+        return false;
+    }
+
     const bool accepted = (err <= 1.0 || h < 1e-10);
 
     if (accepted) {
@@ -285,13 +304,15 @@ inline bool dopri5_adaptive(const KNdSMetric& g, GeodesicState& s,
                            ? 0.9 * std::pow(1.0/err, 0.2)
                            : 4.0;
         double hnew = h * fac;
+        if (!std::isfinite(hnew)) hnew = h;
         if (hnew > 100.0) hnew = 100.0;
         if (hnew < 1e-10) hnew = 1e-10;
         h = hnew;
     } else {
         // Reject; shrink and do NOT advance state
-        const double fac = 0.9 * std::pow(1.0/err, 0.25);
-        h = std::max(h * fac, 1e-10);
+        double hnew = h * 0.9 * std::pow(1.0/err, 0.25);
+        if (!std::isfinite(hnew)) hnew = h * 0.5;
+        h = std::max(hnew, 1e-10);
         k1_fsal.v[0] = std::numeric_limits<double>::quiet_NaN(); // force recompute
     }
     return accepted;

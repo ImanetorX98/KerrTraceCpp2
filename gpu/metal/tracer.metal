@@ -49,6 +49,13 @@ static float Delta_th(float theta, float a, float L) {
 }
 static float Xi(float a, float L) { return 1.0f + L*a*a/3.0f; }
 
+static float keplerian_omega(float r, float M, float a, float Q, float L) {
+    const float Meff = M - Q*Q/(2.0f*r) + L*a*r*r/3.0f;
+    const float sq   = sqrt(max(Meff, 0.0f));
+    const float den  = r*sqrt(r) + a*sq;
+    return (abs(den) > 1e-12f) ? (sq/den) : 0.0f;
+}
+
 // Contravariant metric g^μν components in BL
 static void gUU(float r, float theta,
                 float M, float a, float Q, float L,
@@ -183,8 +190,9 @@ kernel void trace_pixel(
     const float M = kp.M, a = kp.a, Q = kp.Q, L = kp.Lambda;
 
     // ── Pixel → (α, β) ───────────────────────────────────────
-    const float alpha = cp.fov_h*(float(px) - 0.5f*(cp.width-1))  / float(cp.width-1);
-    const float beta  = cp.fov_h*(0.5f*(cp.height-1) - float(py)) / float(cp.width-1);
+    const int span = max(cp.width - 1, 1);
+    const float alpha = cp.fov_h*(float(px) - 0.5f*(cp.width-1))  / float(span);
+    const float beta  = cp.fov_h*(0.5f*(cp.height-1) - float(py)) / float(span);
 
     // ── Initial conditions (approx. flat at large r) ──────────
     const float r0  = cp.r_obs;
@@ -259,7 +267,7 @@ kernel void trace_pixel(
         const float cos_th = cos(theta);
         if (prev_cos*cos_th <= 0.0f && r >= kp.r_isco && r <= kp.r_disk_out) {
             // Disk hit
-            const float Omega = sqrt(M) / (pow(r, 1.5f) + a*sqrt(M));
+            const float Omega = keplerian_omega(r, M, a, Q, L);
             const float b_ip  = pphi / (-pt);
             float gll2[4][4];
             gLL_BL(r, M_PI_2_F, M, a, Q, L, gll2);

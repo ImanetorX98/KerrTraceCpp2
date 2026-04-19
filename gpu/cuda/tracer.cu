@@ -33,6 +33,13 @@ __device__ double d_Delta_th(double theta, double a, double L) {
 }
 __device__ double d_Xi(double a, double L) { return 1.0 + L*a*a/3.0; }
 
+__device__ double d_keplerian_omega(double r, double M, double a, double Q, double L) {
+    const double Meff = M - Q*Q/(2.0*r) + L*a*r*r/3.0;
+    const double sq   = sqrt(fmax(Meff, 0.0));
+    const double den  = r*sqrt(r) + a*sq;
+    return (fabs(den) > 1e-14) ? (sq/den) : 0.0;
+}
+
 __device__ void d_gUU(double r, double theta,
                       double M, double a, double Q, double L,
                       double gu[4][4]) {
@@ -130,8 +137,9 @@ __global__ void trace_kernel(uint32_t*              output,
 
     double M=kp.M, a=kp.a, Q=kp.Q, L=kp.Lambda;
 
-    double alpha = cp.fov_h*(px - 0.5*(cp.width-1)) /(cp.width-1);
-    double beta  = cp.fov_h*(0.5*(cp.height-1) - py)/(cp.width-1);
+    int span = (cp.width > 1) ? (cp.width - 1) : 1;
+    double alpha = cp.fov_h*(px - 0.5*(cp.width-1)) / span;
+    double beta  = cp.fov_h*(0.5*(cp.height-1) - py) / span;
 
     double r0=cp.r_obs, th0=cp.theta_obs;
     double gl[4][4]; d_gLL(r0, th0, M, a, Q, L, gl);
@@ -185,7 +193,7 @@ __global__ void trace_kernel(uint32_t*              output,
 
         double cos_th=cos(theta);
         if(prev_cos*cos_th<=0.0 && r>=kp.r_isco && r<=kp.r_disk_out){
-            double Omega=sqrt(M)/(pow(r,1.5)+a*sqrt(M));
+            double Omega=d_keplerian_omega(r, M, a, Q, L);
             double b_=pphi/(-pt);
             double gl2[4][4]; d_gLL(r, M_PI/2.0, M, a, Q, L, gl2);
             double d2=-(gl2[0][0]+2.0*gl2[0][3]*Omega+gl2[3][3]*Omega*Omega);

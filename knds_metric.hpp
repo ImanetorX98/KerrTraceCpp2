@@ -23,6 +23,7 @@
 // ============================================================
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 class KNdSMetric {
 public:
@@ -234,18 +235,83 @@ public:
 
     /// Outer event horizon  r₊  (largest root of Δ_r = 0)
     double r_horizon() const {
-        // Analytical for Λ=Q=0 (pure Kerr)
-        if (std::abs(Lambda) < 1e-15 && std::abs(Q) < 1e-15)
-            return M + std::sqrt(std::max(M*M - a*a, 0.0));
-        // General: bisection on Δ_r
-        double rhi = 2.0*M + std::abs(a) + 1.0;
-        while (Delta_r(rhi) > 0.0 && rhi < 1e4*M) rhi *= 1.5;
-        double rlo = 0.01*M;
-        for (int i = 0; i < 128; ++i) {
-            double rm = 0.5*(rlo + rhi);
-            (Delta_r(rm) < 0.0 ? rhi : rlo) = rm;
+        // Flat case (Λ=0): exact Kerr-Newman outer horizon.
+        if (std::abs(Lambda) < 1e-15) {
+            const double disc = M*M - a*a - Q*Q;
+            return M + std::sqrt(std::max(disc, 0.0));
         }
-        return 0.5*(rlo + rhi);
+
+        // General Λ: detect sign changes of Δ_r on a logarithmic radial scan,
+        // then refine each root by bisection.
+        const double scale = std::max(std::abs(M), 1.0);
+        const double rmin  = std::max(1e-6*scale, 1e-9);
+        double rmax;
+        if (Lambda > 0.0)
+            rmax = std::max(20.0*scale, 1.25*std::sqrt(3.0/Lambda));
+        else
+            rmax = 200.0*scale + 20.0*std::abs(a) + 20.0*std::abs(Q);
+        if (!(rmax > rmin)) rmax = rmin * 10.0;
+
+        auto bisect = [&](double lo, double hi) -> double {
+            double flo = Delta_r(lo), fhi = Delta_r(hi);
+            if (!std::isfinite(flo) || !std::isfinite(fhi))
+                return std::numeric_limits<double>::quiet_NaN();
+            for (int i = 0; i < 160; ++i) {
+                const double mid = 0.5*(lo + hi);
+                const double fmid = Delta_r(mid);
+                if (!std::isfinite(fmid)) break;
+                if ((flo > 0.0 && fmid < 0.0) || (flo < 0.0 && fmid > 0.0)) {
+                    hi  = mid;
+                    fhi = fmid;
+                } else {
+                    lo  = mid;
+                    flo = fmid;
+                }
+            }
+            return 0.5*(lo + hi);
+        };
+
+        double roots[16];
+        int nroots = 0;
+        auto push_root = [&](double rr) {
+            if (!std::isfinite(rr) || rr <= 0.0) return;
+            for (int i = 0; i < nroots; ++i) {
+                const double rel = std::max({1.0, std::abs(roots[i]), std::abs(rr)});
+                if (std::abs(roots[i] - rr) <= 1e-8 * rel) return;
+            }
+            if (nroots < 16) roots[nroots++] = rr;
+        };
+
+        const int samples = 20000;
+        const double log_span = std::log(rmax / rmin);
+        double prev_r = rmin;
+        double prev_f = Delta_r(prev_r);
+        for (int i = 1; i <= samples; ++i) {
+            const double t = double(i) / double(samples);
+            const double r = rmin * std::exp(log_span * t);
+            const double f = Delta_r(r);
+
+            if (std::isfinite(prev_f) && std::isfinite(f)) {
+                if (prev_f == 0.0) push_root(prev_r);
+                if (f == 0.0)      push_root(r);
+                if ((prev_f > 0.0 && f < 0.0) || (prev_f < 0.0 && f > 0.0))
+                    push_root(bisect(prev_r, r));
+            }
+            prev_r = r;
+            prev_f = f;
+        }
+
+        if (nroots == 0) {
+            // Fallback for edge cases where the scan does not resolve a crossing.
+            const double disc = M*M - a*a - Q*Q;
+            return M + std::sqrt(std::max(disc, 0.0));
+        }
+
+        std::sort(roots, roots + nroots);
+        // For Λ>0 the largest positive root is typically cosmological:
+        // choose the next one (outer BH horizon) when available.
+        if (Lambda > 0.0 && nroots >= 2) return roots[nroots - 2];
+        return roots[nroots - 1];
     }
 
     /// ISCO radius (prograde equatorial)
