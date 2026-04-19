@@ -52,6 +52,11 @@ html, body {
   align-items: start;
 }
 
+.right-col {
+  position: sticky;
+  top: 28px;
+}
+
 @media (max-width: 860px) {
   .grid { grid-template-columns: 1fr; }
 }
