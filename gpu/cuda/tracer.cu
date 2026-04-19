@@ -34,10 +34,11 @@ __device__ double d_Delta_th(double theta, double a, double L) {
 __device__ double d_Xi(double a, double L) { return 1.0 + L*a*a/3.0; }
 
 __device__ double d_keplerian_omega(double r, double M, double a, double Q, double L) {
+    const double s    = (a < 0.0) ? -1.0 : 1.0;
     const double Meff = M - Q*Q/(2.0*r) + L*a*r*r/3.0;
     const double sq   = sqrt(fmax(Meff, 0.0));
-    const double den  = r*sqrt(r) + a*sq;
-    return (fabs(den) > 1e-14) ? (sq/den) : 0.0;
+    const double den  = r*sqrt(r) + s*a*sq;
+    return (fabs(den) > 1e-14) ? (s*sq/den) : 0.0;
 }
 
 __device__ void d_gUU(double r, double theta,

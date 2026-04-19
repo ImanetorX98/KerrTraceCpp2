@@ -50,10 +50,11 @@ static float Delta_th(float theta, float a, float L) {
 static float Xi(float a, float L) { return 1.0f + L*a*a/3.0f; }
 
 static float keplerian_omega(float r, float M, float a, float Q, float L) {
+    const float s    = (a < 0.0f) ? -1.0f : 1.0f;
     const float Meff = M - Q*Q/(2.0f*r) + L*a*r*r/3.0f;
     const float sq   = sqrt(max(Meff, 0.0f));
-    const float den  = r*sqrt(r) + a*sq;
-    return (abs(den) > 1e-12f) ? (sq/den) : 0.0f;
+    const float den  = r*sqrt(r) + s*a*sq;
+    return (abs(den) > 1e-12f) ? (s*sq/den) : 0.0f;
 }
 
 // Contravariant metric g^μν components in BL
