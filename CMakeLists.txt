@@ -74,3 +74,21 @@ if(OpenMP_CXX_FOUND AND NOT USE_METAL AND NOT USE_CUDA)
     target_compile_definitions(kerr_tracer PRIVATE _OPENMP)
     message(STATUS "OpenMP enabled (${OpenMP_CXX_VERSION})")
 endif()
+
+# ── Always build Metal binary on macOS (alongside CPU) ────────
+if(APPLE AND NOT USE_METAL)
+    add_executable(kerr_tracer_metal main.cpp gpu/metal/metal_renderer.mm)
+    configure_file(gpu/metal/tracer.metal
+                   ${CMAKE_BINARY_DIR}/tracer.metal COPYONLY)
+    target_include_directories(kerr_tracer_metal PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(kerr_tracer_metal PRIVATE
+        USE_METAL
+        OUT_DIR="${CMAKE_SOURCE_DIR}/out")
+    target_compile_options(kerr_tracer_metal PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -ffast-math -Wall -Wextra>)
+    target_link_libraries(kerr_tracer_metal PRIVATE
+        "-framework Metal"
+        "-framework Foundation"
+        "-framework CoreGraphics")
+    message(STATUS "Metal GPU binary: kerr_tracer_metal")
+endif()

@@ -15,6 +15,7 @@ export interface RenderParams {
   r_obs: number;
   fov: number;
   // Options
+  backend: string;
   bundles: boolean;
   dopri5: boolean;
   background: string;
@@ -72,7 +73,7 @@ export interface ColorizeParams {
 export interface ApiInfo {
   resolutions: string[];
   backgrounds: string[];
-  binary: boolean;
+  backends: string[];
 }
 
 @Injectable({ providedIn: 'root' })

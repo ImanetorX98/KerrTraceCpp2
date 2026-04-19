@@ -456,6 +456,33 @@ html, body {
   margin: 14px 0;
 }
 
+// ── Backend selector ───────────────────────────────────────────
+.backend-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 500;
+  color: $text-lo;
+  background: #111;
+  border: 1px solid $border;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s;
+  white-space: nowrap;
+
+  mat-icon { color: inherit; }
+
+  &:hover { border-color: $border-hi; color: $text-mid; }
+
+  &.active {
+    border-color: $border-hi;
+    background: #1a1a1a;
+    color: $text-hi;
+  }
+}
+
 // ── Recolor label ──────────────────────────────────────────────
 .section-hint {
   font-size: 11px;

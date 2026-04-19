@@ -118,6 +118,22 @@
       <div class="panel" style="margin-bottom:14px">
         <h2>Options</h2>
 
+        <!-- Backend -->
+        <div style="margin-bottom:14px">
+          <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:8px">Compute backend</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button *ngFor="let b of (info?.backends ?? ['cpu'])"
+                    class="backend-btn"
+                    [class.active]="params.backend === b"
+                    (click)="params.backend = b">
+              <mat-icon style="font-size:14px;width:14px;height:14px;margin-right:4px">
+                {{ b === 'metal' ? 'memory' : b === 'cuda' ? 'developer_board' : 'computer' }}
+              </mat-icon>
+              {{ b === 'metal' ? 'Metal GPU' : b === 'cuda' ? 'CUDA GPU' : 'CPU' }}
+            </button>
+          </div>
+        </div>
+
         <div class="switch-row" (click)="params.bundles = !params.bundles">
           <label>Ray bundles</label>
           <button class="switch" [class.on]="params.bundles"></button>

@@ -15,10 +15,26 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server, path: '/ws' });
 
-const ROOT       = path.resolve(__dirname, '..');
-const BINARY     = path.join(ROOT, 'build', 'kerr_tracer');
-const OUT_DIR    = path.join(ROOT, 'out');
-const ASSETS_DIR = path.join(ROOT, 'assets', 'backgrounds');
+const ROOT         = path.resolve(__dirname, '..');
+const BINARY_CPU   = path.join(ROOT, 'build', 'kerr_tracer');
+const BINARY_METAL = path.join(ROOT, 'build', 'kerr_tracer_metal');
+const BINARY_CUDA  = path.join(ROOT, 'build', 'kerr_tracer_cuda');
+const OUT_DIR      = path.join(ROOT, 'out');
+const ASSETS_DIR   = path.join(ROOT, 'assets', 'backgrounds');
+
+function resolveBinary(backend) {
+  if (backend === 'metal' && fs.existsSync(BINARY_METAL)) return BINARY_METAL;
+  if (backend === 'cuda'  && fs.existsSync(BINARY_CUDA))  return BINARY_CUDA;
+  return BINARY_CPU;
+}
+
+function availableBackends() {
+  const b = [];
+  if (fs.existsSync(BINARY_CPU))   b.push('cpu');
+  if (fs.existsSync(BINARY_METAL)) b.push('metal');
+  if (fs.existsSync(BINARY_CUDA))  b.push('cuda');
+  return b;
+}
 
 // ── Resolutions ───────────────────────────────────────────────
 const RESOLUTIONS = {
@@ -63,7 +79,7 @@ app.get('/api/info', (req, res) => {
   res.json({
     resolutions: Object.keys(RESOLUTIONS),
     backgrounds,
-    binary: fs.existsSync(BINARY),
+    backends: availableBackends(),
   });
 });
 
@@ -131,12 +147,12 @@ app.post('/api/colorize', (req, res) => {
   });
 
   proc.on('close', code => {
-    const outPng = fs.readdirSync(OUT_DIR)
-      .filter(f => f.endsWith('.png'))
+    const outFile = fs.readdirSync(OUT_DIR)
+      .filter(f => /\.(png|mp4)$/.test(f))
       .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
       .sort((a, b) => b.t - a.t)[0]?.f ?? null;
 
-    broadcast({ type: 'done', code, file: outPng });
+    broadcast({ type: 'done', code, file: outFile });
     activeJob = null;
   });
 
@@ -148,6 +164,8 @@ app.post('/api/render', (req, res) => {
   if (activeJob) return res.status(409).json({ error: 'Render already running' });
 
   const p = req.body;
+  const binary = resolveBinary(p.backend || 'cpu');
+  if (!fs.existsSync(binary)) return res.status(503).json({ error: `Binary not found: ${binary}` });
 
   // Build argv
   const args = [];
@@ -202,9 +220,16 @@ app.post('/api/render', (req, res) => {
     if (fs.existsSync(bgPath)) args.push('--bg', bgPath);
   }
 
+  // Always save geodesic cache alongside every render
+  if (!p.anim) {
+    const ts = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 15);
+    const geoPath = path.join(OUT_DIR, `geo_${ts}.kgeo`);
+    args.push('--geo-file', geoPath);
+  }
+
   broadcast({ type: 'start', args, resolution: res_key });
 
-  const proc = spawn(BINARY, args, { cwd: ROOT });
+  const proc = spawn(binary, args, { cwd: ROOT });
   activeJob = { proc };
 
   proc.stdout.on('data', chunk => {
@@ -228,12 +253,12 @@ app.post('/api/render', (req, res) => {
   });
 
   proc.on('close', code => {
-    const outPng = fs.readdirSync(OUT_DIR)
-      .filter(f => f.endsWith('.png'))
+    const outFile = fs.readdirSync(OUT_DIR)
+      .filter(f => /\.(png|mp4)$/.test(f))
       .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
       .sort((a, b) => b.t - a.t)[0]?.f ?? null;
 
-    broadcast({ type: 'done', code, file: outPng });
+    broadcast({ type: 'done', code, file: outFile });
     activeJob = null;
   });
 
@@ -251,6 +276,8 @@ app.post('/api/cancel', (req, res) => {
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`KNdS Render Server → http://localhost:${PORT}`);
-  console.log(`Binary: ${BINARY}`);
+  console.log(`Backends: ${availableBackends().join(', ')}`);
+  console.log(`CPU:   ${BINARY_CPU}`);
+  console.log(`Metal: ${BINARY_METAL}`);
   console.log(`Output: ${OUT_DIR}`);
 });

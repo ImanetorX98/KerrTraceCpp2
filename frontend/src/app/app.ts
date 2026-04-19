@@ -39,6 +39,7 @@ export class App implements OnInit, OnDestroy {
     phi: 0,
     r_obs: 30,
     fov: 30,
+    backend: 'cpu',
     bundles: false,
     dopri5: false,
     background: '',
