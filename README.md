@@ -102,8 +102,15 @@ Useful flags:
 - `--ks` / `--bl` (or `--chart ks|bl`)
 - `--bundles`
 - `--dopri5`
+- `--semi-analytic` / `--elliptic` (experimental scaffold; default OFF)
 - `--bg <path>`
 - `--4k`, `--2k`, `--720p`, `--custom-res W H`
+
+Experimental note:
+
+- The separable semi-analytic path is intended as a foundation for
+  future elliptic-function acceleration in Kerr (`Q=0`, `Lambda=0`)
+  BL runs. It is selectable via CLI/UI and is not the default path.
 
 Rendered frames are written under `out/`.
 

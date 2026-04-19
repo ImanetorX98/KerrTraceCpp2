@@ -41,6 +41,7 @@ export class App implements OnInit, OnDestroy {
     fov: 30,
     backend: 'cpu',
     integration_chart: 'ks',
+    semi_analytic: false,
     bundles: false,
     dopri5: false,
     background: '',

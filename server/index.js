@@ -185,6 +185,7 @@ app.post('/api/render', (req, res) => {
 
   if (p.bundles)  args.push('--bundles');
   if (p.dopri5)   args.push('--dopri5');
+  if (p.semi_analytic) args.push('--semi-analytic');
   if (p.integration_chart === 'bl') args.push('--bl');
   else args.push('--ks');
 

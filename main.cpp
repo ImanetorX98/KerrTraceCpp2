@@ -206,6 +206,216 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
     return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
 }
 
+// ── Separable Kerr fast path (Q=0, Lambda=0, BL chart) ──────
+// Uses first integrals from Hamilton-Jacobi separation:
+//   R(r), Theta(theta), and dphi/dlambda from Carter constants.
+// This is a semi-analytic step toward fully elliptic inversion.
+struct SeparableKerrConsts {
+    double M, a;
+    double E;   // E = -p_t
+    double Lz;  // p_phi
+    double Qc;  // Carter constant
+};
+
+struct SeparableState {
+    double r, theta, phi;
+    int sgn_r;
+    int sgn_th;
+};
+
+static bool init_separable_consts(const GeodesicState& s, const KNdSMetric& g,
+                                  SeparableKerrConsts& c) {
+    if (std::abs(g.Q) > 1e-15 || std::abs(g.Lambda) > 1e-15) return false;
+    c.M  = g.M;
+    c.a  = g.a;
+    c.E  = -s.pt;
+    c.Lz = s.pphi;
+    if (!(std::isfinite(c.E) && std::isfinite(c.Lz) && c.E > 0.0)) return false;
+
+    const double st  = std::sin(s.theta);
+    const double ct  = std::cos(s.theta);
+    const double st2 = std::max(st*st, 1e-14);
+    c.Qc = s.ptheta*s.ptheta + ct*ct * (c.Lz*c.Lz/st2 - c.a*c.a*c.E*c.E);
+    return std::isfinite(c.Qc);
+}
+
+static inline double kerr_sep_delta(const SeparableKerrConsts& c, double r) {
+    return r*r - 2.0*c.M*r + c.a*c.a;
+}
+
+static inline double kerr_sep_R(const SeparableKerrConsts& c, double r) {
+    const double r2 = r*r;
+    const double P = c.E*(r2 + c.a*c.a) - c.a*c.Lz;
+    const double K = c.Qc + (c.Lz - c.a*c.E)*(c.Lz - c.a*c.E);
+    return P*P - kerr_sep_delta(c, r) * K;
+}
+
+static inline double kerr_sep_Theta(const SeparableKerrConsts& c, double theta) {
+    const double st = std::sin(theta);
+    const double ct = std::cos(theta);
+    const double st2 = std::max(st*st, 1e-14);
+    return c.Qc - ct*ct * (c.Lz*c.Lz/st2 - c.a*c.a*c.E*c.E);
+}
+
+static bool kerr_sep_rhs(const SeparableKerrConsts& c, const SeparableState& s,
+                         double& dr, double& dth, double& dphi) {
+    const double st = std::sin(s.theta);
+    const double ct = std::cos(s.theta);
+    const double st2 = std::max(st*st, 1e-14);
+    const double sigma = std::max(s.r*s.r + c.a*c.a*ct*ct, 1e-14);
+    const double delta = kerr_sep_delta(c, s.r);
+    const double P = c.E*(s.r*s.r + c.a*c.a) - c.a*c.Lz;
+    const double R = kerr_sep_R(c, s.r);
+    const double Th = kerr_sep_Theta(c, s.theta);
+
+    dr  = double((s.sgn_r >= 0) ? 1 : -1) * std::sqrt(std::max(R,  0.0)) / sigma;
+    dth = double((s.sgn_th>= 0) ? 1 : -1) * std::sqrt(std::max(Th, 0.0)) / sigma;
+    dphi = (c.Lz/st2 + c.a*(P/std::max(delta, 1e-14) - c.E)) / sigma;
+
+    return std::isfinite(dr) && std::isfinite(dth) && std::isfinite(dphi);
+}
+
+static bool rk4_step_separable_kerr(const SeparableKerrConsts& c, SeparableState& s, double h) {
+    double dr1,dth1,dphi1;
+    double dr2,dth2,dphi2;
+    double dr3,dth3,dphi3;
+    double dr4,dth4,dphi4;
+    const SeparableState s0 = s;
+
+    if (!kerr_sep_rhs(c, s0, dr1, dth1, dphi1)) return false;
+
+    SeparableState s2 = s0;
+    s2.r     = s0.r     + 0.5*h*dr1;
+    s2.theta = s0.theta + 0.5*h*dth1;
+    s2.phi   = s0.phi   + 0.5*h*dphi1;
+    if (!kerr_sep_rhs(c, s2, dr2, dth2, dphi2)) return false;
+
+    SeparableState s3 = s0;
+    s3.r     = s0.r     + 0.5*h*dr2;
+    s3.theta = s0.theta + 0.5*h*dth2;
+    s3.phi   = s0.phi   + 0.5*h*dphi2;
+    if (!kerr_sep_rhs(c, s3, dr3, dth3, dphi3)) return false;
+
+    SeparableState s4 = s0;
+    s4.r     = s0.r     + h*dr3;
+    s4.theta = s0.theta + h*dth3;
+    s4.phi   = s0.phi   + h*dphi3;
+    if (!kerr_sep_rhs(c, s4, dr4, dth4, dphi4)) return false;
+
+    s.r     += h/6.0*(dr1   + 2.0*dr2   + 2.0*dr3   + dr4);
+    s.theta += h/6.0*(dth1  + 2.0*dth2  + 2.0*dth3  + dth4);
+    s.phi   += h/6.0*(dphi1 + 2.0*dphi2 + 2.0*dphi3 + dphi4);
+    return std::isfinite(s.r) && std::isfinite(s.theta) && std::isfinite(s.phi);
+}
+
+static bool rk4_adaptive_separable_kerr(const SeparableKerrConsts& c, SeparableState& s,
+                                        double& h, double tol = 1e-8) {
+    const SeparableState s0 = s;
+
+    SeparableState sA = s0;
+    if (!rk4_step_separable_kerr(c, sA, h)) {
+        h = std::max(h*0.5, 1e-10);
+        return false;
+    }
+
+    SeparableState sB = s0;
+    if (!rk4_step_separable_kerr(c, sB, 0.5*h) ||
+        !rk4_step_separable_kerr(c, sB, 0.5*h)) {
+        h = std::max(h*0.5, 1e-10);
+        return false;
+    }
+
+    const double err = std::sqrt(
+        (sA.r     - sB.r)     * (sA.r     - sB.r) +
+        (sA.theta - sB.theta) * (sA.theta - sB.theta) +
+        (sA.phi   - sB.phi)   * (sA.phi   - sB.phi)
+    ) / 15.0;
+
+    if (!std::isfinite(err)) {
+        h = std::max(h*0.5, 1e-10);
+        return false;
+    }
+
+    if (err < tol || h < 1e-10) {
+        s = sB;
+        const double sc = (err > 1e-14) ? 0.9 * std::pow(tol/err, 0.2) : 4.0;
+        h = clamp(h*sc, 1e-10, 100.0);
+        return true;
+    }
+
+    h = std::max(h * 0.9 * std::pow(tol/err, 0.25), 1e-10);
+    return false;
+}
+
+static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMetric& g,
+                                               double r_disk_in, double r_disk_out,
+                                               double r_escape) {
+    SeparableKerrConsts c{};
+    if (!init_separable_consts(s_bl, g, c))
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
+
+    // Initial signs from BL canonical velocity directions.
+    double dr0=0.0, dth0=0.0, dpr0=0.0, dpth0=0.0;
+    geodesic_rhs(g, s_bl.r, s_bl.theta, s_bl.pr, s_bl.ptheta, s_bl.pt, s_bl.pphi,
+                 dr0, dth0, dpr0, dpth0);
+    SeparableState s{ s_bl.r, s_bl.theta, s_bl.phi,
+                      (dr0 >= 0.0 ? 1 : -1),
+                      (dth0 >= 0.0 ? 1 : -1) };
+
+    const double rh = g.r_horizon();
+    double h = 1.0;
+    double prev_r = s.r;
+    double prev_cos = std::cos(s.theta);
+    double prev_Rpot = kerr_sep_R(c, s.r);
+    double prev_Thpot = kerr_sep_Theta(c, s.theta);
+    const double R_turn_eps = 1e-9;
+    const double Th_turn_eps = 1e-11;
+
+    for (int it = 0; it < 500000; ++it) {
+        int rejects = 0;
+        while (!rk4_adaptive_separable_kerr(c, s, h)) {
+            if (!std::isfinite(h) || ++rejects > 64)
+                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
+        }
+
+        // Keep theta in [0, pi].
+        if (s.theta < 0.0) {
+            s.theta = -s.theta;
+            s.sgn_th *= -1;
+        } else if (s.theta > M_PI) {
+            s.theta = 2.0*M_PI - s.theta;
+            s.sgn_th *= -1;
+        }
+
+        // Turning points in separated potentials: flip branch signs.
+        const double Rnow = kerr_sep_R(c, s.r);
+        const double Thnow = kerr_sep_Theta(c, s.theta);
+        if (Rnow <= R_turn_eps && prev_Rpot > R_turn_eps) s.sgn_r *= -1;
+        if (Thnow <= Th_turn_eps && prev_Thpot > Th_turn_eps) s.sgn_th *= -1;
+
+        if (s.r < rh*1.03)  return {Outcome::HORIZON, s.r, 0.0};
+        if (s.r > r_escape) return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+
+        const double cc = std::cos(s.theta);
+        if (prev_cos*cc <= 0.0) {
+            const double denom = prev_cos - cc;
+            double w = (std::abs(denom) > 1e-14) ? (prev_cos / denom) : 0.5;
+            w = clamp(w, 0.0, 1.0);
+            const double r_hit = prev_r + w*(s.r - prev_r);
+            if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
+                return {Outcome::DISK_HIT, r_hit,
+                        clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g), 0.0, 20.0)};
+            }
+        }
+        prev_cos = cc;
+        prev_r = s.r;
+        prev_Rpot = Rnow;
+        prev_Thpot = Thnow;
+    }
+
+    return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+}
+
 // ── KS single-ray tracing (CPU) ───────────────────────────────
 // Uses Kerr-Schild Cartesian coordinates (Lambda=0 chart) with
 // numerical Hamiltonian gradients in (X,Y,Z).
@@ -589,6 +799,7 @@ static std::vector<GeoPixel> trace_geodesics(
     int W, int H,
     const FrameParams& fp,
     bool use_bundles,
+    bool use_semi_analytic,
     CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
@@ -648,6 +859,8 @@ static std::vector<GeoPixel> trace_geodesics(
                 auto s   = cam.pixel_ray(px_, py, g);
                 auto res = (eff_chart == CoordinateChart::KS)
                          ? trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg)
+                         : (use_semi_analytic && std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15)
+                         ? trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape)
                          : trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg);
                 pix.outcome   = (res.out==Outcome::DISK_HIT) ? 1
                               : (res.out==Outcome::HORIZON)   ? 2 : 0;
@@ -675,6 +888,7 @@ static std::vector<RGB> render_image(
     const FrameParams& fp,
     const BackgroundImage& bg,
     bool use_bundles,
+    bool use_semi_analytic,
     CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
@@ -685,7 +899,7 @@ static std::vector<RGB> render_image(
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
                               (chart == CoordinateChart::KS && ks_chart_supported);
-    if (!use_bundles && gpu_chart_ok) {
+    if (!use_bundles && !use_semi_analytic && gpu_chart_ok) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
@@ -710,6 +924,8 @@ static std::vector<RGB> render_image(
     if (!warned_metal_fallback) {
         if (use_bundles)
             std::cerr << "Info: Metal backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
+        else if (use_semi_analytic)
+            std::cerr << "Info: semi-analytic BL path currently runs on CPU; using CPU fallback.\n";
         else if (chart == CoordinateChart::KS && !ks_chart_supported)
             std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
         else
@@ -717,7 +933,7 @@ static std::vector<RGB> render_image(
         warned_metal_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 
@@ -725,7 +941,7 @@ static std::vector<RGB> render_image(
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
                               (chart == CoordinateChart::KS && ks_chart_supported);
-    if (!use_bundles && gpu_chart_ok) {
+    if (!use_bundles && !use_semi_analytic && gpu_chart_ok) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
@@ -746,6 +962,8 @@ static std::vector<RGB> render_image(
     if (!warned_cuda_fallback) {
         if (use_bundles)
             std::cerr << "Info: CUDA backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
+        else if (use_semi_analytic)
+            std::cerr << "Info: semi-analytic BL path currently runs on CPU; using CPU fallback.\n";
         else if (chart == CoordinateChart::KS && !ks_chart_supported)
             std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
         else
@@ -753,14 +971,14 @@ static std::vector<RGB> render_image(
         warned_cuda_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 
 #else
     // CPU: two-phase
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 #endif
@@ -790,6 +1008,7 @@ int main(int argc, char** argv) {
     int  custom_w=0, custom_h=0;
     Integrator intg=Integrator::RK4_DOUBLING;
     CoordinateChart chart=CoordinateChart::KS;
+    bool use_semi_analytic=false;
     std::string bg_path;
 
     // ── Single-frame / base params ───────────────────────────
@@ -824,6 +1043,7 @@ int main(int argc, char** argv) {
         // Resolution
         if (arg=="--bundles")  use_bundles=true;
         if (arg=="--dopri5")   intg=Integrator::DOPRI5;
+        if (arg=="--semi-analytic" || arg=="--elliptic") use_semi_analytic=true;
         if (arg=="--bl")       chart=CoordinateChart::BL;
         if (arg=="--ks")       chart=CoordinateChart::KS;
         if (arg=="--chart" && i+1<argc) {
@@ -965,6 +1185,7 @@ int main(int argc, char** argv) {
                   << "Mode: " << (use_bundles?"ray bundles":"single ray")
                   << "  chart=" << (chart==CoordinateChart::KS?"KS":"BL")
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
+                  << "  " << (use_semi_analytic?"semi-analytic":"standard")
                   << "  " << W << "x" << H << "\n"
                   << "ColorParams: exp=" << cp.exposure
                   << " γ=" << cp.gamma
@@ -975,7 +1196,7 @@ int main(int argc, char** argv) {
         if (geo_only) {
             // Phase 1 only: trace and save .kgeo
             KGeoMeta meta;
-            auto geo = trace_geodesics(W, H, fp, use_bundles, chart, intg,
+            auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg,
                                        M_bh, Q_bh, Lam, &meta);
             double elapsed=get_time()-t0;
             std::cout << "Trace: " << elapsed << "s  ("
@@ -992,7 +1213,7 @@ int main(int argc, char** argv) {
         } else {
             // Full render (Phase 1 + Phase 2, optionally save .kgeo)
             std::vector<GeoPixel> geo;
-            auto image = render_image(W, H, fp, bg, use_bundles, chart, intg,
+            auto image = render_image(W, H, fp, bg, use_bundles, use_semi_analytic, chart, intg,
                                       M_bh, Q_bh, Lam, cp,
                                       geo_file.empty() ? nullptr : &geo);
             double elapsed=get_time()-t0;
@@ -1093,7 +1314,7 @@ int main(int argc, char** argv) {
                  <<"°  r="<<std::setprecision(2)<<fp.r_obs
                  <<"  a="<<std::setprecision(4)<<fp.a<<" ...\n"<<std::flush;
 
-        auto image=render_image(W,H,fp,bg,use_bundles,chart,intg,M_bh,Q_bh,Lam,cp);
+        auto image=render_image(W,H,fp,bg,use_bundles,use_semi_analytic,chart,intg,M_bh,Q_bh,Lam,cp);
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;
