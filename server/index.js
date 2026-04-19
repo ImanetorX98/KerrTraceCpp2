@@ -86,6 +86,63 @@ app.get('/api/renders/:file', (req, res) => {
   res.sendFile(file);
 });
 
+// ── GET /api/geo-files ────────────────────────────────────────
+app.get('/api/geo-files', (req, res) => {
+  const files = fs.readdirSync(OUT_DIR)
+    .filter(f => f.endsWith('.kgeo'))
+    .map(f => {
+      const stat = fs.statSync(path.join(OUT_DIR, f));
+      return { name: f, size: stat.size, mtime: stat.mtime };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+  res.json(files);
+});
+
+// ── POST /api/colorize ────────────────────────────────────────
+app.post('/api/colorize', (req, res) => {
+  if (activeJob) return res.status(409).json({ error: 'Render already running' });
+
+  const { geoFile, exposure, gamma, tempScale } = req.body;
+  if (!geoFile) return res.status(400).json({ error: 'geoFile required' });
+
+  const geoPath = path.join(OUT_DIR, geoFile);
+  if (!fs.existsSync(geoPath)) return res.status(404).json({ error: 'geo file not found' });
+
+  const args = ['--color-only', geoPath];
+  if (exposure  !== undefined) args.push('--exposure',   String(exposure));
+  if (gamma     !== undefined) args.push('--gamma',      String(gamma));
+  if (tempScale !== undefined) args.push('--temp-scale', String(tempScale));
+
+  broadcast({ type: 'start', args, resolution: 'recolor' });
+
+  const proc = spawn(BINARY, args, { cwd: ROOT });
+  activeJob = { proc };
+
+  proc.stdout.on('data', chunk => {
+    broadcast({ type: 'stdout', line: chunk.toString() });
+  });
+
+  proc.stderr.on('data', chunk => {
+    const raw = chunk.toString();
+    const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
+    if (match) {
+      broadcast({ type: 'progress', pct: parseInt(match[1]), elapsed: parseFloat(match[2]), eta: parseFloat(match[3]) });
+    }
+  });
+
+  proc.on('close', code => {
+    const outPng = fs.readdirSync(OUT_DIR)
+      .filter(f => f.endsWith('.png'))
+      .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
+      .sort((a, b) => b.t - a.t)[0]?.f ?? null;
+
+    broadcast({ type: 'done', code, file: outPng });
+    activeJob = null;
+  });
+
+  res.json({ status: 'started', args });
+});
+
 // ── POST /api/render ──────────────────────────────────────────
 app.post('/api/render', (req, res) => {
   if (activeJob) return res.status(409).json({ error: 'Render already running' });

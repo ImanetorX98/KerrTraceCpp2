@@ -13,7 +13,7 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatIconModule } from '@angular/material/icon';
 import { MatTooltipModule } from '@angular/material/tooltip';
 
-import { RenderService, RenderParams, RenderFile, ApiInfo } from './render.service';
+import { RenderService, RenderParams, RenderFile, GeoFile, ColorizeParams, ApiInfo } from './render.service';
 
 @Component({
   selector: 'app-root',
@@ -54,6 +54,11 @@ export class App implements OnInit, OnDestroy {
   renders: RenderFile[] = [];
   activeRender: string | null = null;
 
+  // ── Post-process panel ────────────────────────────────────────
+  geoFiles: GeoFile[] = [];
+  colorParams: ColorizeParams = { geoFile: '', exposure: 1.0, gamma: 2.2, tempScale: 1.0 };
+  postProcessTab: 'render' | 'recolor' = 'render';
+
   readonly previewUrl = computed(() => {
     if (!this.activeRender) return null;
     return this.svc.renderUrl(this.activeRender);
@@ -68,6 +73,7 @@ export class App implements OnInit, OnDestroy {
       this.info = info;
     });
     this.loadRenders();
+    this.loadGeoFiles();
 
     this.sub = this.svc.messages$.subscribe(msg => {
       switch (msg.type) {
@@ -94,7 +100,7 @@ export class App implements OnInit, OnDestroy {
           this.progress.set(100);
           if (msg.file) {
             this.activeRender = msg.file;
-            setTimeout(() => this.loadRenders(), 500);
+            setTimeout(() => { this.loadRenders(); this.loadGeoFiles(); }, 500);
           }
           break;
       }
@@ -125,6 +131,26 @@ export class App implements OnInit, OnDestroy {
       if (!this.activeRender && files.length > 0) {
         this.activeRender = files[0].name;
       }
+    });
+  }
+
+  loadGeoFiles() {
+    this.svc.getGeoFiles().subscribe(files => {
+      this.geoFiles = files;
+      if (!this.colorParams.geoFile && files.length > 0) {
+        this.colorParams.geoFile = files[0].name;
+      }
+    });
+  }
+
+  startColorize() {
+    if (!this.colorParams.geoFile) return;
+    this.svc.colorize(this.colorParams).subscribe({
+      next: () => { this.status.set('running'); this.progress.set(0); },
+      error: err => {
+        if (err.status === 409) alert('Render already running');
+        else console.error(err);
+      },
     });
   }
 

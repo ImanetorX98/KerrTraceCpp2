@@ -32,6 +32,19 @@ export interface RenderFile {
   mtime: string;
 }
 
+export interface GeoFile {
+  name: string;
+  size: number;
+  mtime: string;
+}
+
+export interface ColorizeParams {
+  geoFile: string;
+  exposure: number;
+  gamma: number;
+  tempScale: number;
+}
+
 export interface ApiInfo {
   resolutions: string[];
   backgrounds: string[];
@@ -80,6 +93,14 @@ export class RenderService {
 
   cancelRender() {
     return this.http.post<{ status: string }>('/api/cancel', {});
+  }
+
+  getGeoFiles() {
+    return this.http.get<GeoFile[]>('/api/geo-files');
+  }
+
+  colorize(params: ColorizeParams) {
+    return this.http.post<{ status: string; args: string[] }>('/api/colorize', params);
   }
 
   renderUrl(filename: string): string {
