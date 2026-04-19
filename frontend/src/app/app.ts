@@ -37,10 +37,18 @@ export class App implements OnInit, OnDestroy {
     lambda: 0.0,
     disk_out: 25,
     theta: 80,
+    phi: 0,
     r_obs: 30,
+    fov: 30,
     bundles: false,
     dopri5: false,
     background: '',
+    anim: false,
+    anim_frames: 60,
+    anim_fps: 30,
+    anim_crf: 18,
+    anim_orbits: 1,
+    anim_ease: true,
   };
 
   // ── State signals ─────────────────────────────────────────────

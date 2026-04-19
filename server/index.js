@@ -174,6 +174,28 @@ app.post('/api/render', (req, res) => {
   if (p.r_obs  !== undefined) args.push('--r-obs',   String(p.r_obs));
   if (p.q      !== undefined && p.q  !== 0) args.push('--charge', String(p.q));
   if (p.lambda !== undefined && p.lambda !== 0) args.push('--lambda', String(p.lambda));
+  if (p.fov    !== undefined && p.fov !== 30) args.push('--fov', String(p.fov));
+  if (p.phi    !== undefined && p.phi !== 0)  args.push('--phi',    String(p.phi));
+
+  // Animation flags
+  if (p.anim) {
+    args.push('--anim');
+    if (p.anim_frames)   args.push('--frames',   String(p.anim_frames));
+    if (p.anim_fps)      args.push('--fps',       String(p.anim_fps));
+    if (p.anim_crf)      args.push('--crf',       String(p.anim_crf));
+    if (p.anim_orbits)   args.push('--orbits',    String(p.anim_orbits));
+    if (p.anim_ease)     args.push('--ease');
+    if (p.anim_theta_start !== undefined) args.push('--theta-start',    String(p.anim_theta_start));
+    if (p.anim_theta_end   !== undefined) args.push('--theta-end',      String(p.anim_theta_end));
+    if (p.anim_phi_start   !== undefined) args.push('--phi-start',      String(p.anim_phi_start));
+    if (p.anim_phi_end     !== undefined) args.push('--phi-end',        String(p.anim_phi_end));
+    if (p.anim_r_start     !== undefined) args.push('--r-start',        String(p.anim_r_start));
+    if (p.anim_r_end       !== undefined) args.push('--r-end',          String(p.anim_r_end));
+    if (p.anim_a_start     !== undefined) args.push('--a-start',        String(p.anim_a_start));
+    if (p.anim_a_end       !== undefined) args.push('--a-end',          String(p.anim_a_end));
+    if (p.anim_disk_start  !== undefined) args.push('--disk-out-start', String(p.anim_disk_start));
+    if (p.anim_disk_end    !== undefined) args.push('--disk-out-end',   String(p.anim_disk_end));
+  }
 
   if (p.background) {
     const bgPath = path.join(ASSETS_DIR, p.background);

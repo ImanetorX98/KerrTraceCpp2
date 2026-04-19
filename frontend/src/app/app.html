@@ -86,9 +86,16 @@
         <h2>Camera</h2>
 
         <div class="param-row">
-          <label>Inclination</label>
+          <label>Inclination θ</label>
           <num-input [(value)]="params.theta"
                      [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°">
+          </num-input>
+        </div>
+
+        <div class="param-row">
+          <label>Azimuth φ</label>
+          <num-input [(value)]="params.phi"
+                     [min]="-180" [max]="180" [step]="5" [decimals]="0" unit="°">
           </num-input>
         </div>
 
@@ -96,6 +103,13 @@
           <label><i>r</i><sub>obs</sub></label>
           <num-input [(value)]="params.r_obs"
                      [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M">
+          </num-input>
+        </div>
+
+        <div class="param-row">
+          <label>FOV</label>
+          <num-input [(value)]="params.fov"
+                     [min]="1" [max]="120" [step]="1" [decimals]="0" unit="°">
           </num-input>
         </div>
       </div>
@@ -110,6 +124,9 @@
           <mat-slide-toggle [(ngModel)]="params.dopri5">
             DOPRI5 integrator
           </mat-slide-toggle>
+          <mat-slide-toggle [(ngModel)]="params.anim">
+            Animation mode
+          </mat-slide-toggle>
         </div>
 
         <hr class="divider">
@@ -122,6 +139,104 @@
             {{bg}}
           </mat-option>
         </mat-select>
+      </div>
+
+      <!-- Animation panel -->
+      <div class="panel anim-panel" style="margin-bottom:14px" *ngIf="params.anim">
+        <h2>Animation</h2>
+
+        <!-- Timing -->
+        <div class="anim-section-label">Timing</div>
+        <div class="param-row">
+          <label>Frames</label>
+          <num-input [(value)]="params.anim_frames"
+                     [min]="2" [max]="9999" [step]="1" [decimals]="0">
+          </num-input>
+        </div>
+        <div class="param-row">
+          <label>FPS</label>
+          <num-input [(value)]="params.anim_fps"
+                     [min]="1" [max]="60" [step]="1" [decimals]="0">
+          </num-input>
+        </div>
+        <div class="param-row">
+          <label>CRF quality</label>
+          <num-input [(value)]="params.anim_crf"
+                     [min]="0" [max]="51" [step]="1" [decimals]="0">
+          </num-input>
+        </div>
+        <div class="param-row">
+          <label>Orbits φ</label>
+          <num-input [(value)]="params.anim_orbits"
+                     [min]="0" [max]="10" [step]="0.25" [decimals]="2">
+          </num-input>
+        </div>
+        <div class="param-row" style="border:none;padding-top:4px">
+          <label>Easing</label>
+          <mat-slide-toggle [(ngModel)]="params.anim_ease"></mat-slide-toggle>
+        </div>
+
+        <hr class="divider">
+
+        <!-- Sweep ranges -->
+        <div class="anim-section-label">Sweep ranges
+          <span class="anim-hint">(leave blank = fixed at current value)</span>
+        </div>
+
+        <div class="anim-sweep-row">
+          <span class="anim-sweep-label">Spin <i>a/M</i></span>
+          <num-input [(value)]="params.anim_a_start!"
+                     [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3">
+          </num-input>
+          <span class="anim-arrow">→</span>
+          <num-input [(value)]="params.anim_a_end!"
+                     [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3">
+          </num-input>
+        </div>
+
+        <div class="anim-sweep-row">
+          <span class="anim-sweep-label">Inclination θ</span>
+          <num-input [(value)]="params.anim_theta_start!"
+                     [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°">
+          </num-input>
+          <span class="anim-arrow">→</span>
+          <num-input [(value)]="params.anim_theta_end!"
+                     [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°">
+          </num-input>
+        </div>
+
+        <div class="anim-sweep-row">
+          <span class="anim-sweep-label">Azimuth φ</span>
+          <num-input [(value)]="params.anim_phi_start!"
+                     [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°">
+          </num-input>
+          <span class="anim-arrow">→</span>
+          <num-input [(value)]="params.anim_phi_end!"
+                     [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°">
+          </num-input>
+        </div>
+
+        <div class="anim-sweep-row">
+          <span class="anim-sweep-label"><i>r</i><sub>obs</sub></span>
+          <num-input [(value)]="params.anim_r_start!"
+                     [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M">
+          </num-input>
+          <span class="anim-arrow">→</span>
+          <num-input [(value)]="params.anim_r_end!"
+                     [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M">
+          </num-input>
+        </div>
+
+        <div class="anim-sweep-row">
+          <span class="anim-sweep-label">Disk r<sub>out</sub></span>
+          <num-input [(value)]="params.anim_disk_start!"
+                     [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
+          </num-input>
+          <span class="anim-arrow">→</span>
+          <num-input [(value)]="params.anim_disk_end!"
+                     [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
+          </num-input>
+        </div>
       </div>
 
       <!-- Actions -->

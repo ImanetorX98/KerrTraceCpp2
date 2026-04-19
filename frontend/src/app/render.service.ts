@@ -4,15 +4,37 @@ import { Subject } from 'rxjs';
 
 export interface RenderParams {
   resolution: string;
+  // Black hole
   a: number;
   q: number;
   lambda: number;
   disk_out: number;
+  // Camera
   theta: number;
+  phi: number;
   r_obs: number;
+  fov: number;
+  // Options
   bundles: boolean;
   dopri5: boolean;
   background: string;
+  // Animation
+  anim: boolean;
+  anim_frames: number;
+  anim_fps: number;
+  anim_crf: number;
+  anim_orbits: number;
+  anim_ease: boolean;
+  anim_theta_start?: number;
+  anim_theta_end?: number;
+  anim_phi_start?: number;
+  anim_phi_end?: number;
+  anim_r_start?: number;
+  anim_r_end?: number;
+  anim_a_start?: number;
+  anim_a_end?: number;
+  anim_disk_start?: number;
+  anim_disk_end?: number;
 }
 
 export interface WsMessage {

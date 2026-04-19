@@ -272,7 +272,7 @@ static void print_progress(int done, int total, double elapsed) {
 
 // ── Per-frame camera/physics parameters ───────────────────────
 struct FrameParams {
-    double a=0.998, theta=80.0, phi=0.0, r_obs=500.0, disk_out=25.0;
+    double a=0.998, theta=80.0, phi=0.0, r_obs=500.0, disk_out=25.0, fov=30.0;
 };
 
 // ── Phase 1: trace all geodesics → GeoPixel buffer ───────────
@@ -286,7 +286,7 @@ static std::vector<GeoPixel> trace_geodesics(
 {
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
     const double r_isco   = g.r_isco();
-    Camera cam(fp.r_obs, fp.theta, fp.phi, 30.0, W, H);
+    Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
     const double r_disk_in  = r_isco;
     const double r_disk_out = fp.disk_out;
     const double r_escape   = cam.r_obs * 1.05;
@@ -354,7 +354,7 @@ static std::vector<RGB> render_image(
     // Metal path: no geo separation yet, direct render
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
     const double r_isco = g.r_isco();
-    Camera cam(fp.r_obs, fp.theta, fp.phi, 30.0, W, H);
+    Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
     KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
                      (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
     CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.fov_h,W,H};
@@ -370,7 +370,7 @@ static std::vector<RGB> render_image(
 #elif defined(USE_CUDA)
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
     const double r_isco = g.r_isco();
-    Camera cam(fp.r_obs, fp.theta, fp.phi, 30.0, W, H);
+    Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
     KNdSParams_CUDA kpcuda{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,fp.disk_out};
     CameraParams_CUDA cpcuda{cam.r_obs,cam.theta_obs,cam.fov_h,W,H};
     auto px32 = cuda_render(kpcuda, cpcuda);
@@ -418,7 +418,7 @@ int main(int argc, char** argv) {
 
     // ── Single-frame / base params ───────────────────────────
     double arg_a=0.998, arg_disk_out=25.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
-    double arg_Q=0.0, arg_Lam=0.0;
+    double arg_Q=0.0, arg_Lam=0.0, arg_fov=30.0;
 
     // ── Colorization params ───────────────────────────────────
     ColorParams cp;  // defaults: exposure=1, gamma=2.2, temp_scale=1
@@ -466,6 +466,7 @@ int main(int argc, char** argv) {
         if (arg=="--r-obs"    && i+1<argc) arg_r_obs    = std::stod(argv[++i]);
         if (arg=="--charge"   && i+1<argc) arg_Q        = std::stod(argv[++i]);
         if (arg=="--lambda"   && i+1<argc) arg_Lam      = std::stod(argv[++i]);
+        if (arg=="--fov"      && i+1<argc) arg_fov      = std::stod(argv[++i]);
 
         // Colorization
         if (arg=="--exposure"   && i+1<argc) cp.exposure   = std::stod(argv[++i]);
@@ -571,6 +572,7 @@ int main(int argc, char** argv) {
         FrameParams fp;
         fp.a=arg_a; fp.theta=arg_theta; fp.phi=arg_phi;
         fp.r_obs=base_r_obs*M_bh; fp.disk_out=arg_disk_out*M_bh;
+        fp.fov=arg_fov;
 
         KNdSMetric g_info(M_bh,fp.a,Q_bh,Lam);
         std::cout << "KNdS  M=" << M_bh << " a=" << fp.a
