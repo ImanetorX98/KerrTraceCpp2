@@ -7,7 +7,6 @@ import { Subscription } from 'rxjs';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
 import { NumericInputComponent } from './numeric-input.component';
 import { MatSelectModule } from '@angular/material/select';
-import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatIconModule } from '@angular/material/icon';
 import { MatTooltipModule } from '@angular/material/tooltip';
 
@@ -19,7 +18,7 @@ import { RenderService, RenderParams, RenderFile, GeoFile, ColorizeParams, ApiIn
   imports: [
     CommonModule, FormsModule, HttpClientModule,
     MatProgressBarModule, MatSelectModule,
-    MatSlideToggleModule, MatIconModule, MatTooltipModule,
+    MatIconModule, MatTooltipModule,
     NumericInputComponent,
   ],
   templateUrl: './app.html',
@@ -49,6 +48,16 @@ export class App implements OnInit, OnDestroy {
     anim_crf: 18,
     anim_orbits: 1,
     anim_ease: true,
+    anim_a_start: 0.998,
+    anim_a_end: 0.998,
+    anim_theta_start: 80,
+    anim_theta_end: 80,
+    anim_phi_start: 0,
+    anim_phi_end: 360,
+    anim_r_start: 30,
+    anim_r_end: 30,
+    anim_disk_start: 25,
+    anim_disk_end: 25,
   };
 
   // ── State signals ─────────────────────────────────────────────

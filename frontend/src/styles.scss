@@ -203,15 +203,6 @@ html, body {
 
 // ── Angular Material overrides ─────────────────────────────────
 
-// Slider track/thumb
-.mat-mdc-slider {
-  --mdc-slider-active-track-color: #{$accent-dim};
-  --mdc-slider-inactive-track-color: #{$border};
-  --mdc-slider-handle-color: #{$text-hi};
-  --mdc-slider-focus-handle-color: #{$text-hi};
-  --mdc-slider-hover-handle-color: #{$text-hi};
-}
-
 // Select
 .mat-mdc-select {
   font-size: 13px;
@@ -219,12 +210,60 @@ html, body {
 }
 .mat-mdc-form-field { width: 100%; }
 
-// Slide toggle
-.mat-mdc-slide-toggle {
-  --mdc-switch-unselected-track-color: #{$border-hi};
-  --mdc-switch-unselected-handle-color: #{$text-lo};
-  font-size: 13px;
-  color: $text-mid;
+// ── Custom compact switch ───────────────────────────────────────
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid #111;
+  cursor: pointer;
+
+  &:last-child { border-bottom: none; }
+
+  label {
+    font-size: 13px;
+    color: $text-mid;
+    cursor: pointer;
+    user-select: none;
+    flex: 1;
+  }
+}
+
+.switch {
+  width: 34px;
+  height: 20px;
+  border-radius: 10px;
+  background: #1a1a1a;
+  border: 1px solid #2e2e2e;
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+  transition: background .18s, border-color .18s;
+  padding: 0;
+  outline: none;
+
+  &::after {
+    content: '';
+    position: absolute;
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: #3a3a3a;
+    top: 3px;
+    left: 3px;
+    transition: transform .18s, background .18s;
+  }
+
+  &.on {
+    background: #1e1e1e;
+    border-color: #505050;
+
+    &::after {
+      transform: translateX(14px);
+      background: $text-hi;
+    }
+  }
 }
 
 // Flat button (primary action)
@@ -427,47 +466,41 @@ html, body {
 
 // ── Animation panel ────────────────────────────────────────────
 .anim-panel {
-  border-color: #222;
-  background: #0a0a0a;
+  border-color: #1e1e1e;
 }
 
 .anim-section-label {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: .1em;
+  letter-spacing: .12em;
   color: $text-lo;
-  margin: 0 0 10px;
+  margin: 14px 0 8px;
+
+  &:first-child { margin-top: 0; }
 }
 
-.anim-hint {
-  font-weight: 400;
-  text-transform: none;
-  letter-spacing: 0;
-  color: #333;
-  font-size: 10px;
-  margin-left: 6px;
-}
-
-.anim-sweep-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 0;
+.anim-sweep-item {
+  padding: 6px 0;
   border-bottom: 1px solid #111;
 
   &:last-child { border-bottom: none; }
 }
 
-.anim-sweep-label {
-  font-size: 12px;
-  color: $text-mid;
-  width: 80px;
-  flex-shrink: 0;
+.anim-sweep-item-label {
+  font-size: 11px;
+  color: $text-lo;
+  margin-bottom: 5px;
+}
+
+.anim-sweep-inputs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .anim-arrow {
-  font-size: 12px;
-  color: #333;
+  font-size: 11px;
+  color: #2e2e2e;
   flex-shrink: 0;
 }

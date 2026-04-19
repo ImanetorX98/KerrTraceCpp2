@@ -117,16 +117,18 @@
       <!-- Options -->
       <div class="panel" style="margin-bottom:14px">
         <h2>Options</h2>
-        <div style="display:flex;flex-direction:column;gap:10px">
-          <mat-slide-toggle [(ngModel)]="params.bundles">
-            Ray bundles
-          </mat-slide-toggle>
-          <mat-slide-toggle [(ngModel)]="params.dopri5">
-            DOPRI5 integrator
-          </mat-slide-toggle>
-          <mat-slide-toggle [(ngModel)]="params.anim">
-            Animation mode
-          </mat-slide-toggle>
+
+        <div class="switch-row" (click)="params.bundles = !params.bundles">
+          <label>Ray bundles</label>
+          <button class="switch" [class.on]="params.bundles"></button>
+        </div>
+        <div class="switch-row" (click)="params.dopri5 = !params.dopri5">
+          <label>DOPRI5 integrator</label>
+          <button class="switch" [class.on]="params.dopri5"></button>
+        </div>
+        <div class="switch-row" (click)="params.anim = !params.anim">
+          <label>Animation mode</label>
+          <button class="switch" [class.on]="params.anim"></button>
         </div>
 
         <hr class="divider">
@@ -149,93 +151,76 @@
         <div class="anim-section-label">Timing</div>
         <div class="param-row">
           <label>Frames</label>
-          <num-input [(value)]="params.anim_frames"
-                     [min]="2" [max]="9999" [step]="1" [decimals]="0">
-          </num-input>
+          <num-input [(value)]="params.anim_frames" [min]="2" [max]="9999" [step]="1" [decimals]="0"></num-input>
         </div>
         <div class="param-row">
           <label>FPS</label>
-          <num-input [(value)]="params.anim_fps"
-                     [min]="1" [max]="60" [step]="1" [decimals]="0">
-          </num-input>
+          <num-input [(value)]="params.anim_fps" [min]="1" [max]="60" [step]="1" [decimals]="0"></num-input>
         </div>
         <div class="param-row">
           <label>CRF quality</label>
-          <num-input [(value)]="params.anim_crf"
-                     [min]="0" [max]="51" [step]="1" [decimals]="0">
-          </num-input>
+          <num-input [(value)]="params.anim_crf" [min]="0" [max]="51" [step]="1" [decimals]="0"></num-input>
         </div>
         <div class="param-row">
           <label>Orbits φ</label>
-          <num-input [(value)]="params.anim_orbits"
-                     [min]="0" [max]="10" [step]="0.25" [decimals]="2">
-          </num-input>
+          <num-input [(value)]="params.anim_orbits" [min]="0" [max]="10" [step]="0.25" [decimals]="2"></num-input>
         </div>
-        <div class="param-row" style="border:none;padding-top:4px">
-          <label>Easing</label>
-          <mat-slide-toggle [(ngModel)]="params.anim_ease"></mat-slide-toggle>
+        <div class="switch-row" style="border-bottom:none;padding:6px 0 0" (click)="params.anim_ease = !params.anim_ease">
+          <label>Smooth easing</label>
+          <button class="switch" [class.on]="params.anim_ease"></button>
         </div>
-
-        <hr class="divider">
 
         <!-- Sweep ranges -->
-        <div class="anim-section-label">Sweep ranges
-          <span class="anim-hint">(leave blank = fixed at current value)</span>
+        <div class="anim-section-label" style="margin-top:16px">
+          Sweep ranges
+        </div>
+        <div style="font-size:11px;color:#333;margin-bottom:10px">
+          Set start → end for each param to animate
         </div>
 
-        <div class="anim-sweep-row">
-          <span class="anim-sweep-label">Spin <i>a/M</i></span>
-          <num-input [(value)]="params.anim_a_start!"
-                     [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3">
-          </num-input>
-          <span class="anim-arrow">→</span>
-          <num-input [(value)]="params.anim_a_end!"
-                     [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3">
-          </num-input>
+        <div class="anim-sweep-item">
+          <div class="anim-sweep-item-label">Spin <i>a/M</i></div>
+          <div class="anim-sweep-inputs">
+            <num-input [(value)]="params.anim_a_start" [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3" style="flex:1"></num-input>
+            <span class="anim-arrow">→</span>
+            <num-input [(value)]="params.anim_a_end" [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3" style="flex:1"></num-input>
+          </div>
         </div>
 
-        <div class="anim-sweep-row">
-          <span class="anim-sweep-label">Inclination θ</span>
-          <num-input [(value)]="params.anim_theta_start!"
-                     [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°">
-          </num-input>
-          <span class="anim-arrow">→</span>
-          <num-input [(value)]="params.anim_theta_end!"
-                     [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°">
-          </num-input>
+        <div class="anim-sweep-item">
+          <div class="anim-sweep-item-label">Inclination θ</div>
+          <div class="anim-sweep-inputs">
+            <num-input [(value)]="params.anim_theta_start" [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°" style="flex:1"></num-input>
+            <span class="anim-arrow">→</span>
+            <num-input [(value)]="params.anim_theta_end" [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°" style="flex:1"></num-input>
+          </div>
         </div>
 
-        <div class="anim-sweep-row">
-          <span class="anim-sweep-label">Azimuth φ</span>
-          <num-input [(value)]="params.anim_phi_start!"
-                     [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°">
-          </num-input>
-          <span class="anim-arrow">→</span>
-          <num-input [(value)]="params.anim_phi_end!"
-                     [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°">
-          </num-input>
+        <div class="anim-sweep-item">
+          <div class="anim-sweep-item-label">Azimuth φ</div>
+          <div class="anim-sweep-inputs">
+            <num-input [(value)]="params.anim_phi_start" [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°" style="flex:1"></num-input>
+            <span class="anim-arrow">→</span>
+            <num-input [(value)]="params.anim_phi_end" [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°" style="flex:1"></num-input>
+          </div>
         </div>
 
-        <div class="anim-sweep-row">
-          <span class="anim-sweep-label"><i>r</i><sub>obs</sub></span>
-          <num-input [(value)]="params.anim_r_start!"
-                     [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M">
-          </num-input>
-          <span class="anim-arrow">→</span>
-          <num-input [(value)]="params.anim_r_end!"
-                     [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M">
-          </num-input>
+        <div class="anim-sweep-item">
+          <div class="anim-sweep-item-label"><i>r</i><sub>obs</sub></div>
+          <div class="anim-sweep-inputs">
+            <num-input [(value)]="params.anim_r_start" [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M" style="flex:1"></num-input>
+            <span class="anim-arrow">→</span>
+            <num-input [(value)]="params.anim_r_end" [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M" style="flex:1"></num-input>
+          </div>
         </div>
 
-        <div class="anim-sweep-row">
-          <span class="anim-sweep-label">Disk r<sub>out</sub></span>
-          <num-input [(value)]="params.anim_disk_start!"
-                     [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
-          </num-input>
-          <span class="anim-arrow">→</span>
-          <num-input [(value)]="params.anim_disk_end!"
-                     [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
-          </num-input>
+        <div class="anim-sweep-item">
+          <div class="anim-sweep-item-label">Disk r<sub>out</sub></div>
+          <div class="anim-sweep-inputs">
+            <num-input [(value)]="params.anim_disk_start" [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M" style="flex:1"></num-input>
+            <span class="anim-arrow">→</span>
+            <num-input [(value)]="params.anim_disk_end" [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M" style="flex:1"></num-input>
+          </div>
         </div>
       </div>
 

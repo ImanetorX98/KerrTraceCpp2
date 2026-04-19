@@ -30,8 +30,17 @@ import { FormsModule } from '@angular/forms';
     </div>
   `,
   styles: [`
-    .ni-wrap {
+    :host {
       display: inline-flex;
+    }
+
+    :host([style*="flex:1"]),
+    :host([style*="flex: 1"]) {
+      flex: 1;
+    }
+
+    .ni-wrap {
+      display: flex;
       align-items: center;
       gap: 0;
       height: 30px;
@@ -39,6 +48,7 @@ import { FormsModule } from '@angular/forms';
       border-radius: 5px;
       overflow: hidden;
       background: #0e0e0e;
+      width: 100%;
     }
 
     .ni-btn {

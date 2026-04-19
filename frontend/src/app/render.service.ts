@@ -25,16 +25,16 @@ export interface RenderParams {
   anim_crf: number;
   anim_orbits: number;
   anim_ease: boolean;
-  anim_theta_start?: number;
-  anim_theta_end?: number;
-  anim_phi_start?: number;
-  anim_phi_end?: number;
-  anim_r_start?: number;
-  anim_r_end?: number;
-  anim_a_start?: number;
-  anim_a_end?: number;
-  anim_disk_start?: number;
-  anim_disk_end?: number;
+  anim_theta_start: number;
+  anim_theta_end: number;
+  anim_phi_start: number;
+  anim_phi_end: number;
+  anim_r_start: number;
+  anim_r_end: number;
+  anim_a_start: number;
+  anim_a_end: number;
+  anim_disk_start: number;
+  anim_disk_end: number;
 }
 
 export interface WsMessage {
