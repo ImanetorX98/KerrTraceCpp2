@@ -362,21 +362,35 @@ static std::vector<RGB> render_image(
     std::vector<GeoPixel>* geo_out = nullptr)
 {
 #if defined(USE_METAL)
-    // Metal path: no geo separation yet, direct render
-    KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
-    const double r_isco = g.r_isco();
-    Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
-    KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
-                     (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
-    CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.fov_h,W,H};
-    auto px32 = metal_render(kpc, cpc);
-    std::vector<RGB> image(W*H);
-    for (int i=0;i<W*H;++i) {
-        image[i].r=(px32[i])    &0xFF;
-        image[i].g=(px32[i]>>8) &0xFF;
-        image[i].b=(px32[i]>>16)&0xFF;
+    if (!use_bundles) {
+        KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
+        const double r_isco = g.r_isco();
+        Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
+        KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
+                         (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
+        CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,W,H};
+        const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
+        const int bg_w = bg.px.empty() ? 0 : bg.w;
+        const int bg_h = bg.px.empty() ? 0 : bg.h;
+        auto px32 = metal_render(kpc, cpc, bg_ptr, bg_w, bg_h);
+        std::vector<RGB> image(W*H);
+        for (int i=0;i<W*H;++i) {
+            image[i].r=(px32[i])    &0xFF;
+            image[i].g=(px32[i]>>8) &0xFF;
+            image[i].b=(px32[i]>>16)&0xFF;
+        }
+        return image;
     }
-    return image;
+
+    static bool warned_bundle_fallback = false;
+    if (!warned_bundle_fallback) {
+        std::cerr << "Info: Metal backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
+        warned_bundle_fallback = true;
+    }
+    KGeoMeta meta;
+    auto geo = trace_geodesics(W, H, fp, use_bundles, intg, M_bh, Q_bh, Lam, &meta);
+    if (geo_out) *geo_out = geo;
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 
 #elif defined(USE_CUDA)
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);

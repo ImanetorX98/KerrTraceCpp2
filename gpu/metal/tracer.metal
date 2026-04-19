@@ -25,9 +25,17 @@ struct KNdSParams {
 struct CameraParams {
     float r_obs;
     float theta_obs;   // radians
+    float phi_obs;     // radians
     float fov_h;       // radians
     int   width;
     int   height;
+};
+
+struct RenderParams {
+    uint width;
+    uint height;
+    uint y_offset;
+    uint tile_h;
 };
 
 // ── Pixel output ──────────────────────────────────────────────
@@ -99,12 +107,14 @@ static void geodesic_rhs(float r, float theta,
                           float pt, float pphi,
                           float M, float a, float Q, float L,
                           thread float& dr_out, thread float& dth_out,
+                          thread float& dphi_out,
                           thread float& dpr_out, thread float& dpth_out) {
     float gu[4][4];
     gUU(r, theta, M, a, Q, L, gu);
 
     dr_out  = gu[1][1]*pr;
     dth_out = gu[2][2]*pth;
+    dphi_out = gu[3][0]*pt + gu[3][3]*pphi;
 
     const float er  = 1e-5f*(abs(r)+0.1f);
     const float eth = 1e-6f;
@@ -117,23 +127,24 @@ static void geodesic_rhs(float r, float theta,
 }
 
 // RK4 step
-static void rk4(thread float& r, thread float& theta,
+static void rk4(thread float& r, thread float& theta, thread float& phi,
                 thread float& pr, thread float& pth,
                 float pt, float pphi,
                 float M, float a, float Q, float L,
                 float dlam) {
-    float dr1,dth1,dpr1,dpth1;
-    float dr2,dth2,dpr2,dpth2;
-    float dr3,dth3,dpr3,dpth3;
-    float dr4,dth4,dpr4,dpth4;
+    float dr1,dth1,dph1,dpr1,dpth1;
+    float dr2,dth2,dph2,dpr2,dpth2;
+    float dr3,dth3,dph3,dpr3,dpth3;
+    float dr4,dth4,dph4,dpr4,dpth4;
 
-    geodesic_rhs(r,               theta,               pr,               pth,               pt,pphi,M,a,Q,L, dr1,dth1,dpr1,dpth1);
-    geodesic_rhs(r+.5f*dlam*dr1, theta+.5f*dlam*dth1, pr+.5f*dlam*dpr1, pth+.5f*dlam*dpth1, pt,pphi,M,a,Q,L, dr2,dth2,dpr2,dpth2);
-    geodesic_rhs(r+.5f*dlam*dr2, theta+.5f*dlam*dth2, pr+.5f*dlam*dpr2, pth+.5f*dlam*dpth2, pt,pphi,M,a,Q,L, dr3,dth3,dpr3,dpth3);
-    geodesic_rhs(r+    dlam*dr3, theta+    dlam*dth3, pr+    dlam*dpr3, pth+    dlam*dpth3, pt,pphi,M,a,Q,L, dr4,dth4,dpr4,dpth4);
+    geodesic_rhs(r,               theta,               pr,               pth,               pt,pphi,M,a,Q,L, dr1,dth1,dph1,dpr1,dpth1);
+    geodesic_rhs(r+.5f*dlam*dr1, theta+.5f*dlam*dth1, pr+.5f*dlam*dpr1, pth+.5f*dlam*dpth1, pt,pphi,M,a,Q,L, dr2,dth2,dph2,dpr2,dpth2);
+    geodesic_rhs(r+.5f*dlam*dr2, theta+.5f*dlam*dth2, pr+.5f*dlam*dpr2, pth+.5f*dlam*dpth2, pt,pphi,M,a,Q,L, dr3,dth3,dph3,dpr3,dpth3);
+    geodesic_rhs(r+    dlam*dr3, theta+    dlam*dth3, pr+    dlam*dpr3, pth+    dlam*dpth3, pt,pphi,M,a,Q,L, dr4,dth4,dph4,dpr4,dpth4);
 
     r     += dlam/6.0f*(dr1   +2.0f*dr2   +2.0f*dr3   +dr4);
     theta += dlam/6.0f*(dth1  +2.0f*dth2  +2.0f*dth3  +dth4);
+    phi   += dlam/6.0f*(dph1  +2.0f*dph2  +2.0f*dph3  +dph4);
     pr    += dlam/6.0f*(dpr1  +2.0f*dpr2  +2.0f*dpr3  +dpr4);
     pth   += dlam/6.0f*(dpth1 +2.0f*dpth2 +2.0f*dpth3 +dpth4);
 }
@@ -177,23 +188,41 @@ static float4 blackbody_rgb(float T) {
     return float4(clamp(R,0.0f,1.0f), clamp(G,0.0f,1.0f), clamp(B,0.0f,1.0f), 1.0f);
 }
 
+static float4 sample_background(texture2d<float, access::sample> bg_tex,
+                                sampler bg_samp,
+                                float theta, float phi) {
+    constexpr float PI_F     = 3.14159265358979323846f;
+    constexpr float TWO_PI_F = 6.28318530717958647692f;
+    float pw = fmod(phi, TWO_PI_F);
+    if (pw < 0.0f) pw += TWO_PI_F;
+    const float u = pw / TWO_PI_F;
+    const float v = clamp(theta / PI_F, 0.0f, 1.0f);
+    return bg_tex.sample(bg_samp, float2(u, v));
+}
+
 // ── Main compute kernel ───────────────────────────────────────
 kernel void trace_pixel(
     device uint32_t*   output    [[buffer(0)]],
     constant KNdSParams& kp      [[buffer(1)]],
     constant CameraParams& cp    [[buffer(2)]],
+    constant RenderParams& rp    [[buffer(3)]],
+    texture2d<float, access::sample> bg_tex [[texture(0)]],
+    sampler             bg_samp   [[sampler(0)]],
     uint2              gid       [[thread_position_in_grid]])
 {
     const int px = (int)gid.x;
-    const int py = (int)gid.y;
-    if (px >= cp.width || py >= cp.height) return;
+    const int py_local = (int)gid.y;
+    const int width = (int)rp.width;
+    const int height = (int)rp.height;
+    if (px >= width || py_local >= (int)rp.tile_h) return;
+    const int py = py_local + (int)rp.y_offset;
 
     const float M = kp.M, a = kp.a, Q = kp.Q, L = kp.Lambda;
 
     // ── Pixel → (α, β) ───────────────────────────────────────
-    const int span = max(cp.width - 1, 1);
-    const float alpha = cp.fov_h*(float(px) - 0.5f*(cp.width-1))  / float(span);
-    const float beta  = cp.fov_h*(0.5f*(cp.height-1) - float(py)) / float(span);
+    const int span = max(width - 1, 1);
+    const float alpha = cp.fov_h*(float(px) - 0.5f*(width-1))  / float(span);
+    const float beta  = cp.fov_h*(0.5f*(height-1) - float(py)) / float(span);
 
     // ── Initial conditions (approx. flat at large r) ──────────
     const float r0  = cp.r_obs;
@@ -235,36 +264,56 @@ kernel void trace_pixel(
     }
 
     // ── Trace ─────────────────────────────────────────────────
-    float r = r0, theta = th0;
+    float r = r0, theta = th0, phi = cp.phi_obs;
     float dlam = 1.0f;
     float prev_r = r0;
+    float prev_theta = th0;
+    float prev_phi = phi;
     float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
 
-    for (int iter = 0; iter < 200000; ++iter) {
+    for (int iter = 0; iter < 60000; ++iter) {
         // Adaptive step (simple: fixed tolerance)
-        float r_h = r, th_h = theta, pr_h = pr, pth_h = pth;
-        rk4(r_h, th_h, pr_h, pth_h, pt, pphi, M, a, Q, L, dlam);
+        float r_h = r, th_h = theta, ph_h = phi, pr_h = pr, pth_h = pth;
+        rk4(r_h, th_h, ph_h, pr_h, pth_h, pt, pphi, M, a, Q, L, dlam);
 
-        float r_f = r, th_f = theta, pr_f = pr, pth_f = pth;
-        rk4(r_f, th_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
-        rk4(r_f, th_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
+        float r_f = r, th_f = theta, ph_f = phi, pr_f = pr, pth_f = pth;
+        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
+        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
 
         const float err = length(float4(r_h-r_f, th_h-th_f,
                                         pr_h-pr_f, pth_h-pth_f)) / 15.0f;
-        const float tol = 1e-5f;
-        if (err < tol || dlam < 1e-8f) {
-            r = r_f; theta = th_f; pr = pr_f; pth = pth_f;
+        const float tol = 2e-5f;
+        if (err < tol || dlam < 1e-6f) {
+            r = r_f; theta = th_f; phi = ph_f; pr = pr_f; pth = pth_f;
             float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-            dlam = clamp(dlam*sc, 1e-8f, 50.0f);
+            dlam = clamp(dlam*sc, 1e-6f, 50.0f);
         } else {
-            dlam = clamp(dlam*0.9f*pow(tol/err, 0.25f), 1e-8f, dlam*0.5f);
+            dlam = clamp(dlam*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam*0.5f);
             continue;
         }
 
+        if (!(isfinite(r) && isfinite(theta) && isfinite(phi) &&
+              isfinite(pr) && isfinite(pth))) {
+            break;
+        }
+
         if (r < kp.r_horizon * 1.03f) break;
-        if (r > cp.r_obs * 1.05f)     break;
+        if (r > cp.r_obs * 1.05f) {
+            const float r_escape = cp.r_obs * 1.05f;
+            const float denom = r - prev_r;
+            float w = (abs(denom) > 1e-8f) ? ((r_escape - prev_r) / denom) : 1.0f;
+            w = clamp(w, 0.0f, 1.0f);
+            const float th_esc = prev_theta + w*(theta - prev_theta);
+            const float ph_esc = prev_phi   + w*(phi   - prev_phi);
+            float4 bgc = clamp(sample_background(bg_tex, bg_samp, th_esc, ph_esc), 0.0f, 1.0f);
+            colour = (0xFFu << 24)
+                   | (uint32_t(bgc.b*255.0f) << 16)
+                   | (uint32_t(bgc.g*255.0f) << 8)
+                   |  uint32_t(bgc.r*255.0f);
+            break;
+        }
 
         const float cos_th = cos(theta);
         if (prev_cos*cos_th <= 0.0f) {
@@ -275,6 +324,8 @@ kernel void trace_pixel(
             if (!(r_hit >= kp.r_isco && r_hit <= kp.r_disk_out)) {
                 prev_cos = cos_th;
                 prev_r = r;
+                prev_theta = theta;
+                prev_phi = phi;
                 continue;
             }
 
@@ -303,7 +354,9 @@ kernel void trace_pixel(
         }
         prev_cos = cos_th;
         prev_r = r;
+        prev_theta = theta;
+        prev_phi = phi;
     }
 
-    output[py * cp.width + px] = colour;
+    output[py * width + px] = colour;
 }
