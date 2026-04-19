@@ -102,4 +102,10 @@ if(BUILD_TESTING)
     target_compile_options(kerrtrace_core_tests PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
     add_test(NAME kerrtrace.core COMMAND kerrtrace_core_tests)
+
+    add_executable(kerrtrace_bump_detector tests/bump_detector.cpp)
+    target_include_directories(kerrtrace_bump_detector PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_bump_detector PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
+    add_test(NAME kerrtrace.bump_detector COMMAND kerrtrace_bump_detector --self-test)
 endif()
