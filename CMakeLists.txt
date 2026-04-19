@@ -4,6 +4,8 @@ project(KerrTracer LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+
 # ── Backend selection ─────────────────────────────────────────
 option(USE_METAL "Use Metal GPU backend (macOS only)"  OFF)
 option(USE_CUDA  "Use CUDA GPU backend (Linux/Windows)" OFF)
@@ -91,4 +93,13 @@ if(APPLE AND NOT USE_METAL)
         "-framework Foundation"
         "-framework CoreGraphics")
     message(STATUS "Metal GPU binary: kerr_tracer_metal")
+endif()
+
+# ── Tests ───────────────────────────────────────────────────────
+if(BUILD_TESTING)
+    add_executable(kerrtrace_core_tests tests/core_tests.cpp)
+    target_include_directories(kerrtrace_core_tests PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_core_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
+    add_test(NAME kerrtrace.core COMMAND kerrtrace_core_tests)
 endif()
