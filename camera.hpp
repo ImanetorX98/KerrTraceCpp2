@@ -21,14 +21,17 @@ class Camera {
 public:
     double r_obs;        ///< BL radial position  (should be ≫ M)
     double theta_obs;    ///< BL polar angle  (radians)
+    double phi_obs;      ///< BL azimuthal angle (radians) — sets initial phi of each ray
     double fov_h;        ///< horizontal field-of-view  (radians)
     int    width, height;
 
     /// @param r_         observer radius (e.g. 500 M)
     /// @param theta_deg  inclination in degrees (90° = equatorial)
+    /// @param phi_deg    azimuth in degrees (0° default)
     /// @param fov_deg    horizontal FOV in degrees
-    Camera(double r_, double theta_deg, double fov_deg, int w, int h)
+    Camera(double r_, double theta_deg, double phi_deg, double fov_deg, int w, int h)
         : r_obs(r_), theta_obs(theta_deg * M_PI / 180.0),
+          phi_obs(phi_deg * M_PI / 180.0),
           fov_h(fov_deg * M_PI / 180.0), width(w), height(h) {}
 
     // ── pixel → initial geodesic state ───────────────────────
@@ -100,6 +103,6 @@ public:
             if (pt > 0.0) pt = std::min(pt1, pt2);  // force negative
         }
 
-        return {r0, th0, 0.0, pr, pth, pt, pphi};
+        return {r0, th0, phi_obs, pr, pth, pt, pphi};
     }
 };

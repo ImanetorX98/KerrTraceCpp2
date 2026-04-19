@@ -6,8 +6,15 @@
 //    -DUSE_CUDA=ON    → CUDA GPU  (Linux/Windows)
 //    default          → CPU with OpenMP
 //
-//  Run:  ./kerr_tracer [--bundles]
-//    --bundles  : use Jacobi ray-bundle renderer (slower, antialiased)
+//  Single frame:
+//    ./kerr_tracer [--720p] [--bundles] [--theta 80] ...
+//
+//  Animation:
+//    ./kerr_tracer --anim --frames 120 --fps 30 \
+//                  --theta-start 85 --theta-end 5   \
+//                  --r-start 100   --r-end 15        \
+//                  --orbits 1.0                      \
+//                  --output out/flyby.mp4
 // ============================================================
 #include "camera.hpp"
 #include "geodesic.hpp"
@@ -25,6 +32,8 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -106,14 +115,14 @@ struct TraceResult {
     Outcome out;
     double  r;
     double  redshift;
-    double  theta_esc = 0.0;   ///< final θ when ESCAPED (for background lookup)
-    double  phi_esc   = 0.0;   ///< final φ when ESCAPED
+    double  theta_esc = 0.0;
+    double  phi_esc   = 0.0;
 };
 
 static double disk_redshift(double r, double pt, double pphi,
                             const KNdSMetric& g) {
     double Omega = g.keplerian_omega(r);
-    double b     = pphi / pt;    // pt<0; backward ray pphi sign is opposite to forward photon
+    double b     = pphi / pt;
     double gLL[4][4]; g.covariant_BL(r, M_PI/2.0, gLL);
     double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
     if (d2 <= 0.0) return 1.0;
@@ -128,7 +137,7 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                                  Integrator intg = Integrator::RK4_DOUBLING) {
     double rh = g.r_horizon(), dlam = 1.0;
     double prev_cos = std::cos(s.theta);
-    Vec4d  fsal = Vec4d::nan_init();   // DOPRI5 FSAL carry-over
+    Vec4d  fsal = Vec4d::nan_init();
 
     for (int it = 0; it < 500000; ++it) {
         while (!adaptive_step(g, s, dlam, intg, fsal)) {}
@@ -156,44 +165,32 @@ static RGB blackbody(double T) {
             (uint8_t)(clamp(B,0.0,1.0)*255)};
 }
 
-// Reinhard tonemapping + gamma 2.2
 static double tonemap(double x) {
     x = x / (1.0 + x);
     return std::pow(clamp(x, 0.0, 1.0), 1.0/2.2);
 }
 
-// Page-Thorne (Novikov-Thorne) emissivity profile.
-// Zero at r_isco, peaks near 3*r_isco, falls as r^{-3} at large r.
-// Simplified: f(r) = (1 - sqrt(r_isco/r)) / r^3
 static double page_thorne(double r, double r_isco) {
     if (r <= r_isco) return 0.0;
-    double x = std::sqrt(r_isco / r);          // = 1 at ISCO, → 0 at infinity
+    double x = std::sqrt(r_isco / r);
     return (1.0 - x) / (r * r * r);
 }
 
 static RGB disk_colour(double r, double red, double magnif,
                        double M, double r_isco) {
-    // ── Colour temperature: warm at large r, hot near ISCO ───────
-    // Reference: ~6500 K at r = 6M, scales as r^{-1/2} with redshift.
-    // This keeps the inner disk blue-white and outer disk orange-red.
     double T = 6500.0 * std::sqrt(6.0*M / r) * clamp(red, 0.2, 5.0);
-
-    // ── Intensity: Page-Thorne × g^4 × magnification correction ──
     double pt_norm = page_thorne(r, r_isco);
-    // Normalise so peak (≈ 3·r_isco) maps to I ≈ 1
     double r_peak  = 3.0 * r_isco;
     double pt_peak = page_thorne(r_peak, r_isco);
     double I = (pt_peak > 0.0) ? pt_norm / pt_peak : 0.0;
-    I *= std::pow(clamp(red, 0.1, 10.0), 4.0);   // g^4 surface brightness
-    I *= clamp(1.0 / magnif, 0.05, 5.0);          // flux conservation
-
+    I *= std::pow(clamp(red, 0.1, 10.0), 4.0);
+    I *= clamp(1.0 / magnif, 0.05, 5.0);
     auto c = blackbody(T);
     return {(uint8_t)(tonemap(c.r/255.0 * I) * 255),
             (uint8_t)(tonemap(c.g/255.0 * I) * 255),
             (uint8_t)(tonemap(c.b/255.0 * I) * 255)};
 }
 
-// ── Write PNG ─────────────────────────────────────────────────
 static void write_png(const char* path, const std::vector<RGB>& img,
                       int W, int H) {
     stbi_write_png(path, W, H, 3,
@@ -201,8 +198,6 @@ static void write_png(const char* path, const std::vector<RGB>& img,
                    W * 3);
 }
 
-// ── Main ──────────────────────────────────────────────────────
-// ── Progress bar ──────────────────────────────────────────────
 static void print_progress(int done, int total, double elapsed) {
     const int BAR = 40;
     double frac = (double)done / total;
@@ -219,94 +214,38 @@ static void print_progress(int done, int total, double elapsed) {
     std::cerr << "   " << std::flush;
 }
 
-int main(int argc, char** argv) {
-    bool use_bundles  = false;
-    bool preview      = false;
-    bool hd_preview   = false;
-    bool res_720p     = false;
-    bool res_2k       = false;
-    bool res_4k       = false;
-    int  custom_w     = 0;
-    int  custom_h     = 0;
-    Integrator intg   = Integrator::RK4_DOUBLING;
-    std::string bg_path;
-    double arg_a        = 0.998;   // BH spin  (overridable)
-    double arg_disk_out = 25.0;    // outer disk radius in M  (overridable)
-    double arg_theta    = 80.0;    // camera inclination degrees (overridable)
-    double arg_r_obs    = -1.0;    // <0 → use mode default
-    for (int i=1;i<argc;++i) {
-        std::string arg(argv[i]);
-        if (arg=="--bundles")              use_bundles = true;
-        if (arg=="--dopri5")               intg = Integrator::DOPRI5;
-        if (arg=="--preview")              preview = true;
-        if (arg=="--hd")                   hd_preview = true;
-        if (arg=="--720p")                 res_720p = true;
-        if (arg=="--2k")                   res_2k = true;
-        if (arg=="--4k")                   res_4k = true;
-        if (arg=="--custom-res" && i+2<argc) {
-            custom_w = std::stoi(argv[++i]);
-            custom_h = std::stoi(argv[++i]);
-        }
-        if (arg=="--bg"       && i+1<argc) bg_path     = argv[++i];
-        if (arg=="--a"        && i+1<argc) arg_a        = std::stod(argv[++i]);
-        if (arg=="--disk-out" && i+1<argc) arg_disk_out = std::stod(argv[++i]);
-        if (arg=="--theta"    && i+1<argc) arg_theta    = std::stod(argv[++i]);
-        if (arg=="--r-obs"    && i+1<argc) arg_r_obs    = std::stod(argv[++i]);
-    }
+// ── Per-frame variable parameters ────────────────────────────
+struct FrameParams {
+    double a        = 0.998;  // BH spin
+    double theta    = 80.0;   // camera inclination, degrees
+    double phi      = 0.0;    // camera azimuth,     degrees
+    double r_obs    = 500.0;  // observer radius,    units of M
+    double disk_out = 25.0;   // outer disk radius,  units of M
+};
 
-    // ── Background ────────────────────────────────────────────
-    BackgroundImage bg;
-    if (!bg_path.empty()) {
-        if (bg.load(bg_path.c_str()))
-            std::cout << "Background: " << bg_path
-                      << " (" << bg.w << "x" << bg.h << ")\n";
-        else
-            std::cerr << "Warning: could not load background '" << bg_path << "'\n";
-    }
-
-    // ── Spacetime ─────────────────────────────────────────────
-    // Zero-out Q and/or Lambda to get simpler metrics:
-    //   Q=0, Lambda=0  → Kerr
-    //   a=0, Lambda=0  → Reissner-Nordström
-    //   a=0, Q=0       → Schwarzschild-dS
-    const double M_bh  = 1.0;
-    const double a_bh  = arg_a;
-    const double Q_bh  = 0.0;
-    const double Lam   = 0.0;
-
-    KNdSMetric g(M_bh, a_bh, Q_bh, Lam);
-    const double rh     = g.r_horizon();
-    const double r_isco = g.r_isco();
-    std::cout << "KNdS  M=" << M_bh << " a=" << a_bh
-              << " Q=" << Q_bh << " Λ=" << Lam << "\n"
-              << "  r₊=" << rh << "  r_ISCO=" << r_isco << "\n";
-
-    // ── Camera ────────────────────────────────────────────────
-    const int    W      = custom_w   ? custom_w
-                        : res_4k     ? 3840
-                        : res_2k     ? 2560
-                        : res_720p   ? 1280
-                        : hd_preview ? 854  : preview ? 480  : 1920;
-    const int    H      = custom_h   ? custom_h
-                        : res_4k     ? 2160
-                        : res_2k     ? 1440
-                        : res_720p   ? 720
-                        : hd_preview ? 480  : preview ? 270  : 1080;
-    const double r_obs  = (arg_r_obs > 0) ? arg_r_obs*M_bh
-                        : (res_720p || hd_preview) ? 30.0*M_bh : 500.0*M_bh;
-    Camera cam(r_obs, arg_theta, 30.0, W, H);
+// ── Core render function ──────────────────────────────────────
+// Renders one frame given variable FrameParams + fixed context.
+// Returns pixel buffer (W×H RGB).
+static std::vector<RGB> render_image(
+    int W, int H,
+    const FrameParams& fp,
+    const BackgroundImage& bg,
+    bool use_bundles,
+    Integrator intg,
+    double M_bh, double Q_bh, double Lam)
+{
+    KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
+    const double r_isco   = g.r_isco();
+    Camera cam(fp.r_obs, fp.theta, fp.phi, 30.0, W, H);
     const double r_disk_in  = r_isco;
-    const double r_disk_out = arg_disk_out * M_bh;
-    const double r_escape   = cam.r_obs*1.05;
+    const double r_disk_out = fp.disk_out;
+    const double r_escape   = cam.r_obs * 1.05;
 
     std::vector<RGB> image(W*H, {0,0,0});
-    const double t0 = get_time();
 
 #if defined(USE_METAL)
-    // ── Metal GPU path ─────────────────────────────────────────
-    std::cout << "Backend: Metal GPU\n";
-    KNdSParams_C kpc{(float)M_bh,(float)a_bh,(float)Q_bh,(float)Lam,
-                     (float)rh,(float)r_isco,(float)r_disk_out};
+    KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
+                     (float)g.r_horizon(),(float)r_isco,(float)r_disk_out};
     CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.fov_h,W,H};
     auto px32 = metal_render(kpc, cpc);
     for (int i=0; i<W*H; ++i) {
@@ -316,9 +255,7 @@ int main(int argc, char** argv) {
     }
 
 #elif defined(USE_CUDA)
-    // ── CUDA GPU path ─────────────────────────────────────────
-    std::cout << "Backend: CUDA GPU\n";
-    KNdSParams_CUDA kpcuda{M_bh,a_bh,Q_bh,Lam,rh,r_isco,r_disk_out};
+    KNdSParams_CUDA kpcuda{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,r_disk_out};
     CameraParams_CUDA cpcuda{cam.r_obs,cam.theta_obs,cam.fov_h,W,H};
     auto px32 = cuda_render(kpcuda, cpcuda);
     for (int i=0; i<W*H; ++i) {
@@ -328,15 +265,8 @@ int main(int argc, char** argv) {
     }
 
 #else
-    // ── CPU path (OpenMP) ──────────────────────────────────────
-    std::cout << "Backend: CPU"
-#ifdef _OPENMP
-              << " (OpenMP " << omp_get_max_threads() << " threads)"
-#endif
-              << "\nMode: " << (use_bundles ? "ray bundles" : "single ray")
-              << "  integrator: " << (intg==Integrator::DOPRI5 ? "DOPRI5" : "RK4-doubling") << "\n";
-
     std::atomic<int> rows_done{0};
+    const double t0_render = get_time();
     #pragma omp parallel for schedule(dynamic, 4)
     for (int py=0; py<H; ++py) {
         for (int px=0; px<W; ++px) {
@@ -346,7 +276,7 @@ int main(int argc, char** argv) {
                                         r_disk_in, r_disk_out, r_escape);
                 if (res.disk_hit)
                     col = disk_colour(res.r_hit, res.redshift, res.magnif, M_bh, r_isco);
-                else if (!res.disk_hit && !bg.px.empty())
+                else if (!bg.px.empty())
                     col = bg.sample(res.theta_esc, res.phi_esc);
             } else {
                 auto s   = cam.pixel_ray(px, py, g);
@@ -361,35 +291,354 @@ int main(int argc, char** argv) {
         int done = ++rows_done;
         if (done % 4 == 0 || done == H) {
             #pragma omp critical
-            print_progress(done, H, get_time()-t0);
+            print_progress(done, H, get_time()-t0_render);
         }
     }
     std::cerr << "\n";
 #endif
 
-    double elapsed = get_time()-t0;
-    std::cout << "Time: " << elapsed << " s  ("
-              << std::fixed << std::setprecision(1)
-              << (W*H/elapsed/1e3) << " kpix/s)\n";
+    return image;
+}
 
-    // Build unique filename: <tag>_<WxH>_<YYYYMMDD-HHMMSS>.png
-    const char* tag = res_4k      ? "4k"
-                    : res_2k      ? "2k"
-                    : custom_w    ? "custom"
-                    : res_720p    ? "720p"
-                    : hd_preview  ? "hd"
-                    : preview     ? "preview"
-                    : use_bundles ? "bundles"
-                                  : "trace";
-    {
+// ── Interpolation helpers ─────────────────────────────────────
+static double smooth_step(double t) { return t*t*(3.0-2.0*t); }
+
+static double lerp_angle(double a, double b, double t) {
+    // Always take the short path
+    double d = b - a;
+    while (d >  180.0) d -= 360.0;
+    while (d < -180.0) d += 360.0;
+    return a + d*t;
+}
+
+// ── main ──────────────────────────────────────────────────────
+int main(int argc, char** argv) {
+    // ── Resolution flags ──────────────────────────────────────
+    bool use_bundles  = false;
+    bool preview      = false;
+    bool hd_preview   = false;
+    bool res_720p     = false;
+    bool res_2k       = false;
+    bool res_4k       = false;
+    int  custom_w     = 0;
+    int  custom_h     = 0;
+    Integrator intg   = Integrator::RK4_DOUBLING;
+    std::string bg_path;
+
+    // ── Single-frame params ───────────────────────────────────
+    double arg_a        = 0.998;
+    double arg_disk_out = 25.0;
+    double arg_theta    = 80.0;
+    double arg_phi      = 0.0;
+    double arg_r_obs    = -1.0;   // <0 → use mode default
+
+    // ── Animation params ──────────────────────────────────────
+    bool        anim_mode        = false;
+    int         anim_frames      = 60;
+    int         anim_fps         = 30;
+    int         anim_crf         = 18;
+    bool        anim_ease        = false;
+    bool        anim_keep_frames = false;
+    bool        anim_resume      = false;
+    bool        anim_no_encode   = false;
+    double      anim_orbits      = 0.0;  // phi = phi_start + 360*orbits*phase
+    std::string anim_output;             // empty → auto
+    std::string anim_frames_dir;         // empty → auto (out/anim_<tag>)
+
+    // Sweep start/end (NaN = no sweep → use single-frame value)
+    double anim_theta_start   = std::numeric_limits<double>::quiet_NaN();
+    double anim_theta_end     = std::numeric_limits<double>::quiet_NaN();
+    double anim_phi_start     = std::numeric_limits<double>::quiet_NaN();
+    double anim_phi_end       = std::numeric_limits<double>::quiet_NaN();
+    double anim_r_start       = std::numeric_limits<double>::quiet_NaN();
+    double anim_r_end         = std::numeric_limits<double>::quiet_NaN();
+    double anim_a_start       = std::numeric_limits<double>::quiet_NaN();
+    double anim_a_end         = std::numeric_limits<double>::quiet_NaN();
+    double anim_disk_out_start= std::numeric_limits<double>::quiet_NaN();
+    double anim_disk_out_end  = std::numeric_limits<double>::quiet_NaN();
+
+    for (int i=1;i<argc;++i) {
+        std::string arg(argv[i]);
+
+        // Resolution
+        if (arg=="--bundles")              use_bundles = true;
+        if (arg=="--dopri5")               intg = Integrator::DOPRI5;
+        if (arg=="--preview")              preview = true;
+        if (arg=="--hd")                   hd_preview = true;
+        if (arg=="--720p")                 res_720p = true;
+        if (arg=="--2k")                   res_2k = true;
+        if (arg=="--4k")                   res_4k = true;
+        if (arg=="--custom-res" && i+2<argc) {
+            custom_w = std::stoi(argv[++i]);
+            custom_h = std::stoi(argv[++i]);
+        }
+
+        // Single-frame
+        if (arg=="--bg"       && i+1<argc) bg_path     = argv[++i];
+        if (arg=="--a"        && i+1<argc) arg_a        = std::stod(argv[++i]);
+        if (arg=="--disk-out" && i+1<argc) arg_disk_out = std::stod(argv[++i]);
+        if (arg=="--theta"    && i+1<argc) arg_theta    = std::stod(argv[++i]);
+        if (arg=="--phi"      && i+1<argc) arg_phi      = std::stod(argv[++i]);
+        if (arg=="--r-obs"    && i+1<argc) arg_r_obs    = std::stod(argv[++i]);
+
+        // Animation
+        if (arg=="--anim")                   anim_mode   = true;
+        if (arg=="--frames"   && i+1<argc)   anim_frames = std::stoi(argv[++i]);
+        if (arg=="--fps"      && i+1<argc)   anim_fps    = std::stoi(argv[++i]);
+        if (arg=="--crf"      && i+1<argc)   anim_crf    = std::stoi(argv[++i]);
+        if (arg=="--ease")                   anim_ease   = true;
+        if (arg=="--keep-frames")            anim_keep_frames = true;
+        if (arg=="--resume")                 anim_resume = true;
+        if (arg=="--no-encode")              anim_no_encode = true;
+        if (arg=="--orbits"   && i+1<argc)   anim_orbits = std::stod(argv[++i]);
+        if (arg=="--output"   && i+1<argc)   anim_output = argv[++i];
+        if (arg=="--frames-dir" && i+1<argc) anim_frames_dir = argv[++i];
+
+        // Sweep params
+        if (arg=="--theta-start"    && i+1<argc) anim_theta_start    = std::stod(argv[++i]);
+        if (arg=="--theta-end"      && i+1<argc) anim_theta_end      = std::stod(argv[++i]);
+        if (arg=="--phi-start"      && i+1<argc) anim_phi_start      = std::stod(argv[++i]);
+        if (arg=="--phi-end"        && i+1<argc) anim_phi_end        = std::stod(argv[++i]);
+        if (arg=="--r-start"        && i+1<argc) anim_r_start        = std::stod(argv[++i]);
+        if (arg=="--r-end"          && i+1<argc) anim_r_end          = std::stod(argv[++i]);
+        if (arg=="--a-start"        && i+1<argc) anim_a_start        = std::stod(argv[++i]);
+        if (arg=="--a-end"          && i+1<argc) anim_a_end          = std::stod(argv[++i]);
+        if (arg=="--disk-out-start" && i+1<argc) anim_disk_out_start = std::stod(argv[++i]);
+        if (arg=="--disk-out-end"   && i+1<argc) anim_disk_out_end   = std::stod(argv[++i]);
+    }
+
+    // ── Background ────────────────────────────────────────────
+    BackgroundImage bg;
+    if (!bg_path.empty()) {
+        if (bg.load(bg_path.c_str()))
+            std::cout << "Background: " << bg_path
+                      << " (" << bg.w << "x" << bg.h << ")\n";
+        else
+            std::cerr << "Warning: could not load background '" << bg_path << "'\n";
+    }
+
+    // ── Derived constants ─────────────────────────────────────
+    const double M_bh  = 1.0;
+    const double Q_bh  = 0.0;
+    const double Lam   = 0.0;
+
+    const int W = custom_w   ? custom_w
+                : res_4k     ? 3840
+                : res_2k     ? 2560
+                : res_720p   ? 1280
+                : hd_preview ? 854  : preview ? 480  : 1920;
+    const int H = custom_h   ? custom_h
+                : res_4k     ? 2160
+                : res_2k     ? 1440
+                : res_720p   ? 720
+                : hd_preview ? 480  : preview ? 270  : 1080;
+
+    // Default r_obs depends on resolution mode
+    const double default_r_obs = (res_720p || hd_preview) ? 30.0 : 500.0;
+    const double base_r_obs    = (arg_r_obs > 0) ? arg_r_obs : default_r_obs;
+
+    // ── Resolution tag ────────────────────────────────────────
+    const char* res_tag = res_4k      ? "4k"
+                        : res_2k      ? "2k"
+                        : custom_w    ? "custom"
+                        : res_720p    ? "720p"
+                        : hd_preview  ? "hd"
+                        : preview     ? "preview"
+                        : use_bundles ? "bundles"
+                                      : "trace";
+
+    // ── SINGLE FRAME mode ─────────────────────────────────────
+    if (!anim_mode) {
+        FrameParams fp;
+        fp.a        = arg_a;
+        fp.theta    = arg_theta;
+        fp.phi      = arg_phi;
+        fp.r_obs    = base_r_obs * M_bh;
+        fp.disk_out = arg_disk_out * M_bh;
+
+        // Print info
+        KNdSMetric g_info(M_bh, fp.a, Q_bh, Lam);
+        std::cout << "KNdS  M=" << M_bh << " a=" << fp.a
+                  << " Q=" << Q_bh << " Λ=" << Lam << "\n"
+                  << "  r₊=" << g_info.r_horizon()
+                  << "  r_ISCO=" << g_info.r_isco() << "\n"
+                  << "Backend: CPU"
+#ifdef _OPENMP
+                  << " (OpenMP " << omp_get_max_threads() << " threads)"
+#endif
+                  << "\nMode: " << (use_bundles ? "ray bundles" : "single ray")
+                  << "  integrator: "
+                  << (intg==Integrator::DOPRI5 ? "DOPRI5" : "RK4-doubling") << "\n"
+                  << "Resolution: " << W << "x" << H << "\n";
+
+        double t0 = get_time();
+        auto image = render_image(W, H, fp, bg, use_bundles, intg, M_bh, Q_bh, Lam);
+        double elapsed = get_time()-t0;
+
+        std::cout << "Time: " << elapsed << " s  ("
+                  << std::fixed << std::setprecision(1)
+                  << (W*H/elapsed/1e3) << " kpix/s)\n";
+
         std::time_t now = std::time(nullptr);
         char ts[32];
         std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", std::localtime(&now));
-        std::string outfile = std::string(OUT_DIR) + "/" + tag
+        std::string outfile = std::string(OUT_DIR) + "/" + res_tag
                             + "_" + std::to_string(W) + "x" + std::to_string(H)
                             + "_" + ts + ".png";
         write_png(outfile.c_str(), image, W, H);
         std::cout << "Saved: " << outfile << "\n";
+        return 0;
     }
+
+    // ── ANIMATION mode ────────────────────────────────────────
+    // Resolve sweep start/end values (NaN → use single-frame default)
+    auto resolve = [](double val, double fallback) {
+        return std::isnan(val) ? fallback : val;
+    };
+
+    double theta_start    = resolve(anim_theta_start,    arg_theta);
+    double theta_end      = resolve(anim_theta_end,      arg_theta);
+    double phi_start      = resolve(anim_phi_start,      arg_phi);
+    double phi_end        = resolve(anim_phi_end,        arg_phi);
+    double r_start        = resolve(anim_r_start,        base_r_obs);
+    double r_end          = resolve(anim_r_end,          base_r_obs);
+    double a_start        = resolve(anim_a_start,        arg_a);
+    double a_end          = resolve(anim_a_end,          arg_a);
+    double disk_out_start = resolve(anim_disk_out_start, arg_disk_out);
+    double disk_out_end   = resolve(anim_disk_out_end,   arg_disk_out);
+
+    // Build auto tag from active sweeps
+    std::ostringstream tag_ss;
+    tag_ss << res_tag;
+    if (anim_orbits != 0.0)
+        tag_ss << "_orbit" << anim_orbits << "x";
+    else if (phi_start != phi_end)
+        tag_ss << "_phi" << (int)phi_start << "-" << (int)phi_end;
+    if (theta_start != theta_end)
+        tag_ss << "_th" << (int)theta_start << "-" << (int)theta_end;
+    if (r_start != r_end)
+        tag_ss << "_r" << (int)r_start << "-" << (int)r_end;
+    if (a_start != a_end)
+        tag_ss << "_a" << a_start << "-" << a_end;
+    tag_ss << "_" << anim_frames << "f" << anim_fps << "fps";
+    std::string anim_tag = tag_ss.str();
+
+    // Frames directory
+    std::string frames_dir = anim_frames_dir.empty()
+        ? std::string(OUT_DIR) + "/anim_" + anim_tag
+        : anim_frames_dir;
+
+    // Create frames dir
+    {
+        std::string cmd = "mkdir -p \"" + frames_dir + "\"";
+        std::system(cmd.c_str());
+    }
+
+    // Output file
+    std::string output_file = anim_output.empty()
+        ? std::string(OUT_DIR) + "/" + anim_tag + ".mp4"
+        : anim_output;
+
+    std::cout << "Animation: " << anim_frames << " frames @ " << anim_fps << " fps\n"
+              << "  theta:  " << theta_start << "° → " << theta_end << "°\n";
+    if (anim_orbits != 0.0)
+        std::cout << "  phi:    " << phi_start << "° + " << anim_orbits << " orbit(s)\n";
+    else
+        std::cout << "  phi:    " << phi_start << "° → " << phi_end << "°\n";
+    std::cout << "  r_obs:  " << r_start << " M → " << r_end << " M\n"
+              << "  a:      " << a_start << " → " << a_end << "\n"
+              << "  output: " << output_file << "\n"
+              << "  frames: " << frames_dir << "\n"
+              << "  res:    " << W << "x" << H << "\n"
+              << "  ease:   " << (anim_ease ? "yes (smooth-step)" : "no (linear)") << "\n\n";
+
+    double t_total = get_time();
+    int rendered = 0;
+    int skipped  = 0;
+
+    for (int frame = 0; frame < anim_frames; ++frame) {
+        // Frame file path
+        char fname[512];
+        std::snprintf(fname, sizeof(fname),
+                      "%s/frame_%05d.png", frames_dir.c_str(), frame);
+
+        // Resume: skip existing frames
+        if (anim_resume) {
+            std::ifstream test(fname);
+            if (test.good()) { ++skipped; continue; }
+        }
+
+        // Normalised phase [0,1]
+        double phase = (anim_frames == 1) ? 0.0
+                     : (double)frame / (anim_frames - 1);
+        double t     = anim_ease ? smooth_step(phase) : phase;
+
+        // Interpolate per-frame params
+        FrameParams fp;
+        fp.a        = a_start        + (a_end        - a_start)        * t;
+        fp.theta    = theta_start    + (theta_end    - theta_start)    * t;
+        fp.r_obs    = (r_start       + (r_end        - r_start)        * t) * M_bh;
+        fp.disk_out = (disk_out_start+ (disk_out_end - disk_out_start) * t) * M_bh;
+
+        // Phi: orbits override linear lerp
+        if (anim_orbits != 0.0)
+            fp.phi = phi_start + 360.0 * anim_orbits * phase;
+        else
+            fp.phi = lerp_angle(phi_start, phi_end, t);
+
+        double t_frame = get_time();
+        std::cout << "Frame " << (frame+1) << "/" << anim_frames
+                  << "  θ=" << std::fixed << std::setprecision(1) << fp.theta
+                  << "°  φ=" << fp.phi << "°"
+                  << "  r=" << std::setprecision(2) << fp.r_obs
+                  << "  a=" << std::setprecision(4) << fp.a
+                  << " ...\n" << std::flush;
+
+        auto image = render_image(W, H, fp, bg, use_bundles, intg, M_bh, Q_bh, Lam);
+        write_png(fname, image, W, H);
+
+        double dt = get_time() - t_frame;
+        double eta_total = (rendered > 0)
+            ? (get_time()-t_total) / rendered * (anim_frames - frame - 1)
+            : 0.0;
+        ++rendered;
+        std::cout << "  → saved " << fname
+                  << "  (" << std::setprecision(1) << dt << "s"
+                  << "  ETA " << (int)(eta_total/60) << "m"
+                  << (int)(std::fmod(eta_total,60)) << "s)\n";
+    }
+
+    double render_elapsed = get_time() - t_total;
+    std::cout << "\nFrames done: " << rendered << " rendered";
+    if (skipped) std::cout << ", " << skipped << " skipped";
+    std::cout << "  (" << render_elapsed << "s total)\n";
+
+    // ── ffmpeg encode ─────────────────────────────────────────
+    if (!anim_no_encode) {
+        char ffcmd[2048];
+        std::snprintf(ffcmd, sizeof(ffcmd),
+            "ffmpeg -y -framerate %d"
+            " -i \"%s/frame_%%05d.png\""
+            " -c:v libx264 -pix_fmt yuv420p"
+            " -crf %d -movflags +faststart"
+            " \"%s\" 2>&1",
+            anim_fps, frames_dir.c_str(),
+            anim_crf, output_file.c_str());
+
+        std::cout << "Encoding: " << ffcmd << "\n";
+        int ret = std::system(ffcmd);
+        if (ret == 0)
+            std::cout << "Video saved: " << output_file << "\n";
+        else
+            std::cerr << "ffmpeg failed (exit " << ret
+                      << "). Frames preserved in: " << frames_dir << "\n";
+    }
+
+    // Cleanup frames dir unless --keep-frames or encode failed
+    if (!anim_keep_frames && !anim_no_encode) {
+        std::string rmcmd = "rm -rf \"" + frames_dir + "\"";
+        std::system(rmcmd.c_str());
+    }
+
     return 0;
 }
