@@ -83,8 +83,6 @@ export class RenderService {
   }
 
   renderUrl(filename: string): string {
-    // Serve PNG version via backend (auto-converts PPM)
-    const png = filename.replace(/\.ppm$/, '.png');
-    return `/api/renders/${png}`;
+    return `/api/renders/${filename}`;
   }
 }

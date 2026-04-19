@@ -16,12 +16,13 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <vector>
@@ -192,12 +193,12 @@ static RGB disk_colour(double r, double red, double magnif,
             (uint8_t)(tonemap(c.b/255.0 * I) * 255)};
 }
 
-// ── Write PPM ─────────────────────────────────────────────────
-static void write_ppm(const char* path, const std::vector<RGB>& img,
+// ── Write PNG ─────────────────────────────────────────────────
+static void write_png(const char* path, const std::vector<RGB>& img,
                       int W, int H) {
-    std::ofstream o(path, std::ios::binary);
-    o << "P6\n" << W << " " << H << "\n255\n";
-    for (auto& p : img) { o.put(p.r); o.put(p.g); o.put(p.b); }
+    stbi_write_png(path, W, H, 3,
+                   reinterpret_cast<const unsigned char*>(img.data()),
+                   W * 3);
 }
 
 // ── Main ──────────────────────────────────────────────────────
@@ -371,7 +372,7 @@ int main(int argc, char** argv) {
               << std::fixed << std::setprecision(1)
               << (W*H/elapsed/1e3) << " kpix/s)\n";
 
-    // Build unique filename: <tag>_<WxH>_<YYYYMMDD-HHMMSS>.ppm
+    // Build unique filename: <tag>_<WxH>_<YYYYMMDD-HHMMSS>.png
     const char* tag = res_4k      ? "4k"
                     : res_2k      ? "2k"
                     : custom_w    ? "custom"
@@ -386,8 +387,8 @@ int main(int argc, char** argv) {
         std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", std::localtime(&now));
         std::string outfile = std::string(OUT_DIR) + "/" + tag
                             + "_" + std::to_string(W) + "x" + std::to_string(H)
-                            + "_" + ts + ".ppm";
-        write_ppm(outfile.c_str(), image, W, H);
+                            + "_" + ts + ".png";
+        write_png(outfile.c_str(), image, W, H);
         std::cout << "Saved: " << outfile << "\n";
     }
     return 0;

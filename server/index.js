@@ -9,7 +9,7 @@ const http       = require('http');
 const WebSocket  = require('ws');
 const path       = require('path');
 const fs         = require('fs');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const app    = express();
 const server = http.createServer(app);
@@ -70,7 +70,7 @@ app.get('/api/info', (req, res) => {
 // ── GET /api/renders ─────────────────────────────────────────
 app.get('/api/renders', (req, res) => {
   const files = fs.readdirSync(OUT_DIR)
-    .filter(f => /\.(ppm|png)$/.test(f))
+    .filter(f => /\.png$/.test(f))
     .map(f => {
       const stat = fs.statSync(path.join(OUT_DIR, f));
       return { name: f, size: stat.size, mtime: stat.mtime };
@@ -79,20 +79,10 @@ app.get('/api/renders', (req, res) => {
   res.json(files);
 });
 
-// ── GET /api/renders/:file (PNG conversion on-the-fly) ────────
+// ── GET /api/renders/:file ────────────────────────────────────
 app.get('/api/renders/:file', (req, res) => {
   const file = path.join(OUT_DIR, req.params.file);
   if (!fs.existsSync(file)) return res.sendStatus(404);
-
-  if (file.endsWith('.ppm')) {
-    // Convert to PNG on the fly with sips (macOS)
-    const png = file.replace('.ppm', '.png');
-    if (!fs.existsSync(png)) {
-      try { execSync(`sips -s format png "${file}" --out "${png}"`); }
-      catch { return res.sendFile(file); }
-    }
-    return res.sendFile(png);
-  }
   res.sendFile(file);
 });
 
@@ -157,21 +147,12 @@ app.post('/api/render', (req, res) => {
   });
 
   proc.on('close', code => {
-    const outPpm = fs.readdirSync(OUT_DIR)
-      .filter(f => f.endsWith('.ppm'))
+    const outPng = fs.readdirSync(OUT_DIR)
+      .filter(f => f.endsWith('.png'))
       .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
-      .sort((a, b) => b.t - a.t)[0]?.f;
+      .sort((a, b) => b.t - a.t)[0]?.f ?? null;
 
-    let outPng = null;
-    if (outPpm) {
-      outPng = outPpm.replace('.ppm', '.png');
-      const ppmPath = path.join(OUT_DIR, outPpm);
-      const pngPath = path.join(OUT_DIR, outPng);
-      try { execSync(`sips -s format png "${ppmPath}" --out "${pngPath}"`); }
-      catch { outPng = null; }
-    }
-
-    broadcast({ type: 'done', code, file: outPng || outPpm });
+    broadcast({ type: 'done', code, file: outPng });
     activeJob = null;
   });
 
