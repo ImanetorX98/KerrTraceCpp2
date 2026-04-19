@@ -4,10 +4,8 @@ import { FormsModule } from '@angular/forms';
 import { HttpClientModule } from '@angular/common/http';
 import { Subscription } from 'rxjs';
 
-import { MatSliderModule } from '@angular/material/slider';
-import { MatButtonModule } from '@angular/material/button';
-import { MatButtonToggleModule } from '@angular/material/button-toggle';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
+import { NumericInputComponent } from './numeric-input.component';
 import { MatSelectModule } from '@angular/material/select';
 import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatIconModule } from '@angular/material/icon';
@@ -20,9 +18,9 @@ import { RenderService, RenderParams, RenderFile, GeoFile, ColorizeParams, ApiIn
   standalone: true,
   imports: [
     CommonModule, FormsModule, HttpClientModule,
-    MatSliderModule, MatButtonModule, MatButtonToggleModule,
-    MatProgressBarModule, MatSelectModule, MatSlideToggleModule,
-    MatIconModule, MatTooltipModule,
+    MatProgressBarModule, MatSelectModule,
+    MatSlideToggleModule, MatIconModule, MatTooltipModule,
+    NumericInputComponent,
   ],
   templateUrl: './app.html',
   styleUrl: './app.scss',
@@ -35,6 +33,8 @@ export class App implements OnInit, OnDestroy {
   params: RenderParams = {
     resolution: '720p',
     a: 0.998,
+    q: 0.0,
+    lambda: 0.0,
     disk_out: 25,
     theta: 80,
     r_obs: 30,
@@ -52,7 +52,7 @@ export class App implements OnInit, OnDestroy {
 
   // ── Gallery ───────────────────────────────────────────────────
   renders: RenderFile[] = [];
-  activeRender: string | null = null;
+  readonly activeRender = signal<string | null>(null);
 
   // ── Post-process panel ────────────────────────────────────────
   geoFiles: GeoFile[] = [];
@@ -60,8 +60,8 @@ export class App implements OnInit, OnDestroy {
   postProcessTab: 'render' | 'recolor' = 'render';
 
   readonly previewUrl = computed(() => {
-    if (!this.activeRender) return null;
-    return this.svc.renderUrl(this.activeRender);
+    const r = this.activeRender();
+    return r ? this.svc.renderUrl(r) : null;
   });
 
   private sub: Subscription | null = null;
@@ -99,7 +99,7 @@ export class App implements OnInit, OnDestroy {
           this.status.set(msg.code === 0 ? 'done' : 'error');
           this.progress.set(100);
           if (msg.file) {
-            this.activeRender = msg.file;
+            this.activeRender.set(msg.file);
             setTimeout(() => { this.loadRenders(); this.loadGeoFiles(); }, 500);
           }
           break;
@@ -128,8 +128,8 @@ export class App implements OnInit, OnDestroy {
   loadRenders() {
     this.svc.getRenders().subscribe(files => {
       this.renders = files;
-      if (!this.activeRender && files.length > 0) {
-        this.activeRender = files[0].name;
+      if (!this.activeRender() && files.length > 0) {
+        this.activeRender.set(files[0].name);
       }
     });
   }
@@ -155,7 +155,7 @@ export class App implements OnInit, OnDestroy {
   }
 
   selectRender(name: string) {
-    this.activeRender = name;
+    this.activeRender.set(name);
   }
 
   fmt(v: number, d = 2): string {

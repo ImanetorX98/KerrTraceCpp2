@@ -1,39 +1,54 @@
 @use '@angular/material' as mat;
 
+// ── Tokens ─────────────────────────────────────────────────────
+$bg-base:    #000000;
+$bg-surface: #0e0e0e;
+$bg-panel:   #141414;
+$bg-hover:   #1c1c1c;
+$border:     #262626;
+$border-hi:  #3a3a3a;
+$text-hi:    #f0f0f0;
+$text-lo:    #666;
+$text-mid:   #999;
+$accent:     #e0e0e0;
+$accent-dim: #555;
+
+// ── Base ───────────────────────────────────────────────────────
 html, body {
   height: 100%;
   margin: 0;
-  font-family: Roboto, "Helvetica Neue", sans-serif;
-  background: #0d1117;
-  color: #e6edf3;
+  font-family: 'Inter', 'Roboto', sans-serif;
+  background: $bg-base;
+  color: $text-hi;
+  -webkit-font-smoothing: antialiased;
 }
 
+:root { color-scheme: dark; }
+
+// ── Material theme ─────────────────────────────────────────────
 :root {
-  color-scheme: dark;
+  @include mat.theme((
+    color: (
+      theme-type: dark,
+      primary: mat.$azure-palette,
+      tertiary: mat.$cyan-palette,
+    ),
+    typography: Roboto,
+    density: -1,
+  ));
 }
-
-// ── Material dark theme ────────────────────────────────────────
-@include mat.theme((
-  color: (
-    theme-type: dark,
-    primary: mat.$violet-palette,
-    tertiary: mat.$cyan-palette
-  ),
-  typography: Roboto,
-  density: 0
-));
 
 // ── Layout ─────────────────────────────────────────────────────
 .page {
-  max-width: 1400px;
+  max-width: 1440px;
   margin: 0 auto;
-  padding: 24px 16px;
+  padding: 28px 20px 48px;
 }
 
 .grid {
   display: grid;
-  grid-template-columns: 340px 1fr;
-  gap: 24px;
+  grid-template-columns: 300px 1fr;
+  gap: 20px;
   align-items: start;
 }
 
@@ -41,105 +56,341 @@ html, body {
   .grid { grid-template-columns: 1fr; }
 }
 
-// ── Panel card ─────────────────────────────────────────────────
+// ── Panel ──────────────────────────────────────────────────────
 .panel {
-  background: #161b22;
-  border: 1px solid #30363d;
-  border-radius: 10px;
-  padding: 20px;
+  background: $bg-panel;
+  border: 1px solid $border;
+  border-radius: 8px;
+  padding: 18px;
 }
 
 .panel h2 {
-  margin: 0 0 16px;
-  font-size: 14px;
+  margin: 0 0 14px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: .08em;
-  color: #8b949e;
+  letter-spacing: .12em;
+  color: $text-lo;
 }
 
-// ── Sliders ────────────────────────────────────────────────────
+// ── Header ─────────────────────────────────────────────────────
+.app-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 24px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid $border;
+}
+
+.app-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -.02em;
+  color: $text-hi;
+}
+
+.app-subtitle {
+  font-size: 12px;
+  color: $text-lo;
+  margin-top: 3px;
+  font-weight: 400;
+}
+
+.app-meta {
+  text-align: right;
+  font-size: 11px;
+  color: $text-lo;
+  line-height: 1.6;
+}
+
+.app-meta strong {
+  color: $text-mid;
+  font-weight: 500;
+}
+
+// ── Status chip ────────────────────────────────────────────────
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  border: 1px solid transparent;
+}
+
+.status-chip::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.status-chip.idle    { background: #111; border-color: $border; color: $text-lo; }
+.status-chip.idle::before { background: $text-lo; }
+.status-chip.running { background: #0a1f0a; border-color: #1a3a1a; color: #4caf50; }
+.status-chip.running::before { background: #4caf50; box-shadow: 0 0 4px #4caf50; }
+.status-chip.done    { background: #0a1525; border-color: #1a2f45; color: #64b5f6; }
+.status-chip.done::before { background: #64b5f6; }
+.status-chip.error   { background: #1f0a0a; border-color: #3a1a1a; color: #ef5350; }
+.status-chip.error::before { background: #ef5350; }
+
+// ── Tab bar ────────────────────────────────────────────────────
+.tab-bar {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 20px;
+  background: $bg-panel;
+  border: 1px solid $border;
+  border-radius: 6px;
+  padding: 3px;
+  width: fit-content;
+}
+
+.tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: $text-mid;
+  border-radius: 4px;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  transition: background .15s, color .15s;
+  font-family: inherit;
+  letter-spacing: .01em;
+
+  mat-icon {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+    line-height: 16px;
+  }
+
+  &:hover { background: $bg-hover; color: $text-hi; }
+  &.active { background: #1e1e1e; color: $text-hi; border: 1px solid $border-hi; }
+}
+
+// ── Numeric input rows ─────────────────────────────────────────
 .param-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid #111;
+
+  &:last-child { border-bottom: none; }
 }
 
 .param-row label {
-  width: 90px;
-  font-size: 13px;
-  color: #8b949e;
+  font-size: 12px;
+  color: $text-mid;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.param-row num-input {
   flex-shrink: 0;
 }
 
-.param-row mat-slider { flex: 1; }
+// ── Angular Material overrides ─────────────────────────────────
 
-.param-row .val {
-  width: 52px;
+// Slider track/thumb
+.mat-mdc-slider {
+  --mdc-slider-active-track-color: #{$accent-dim};
+  --mdc-slider-inactive-track-color: #{$border};
+  --mdc-slider-handle-color: #{$text-hi};
+  --mdc-slider-focus-handle-color: #{$text-hi};
+  --mdc-slider-hover-handle-color: #{$text-hi};
+}
+
+// Select
+.mat-mdc-select {
   font-size: 13px;
-  text-align: right;
-  color: #e6edf3;
-  font-family: monospace;
+  color: $text-hi;
+}
+.mat-mdc-form-field { width: 100%; }
+
+// Slide toggle
+.mat-mdc-slide-toggle {
+  --mdc-switch-unselected-track-color: #{$border-hi};
+  --mdc-switch-unselected-handle-color: #{$text-lo};
+  font-size: 13px;
+  color: $text-mid;
 }
 
-// ── Progress bar ───────────────────────────────────────────────
-.progress-wrap {
-  margin-top: 16px;
+// Flat button (primary action)
+.mat-mdc-unelevated-button.primary-btn {
+  background: $text-hi !important;
+  color: #000 !important;
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: .02em;
+  border-radius: 6px;
+  height: 36px;
 }
+
+// Outlined button (secondary)
+.mat-mdc-outlined-button.cancel-btn {
+  border-color: $border-hi !important;
+  color: $text-mid !important;
+  font-size: 13px;
+  border-radius: 6px;
+  height: 36px;
+}
+
+// Icon-only button
+.mat-mdc-icon-button {
+  color: $text-lo !important;
+  &:hover { color: $text-hi !important; }
+}
+
+// Mat select panel
+.mat-mdc-select-panel { background: $bg-panel !important; border: 1px solid $border !important; }
+.mat-mdc-option { font-size: 13px !important; color: $text-hi !important; }
+.mat-mdc-option:hover { background: $bg-hover !important; }
+
+// Resolution select
+.resolution-select {
+  .mat-mdc-select-trigger { font-size: 13px; }
+}
+
+// ── Progress ───────────────────────────────────────────────────
+.progress-wrap { margin-top: 16px; }
 
 .progress-info {
   display: flex;
   justify-content: space-between;
-  font-size: 12px;
-  color: #8b949e;
-  margin-bottom: 4px;
+  font-size: 11px;
+  color: $text-lo;
+  margin-bottom: 5px;
+  font-variant-numeric: tabular-nums;
 }
 
-// ── Image viewer ───────────────────────────────────────────────
-.render-view {
-  position: relative;
-  background: #010409;
-  border: 1px solid #30363d;
-  border-radius: 10px;
-  overflow: hidden;
+.mat-mdc-progress-bar {
+  --mdc-linear-progress-active-indicator-color: #{$text-hi};
+  --mdc-linear-progress-track-color: #{$border};
+  border-radius: 2px;
+  height: 2px !important;
+}
+
+// ── Log console ────────────────────────────────────────────────
+.log-console {
+  margin-top: 12px;
+  background: #080808;
+  border: 1px solid $border;
+  border-radius: 6px;
+  padding: 8px 10px;
+  max-height: 110px;
+  overflow-y: auto;
+  font-size: 11px;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  color: $text-lo;
+  line-height: 1.6;
+}
+
+// ── Actions row ────────────────────────────────────────────────
+.actions {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 300px;
-}
-
-.render-view img {
-  max-width: 100%;
-  max-height: 70vh;
-  display: block;
-}
-
-.render-placeholder {
-  color: #30363d;
-  font-size: 14px;
-  user-select: none;
-}
-
-// ── Gallery ────────────────────────────────────────────────────
-.gallery {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
   gap: 8px;
   margin-top: 16px;
 }
 
-.gallery-thumb {
-  cursor: pointer;
+.action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 16px;
+  height: 36px;
+  font-size: 13px;
+  font-weight: 500;
   border-radius: 6px;
-  overflow: hidden;
-  border: 2px solid transparent;
-  transition: border-color .15s;
+  cursor: pointer;
+  border: none;
+  font-family: inherit;
+  transition: opacity .15s, background .15s;
+  letter-spacing: .01em;
+
+  mat-icon {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+    line-height: 16px;
+  }
+
+  &:disabled { opacity: .35; cursor: not-allowed; }
 }
 
-.gallery-thumb:hover,
-.gallery-thumb.active {
-  border-color: #6e40c9;
+.action-btn.primary {
+  background: $text-hi;
+  color: #000;
+  font-weight: 600;
+  flex: 1;
+  &:not(:disabled):hover { background: #ccc; }
+}
+
+.action-btn.danger {
+  background: transparent;
+  color: $text-lo;
+  border: 1px solid $border;
+  &:not(:disabled):hover { border-color: $border-hi; color: $text-hi; }
+}
+
+// ── Image viewer ───────────────────────────────────────────────
+.render-view {
+  background: #080808;
+  border: 1px solid $border;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 280px;
+}
+
+.render-view img {
+  max-width: 100%;
+  max-height: 68vh;
+  display: block;
+}
+
+.render-placeholder {
+  color: #2a2a2a;
+  font-size: 13px;
+  user-select: none;
+}
+
+// ── Gallery ────────────────────────────────────────────────────
+.gallery-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 6px;
+}
+
+.gallery-thumb {
+  cursor: pointer;
+  border-radius: 5px;
+  overflow: hidden;
+  border: 1px solid $border;
+  transition: border-color .15s;
+
+  &:hover, &.active { border-color: $border-hi; }
 }
 
 .gallery-thumb img {
@@ -151,45 +402,25 @@ html, body {
 
 .gallery-thumb .fname {
   font-size: 10px;
-  color: #8b949e;
-  padding: 2px 4px;
+  color: $text-lo;
+  padding: 3px 5px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  background: #161b22;
-}
-
-// ── Status chip ────────────────────────────────────────────────
-.status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.status-chip.idle    { background: #21262d; color: #8b949e; }
-.status-chip.running { background: #1f3a1f; color: #56d364; }
-.status-chip.done    { background: #1a2c3d; color: #58a6ff; }
-.status-chip.error   { background: #3d1a1a; color: #f85149; }
-
-// ── Buttons ────────────────────────────────────────────────────
-.actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 16px;
-}
-
-// ── Resolution selector ────────────────────────────────────────
-mat-button-toggle-group {
-  flex-wrap: wrap;
+  background: $bg-panel;
 }
 
 // ── Section divider ────────────────────────────────────────────
 .divider {
   border: none;
-  border-top: 1px solid #30363d;
-  margin: 16px 0;
+  border-top: 1px solid $border;
+  margin: 14px 0;
+}
+
+// ── Recolor label ──────────────────────────────────────────────
+.section-hint {
+  font-size: 11px;
+  color: $text-lo;
+  margin-top: 6px;
+  line-height: 1.5;
 }

@@ -418,6 +418,7 @@ int main(int argc, char** argv) {
 
     // ── Single-frame / base params ───────────────────────────
     double arg_a=0.998, arg_disk_out=25.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
+    double arg_Q=0.0, arg_Lam=0.0;
 
     // ── Colorization params ───────────────────────────────────
     ColorParams cp;  // defaults: exposure=1, gamma=2.2, temp_scale=1
@@ -463,6 +464,8 @@ int main(int argc, char** argv) {
         if (arg=="--theta"    && i+1<argc) arg_theta    = std::stod(argv[++i]);
         if (arg=="--phi"      && i+1<argc) arg_phi      = std::stod(argv[++i]);
         if (arg=="--r-obs"    && i+1<argc) arg_r_obs    = std::stod(argv[++i]);
+        if (arg=="--charge"   && i+1<argc) arg_Q        = std::stod(argv[++i]);
+        if (arg=="--lambda"   && i+1<argc) arg_Lam      = std::stod(argv[++i]);
 
         // Colorization
         if (arg=="--exposure"   && i+1<argc) cp.exposure   = std::stod(argv[++i]);
@@ -509,7 +512,8 @@ int main(int argc, char** argv) {
     }
 
     // ── Derived constants ────────────────────────────────────
-    const double M_bh=1.0, Q_bh=0.0, Lam=0.0;
+    const double M_bh=1.0;
+    const double Q_bh=arg_Q, Lam=arg_Lam;
 
     const int W = custom_w ? custom_w : res_4k ? 3840 : res_2k ? 2560
                 : res_720p ? 1280 : hd_preview ? 854 : preview ? 480 : 1920;

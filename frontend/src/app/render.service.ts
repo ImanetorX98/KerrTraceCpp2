@@ -5,6 +5,8 @@ import { Subject } from 'rxjs';
 export interface RenderParams {
   resolution: string;
   a: number;
+  q: number;
+  lambda: number;
   disk_out: number;
   theta: number;
   r_obs: number;

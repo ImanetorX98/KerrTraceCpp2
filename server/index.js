@@ -168,10 +168,12 @@ app.post('/api/render', (req, res) => {
   if (p.bundles)  args.push('--bundles');
   if (p.dopri5)   args.push('--dopri5');
 
-  if (p.a        !== undefined) args.push('--a',        String(p.a));
+  if (p.a      !== undefined) args.push('--a',       String(p.a));
   if (p.disk_out !== undefined) args.push('--disk-out', String(p.disk_out));
-  if (p.theta    !== undefined) args.push('--theta',    String(p.theta));
-  if (p.r_obs    !== undefined) args.push('--r-obs',    String(p.r_obs));
+  if (p.theta  !== undefined) args.push('--theta',   String(p.theta));
+  if (p.r_obs  !== undefined) args.push('--r-obs',   String(p.r_obs));
+  if (p.q      !== undefined && p.q  !== 0) args.push('--charge', String(p.q));
+  if (p.lambda !== undefined && p.lambda !== 0) args.push('--lambda', String(p.lambda));
 
   if (p.background) {
     const bgPath = path.join(ASSETS_DIR, p.background);

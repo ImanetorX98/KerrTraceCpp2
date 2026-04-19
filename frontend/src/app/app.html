@@ -1,109 +1,122 @@
 <div class="page">
 
   <!-- ── Header ─────────────────────────────────────────────── -->
-  <header style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+  <header class="app-header">
     <div>
-      <h1 style="margin:0;font-size:20px;font-weight:700;letter-spacing:-.02em">
-        KNdS Ray Tracer
-      </h1>
-      <div style="font-size:12px;color:#8b949e;margin-top:2px">
-        Kerr-Newman-de Sitter relativistic renderer
-      </div>
+      <h1 class="app-title">KNdS Ray Tracer</h1>
+      <div class="app-subtitle">Kerr-Newman-de Sitter relativistic renderer</div>
     </div>
-    <span class="status-chip" [class]="status()">
-      <span *ngIf="status()==='idle'">Idle</span>
-      <span *ngIf="status()==='running'">Rendering…</span>
-      <span *ngIf="status()==='done'">Done</span>
-      <span *ngIf="status()==='error'">Error</span>
-    </span>
+    <div style="display:flex;align-items:center;gap:16px">
+      <div class="app-meta">
+        <div><strong>Author</strong> Iman Rosignoli</div>
+        <div><strong>Version</strong> Phase 2 — GPU &amp; Quality</div>
+      </div>
+      <span class="status-chip" [class]="status()">
+        <span *ngIf="status()==='idle'">Idle</span>
+        <span *ngIf="status()==='running'">Rendering</span>
+        <span *ngIf="status()==='done'">Done</span>
+        <span *ngIf="status()==='error'">Error</span>
+      </span>
+    </div>
   </header>
 
-  <!-- ── Tab switcher ──────────────────────────────────────────── -->
-  <mat-button-toggle-group [(ngModel)]="postProcessTab" style="margin-bottom:16px">
-    <mat-button-toggle value="render">
-      <mat-icon>photo_camera</mat-icon>&nbsp;Render
-    </mat-button-toggle>
-    <mat-button-toggle value="recolor">
-      <mat-icon>tune</mat-icon>&nbsp;Re-colorize
-    </mat-button-toggle>
-  </mat-button-toggle-group>
+  <!-- ── Tab bar ─────────────────────────────────────────────── -->
+  <div class="tab-bar">
+    <button class="tab-btn" [class.active]="postProcessTab==='render'"
+            (click)="postProcessTab='render'">
+      <mat-icon>photo_camera</mat-icon>Render
+    </button>
+    <button class="tab-btn" [class.active]="postProcessTab==='recolor'"
+            (click)="postProcessTab='recolor'">
+      <mat-icon>tune</mat-icon>Re-colorize
+    </button>
+  </div>
 
   <div class="grid">
 
-    <!-- ── Left panel: parameters ──────────────────────────── -->
+    <!-- ══════════════════════════════════════════════════════ -->
+    <!--  LEFT — Render panel                                   -->
+    <!-- ══════════════════════════════════════════════════════ -->
     <div *ngIf="postProcessTab === 'render'">
 
       <!-- Resolution -->
-      <div class="panel" style="margin-bottom:16px">
+      <div class="panel" style="margin-bottom:14px">
         <h2>Resolution</h2>
-        <mat-button-toggle-group [(ngModel)]="params.resolution" style="width:100%">
-          <mat-button-toggle *ngFor="let r of info?.resolutions ?? []" [value]="r"
-                             style="flex:1;min-width:50px;font-size:12px">
-            {{r}}
-          </mat-button-toggle>
-        </mat-button-toggle-group>
+        <mat-select [(ngModel)]="params.resolution"
+                    style="width:100%;font-size:13px;color:#f0f0f0">
+          <mat-option *ngFor="let r of info?.resolutions ?? []" [value]="r">{{r}}</mat-option>
+        </mat-select>
       </div>
 
-      <!-- Black hole parameters -->
-      <div class="panel" style="margin-bottom:16px">
+      <!-- Black hole -->
+      <div class="panel" style="margin-bottom:14px">
         <h2>Black Hole</h2>
 
         <div class="param-row">
           <label>Spin <i>a/M</i></label>
-          <mat-slider min="0" max="0.9999" step="0.001" style="flex:1">
-            <input matSliderThumb [(ngModel)]="params.a">
-          </mat-slider>
-          <span class="val">{{fmt(params.a, 3)}}</span>
+          <num-input [(value)]="params.a"
+                     [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3">
+          </num-input>
+        </div>
+
+        <div class="param-row">
+          <label>Charge <i>Q/M</i></label>
+          <num-input [(value)]="params.q"
+                     [min]="-1" [max]="1" [step]="0.01" [decimals]="3">
+          </num-input>
+        </div>
+
+        <div class="param-row">
+          <label>Λ <span style="font-size:10px;color:#555">(×10⁻³)</span></label>
+          <num-input [(value)]="params.lambda"
+                     [min]="-5" [max]="5" [step]="0.1" [decimals]="3">
+          </num-input>
         </div>
 
         <div class="param-row">
           <label>Disk r<sub>out</sub></label>
-          <mat-slider min="6" max="60" step="0.5" style="flex:1">
-            <input matSliderThumb [(ngModel)]="params.disk_out">
-          </mat-slider>
-          <span class="val">{{fmt(params.disk_out, 1)}} M</span>
+          <num-input [(value)]="params.disk_out"
+                     [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
+          </num-input>
         </div>
       </div>
 
-      <!-- Camera parameters -->
-      <div class="panel" style="margin-bottom:16px">
+      <!-- Camera -->
+      <div class="panel" style="margin-bottom:14px">
         <h2>Camera</h2>
 
         <div class="param-row">
           <label>Inclination</label>
-          <mat-slider min="1" max="89" step="1" style="flex:1">
-            <input matSliderThumb [(ngModel)]="params.theta">
-          </mat-slider>
-          <span class="val">{{fmt(params.theta, 0)}}°</span>
+          <num-input [(value)]="params.theta"
+                     [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°">
+          </num-input>
         </div>
 
         <div class="param-row">
           <label><i>r</i><sub>obs</sub></label>
-          <mat-slider min="5" max="500" step="1" style="flex:1">
-            <input matSliderThumb [(ngModel)]="params.r_obs">
-          </mat-slider>
-          <span class="val">{{fmt(params.r_obs, 0)}} M</span>
+          <num-input [(value)]="params.r_obs"
+                     [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M">
+          </num-input>
         </div>
       </div>
 
-      <!-- Render options -->
-      <div class="panel" style="margin-bottom:16px">
+      <!-- Options -->
+      <div class="panel" style="margin-bottom:14px">
         <h2>Options</h2>
-
         <div style="display:flex;flex-direction:column;gap:10px">
           <mat-slide-toggle [(ngModel)]="params.bundles">
-            Ray bundles (antialiasing + magnification)
+            Ray bundles
           </mat-slide-toggle>
           <mat-slide-toggle [(ngModel)]="params.dopri5">
-            DOPRI5 integrator (instead of RK4)
+            DOPRI5 integrator
           </mat-slide-toggle>
         </div>
 
         <hr class="divider">
 
-        <!-- Background selector -->
         <h2>Background HDRI</h2>
-        <mat-select [(ngModel)]="params.background" placeholder="None">
+        <mat-select [(ngModel)]="params.background" placeholder="None"
+                    style="width:100%;font-size:13px">
           <mat-option value="">None</mat-option>
           <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg">
             {{bg}}
@@ -113,18 +126,15 @@
 
       <!-- Actions -->
       <div class="actions">
-        <button mat-flat-button color="primary"
+        <button class="action-btn primary"
                 [disabled]="status()==='running'"
-                (click)="startRender()"
-                style="flex:1">
-          <mat-icon>play_arrow</mat-icon>
-          Render
+                (click)="startRender()">
+          <mat-icon>play_arrow</mat-icon>Render
         </button>
-        <button mat-stroked-button color="warn"
+        <button class="action-btn danger"
                 [disabled]="status()!=='running'"
                 (click)="cancelRender()">
-          <mat-icon>stop</mat-icon>
-          Cancel
+          <mat-icon>stop</mat-icon>Cancel
         </button>
       </div>
 
@@ -132,82 +142,77 @@
       <div class="progress-wrap" *ngIf="status()==='running'">
         <div class="progress-info">
           <span>{{progress()}}%</span>
-          <span *ngIf="eta() > 0">ETA {{fmt(eta(), 0)}}s · {{fmt(elapsed(), 0)}}s elapsed</span>
+          <span *ngIf="eta() > 0">{{fmt(elapsed(), 0)}}s elapsed · ETA {{fmt(eta(), 0)}}s</span>
         </div>
         <mat-progress-bar mode="determinate" [value]="progress()"></mat-progress-bar>
       </div>
 
       <!-- Log -->
-      <div *ngIf="logLines().length > 0"
-           style="margin-top:12px;background:#010409;border:1px solid #30363d;
-                  border-radius:6px;padding:8px;max-height:120px;overflow-y:auto;
-                  font-size:11px;font-family:monospace;color:#8b949e;line-height:1.5">
+      <div class="log-console" *ngIf="logLines().length > 0">
         <div *ngFor="let l of logLines()">{{l}}</div>
       </div>
     </div>
 
-    <!-- ── Left panel: re-colorize ─────────────────────────── -->
+    <!-- ══════════════════════════════════════════════════════ -->
+    <!--  LEFT — Re-colorize panel                              -->
+    <!-- ══════════════════════════════════════════════════════ -->
     <div *ngIf="postProcessTab === 'recolor'">
 
-      <div class="panel" style="margin-bottom:16px">
-        <h2>Geodesic file (.kgeo)</h2>
-        <mat-select [(ngModel)]="colorParams.geoFile" placeholder="Select .kgeo file"
-                    style="width:100%">
-          <mat-option *ngFor="let f of geoFiles" [value]="f.name">
-            {{f.name}}
-          </mat-option>
-        </mat-select>
-        <div *ngIf="geoFiles.length === 0"
-             style="font-size:12px;color:#8b949e;margin-top:8px">
-          No .kgeo files yet — run a render with --geo-only or with normal render.
+      <div class="panel" style="margin-bottom:14px">
+        <h2>Geodesic cache (.kgeo)</h2>
+        <div style="display:flex;align-items:center;gap:8px">
+          <mat-select [(ngModel)]="colorParams.geoFile" placeholder="Select file…"
+                      style="flex:1;font-size:13px">
+            <mat-option *ngFor="let f of geoFiles" [value]="f.name">
+              {{f.name}}
+            </mat-option>
+          </mat-select>
+          <button class="action-btn danger" style="padding:0 10px;height:34px"
+                  (click)="loadGeoFiles()">
+            <mat-icon>refresh</mat-icon>
+          </button>
         </div>
-        <button mat-icon-button matTooltip="Refresh" (click)="loadGeoFiles()"
-                style="margin-top:4px">
-          <mat-icon>refresh</mat-icon>
-        </button>
+        <div class="section-hint" *ngIf="geoFiles.length === 0">
+          No .kgeo files found. Run a render first.
+        </div>
       </div>
 
-      <div class="panel" style="margin-bottom:16px">
+      <div class="panel" style="margin-bottom:14px">
         <h2>Color grading</h2>
 
         <div class="param-row">
           <label>Exposure</label>
-          <mat-slider min="0.1" max="5.0" step="0.05" style="flex:1">
-            <input matSliderThumb [(ngModel)]="colorParams.exposure">
-          </mat-slider>
-          <span class="val">{{fmt(colorParams.exposure, 2)}}</span>
+          <num-input [(value)]="colorParams.exposure"
+                     [min]="0.1" [max]="5.0" [step]="0.05" [decimals]="2">
+          </num-input>
         </div>
 
         <div class="param-row">
           <label>Gamma</label>
-          <mat-slider min="1.0" max="3.0" step="0.05" style="flex:1">
-            <input matSliderThumb [(ngModel)]="colorParams.gamma">
-          </mat-slider>
-          <span class="val">{{fmt(colorParams.gamma, 2)}}</span>
+          <num-input [(value)]="colorParams.gamma"
+                     [min]="1.0" [max]="3.0" [step]="0.05" [decimals]="2">
+          </num-input>
         </div>
 
         <div class="param-row">
           <label>Temp scale</label>
-          <mat-slider min="0.5" max="2.0" step="0.05" style="flex:1">
-            <input matSliderThumb [(ngModel)]="colorParams.tempScale">
-          </mat-slider>
-          <span class="val">{{fmt(colorParams.tempScale, 2)}}</span>
+          <num-input [(value)]="colorParams.tempScale"
+                     [min]="0.5" [max]="2.0" [step]="0.05" [decimals]="2">
+          </num-input>
         </div>
       </div>
 
+      <!-- Actions -->
       <div class="actions">
-        <button mat-flat-button color="accent"
+        <button class="action-btn primary"
                 [disabled]="status()==='running' || !colorParams.geoFile"
-                (click)="startColorize()"
-                style="flex:1">
-          <mat-icon>palette</mat-icon>
-          Re-colorize
+                (click)="startColorize()">
+          <mat-icon>palette</mat-icon>Re-colorize
         </button>
-        <button mat-stroked-button color="warn"
+        <button class="action-btn danger"
                 [disabled]="status()!=='running'"
                 (click)="cancelRender()">
-          <mat-icon>stop</mat-icon>
-          Cancel
+          <mat-icon>stop</mat-icon>Cancel
         </button>
       </div>
 
@@ -215,57 +220,52 @@
       <div class="progress-wrap" *ngIf="status()==='running'">
         <div class="progress-info">
           <span>{{progress()}}%</span>
-          <span *ngIf="eta() > 0">ETA {{fmt(eta(), 0)}}s · {{fmt(elapsed(), 0)}}s elapsed</span>
+          <span *ngIf="eta() > 0">{{fmt(elapsed(), 0)}}s elapsed · ETA {{fmt(eta(), 0)}}s</span>
         </div>
         <mat-progress-bar mode="determinate" [value]="progress()"></mat-progress-bar>
       </div>
 
       <!-- Log -->
-      <div *ngIf="logLines().length > 0"
-           style="margin-top:12px;background:#010409;border:1px solid #30363d;
-                  border-radius:6px;padding:8px;max-height:120px;overflow-y:auto;
-                  font-size:11px;font-family:monospace;color:#8b949e;line-height:1.5">
+      <div class="log-console" *ngIf="logLines().length > 0">
         <div *ngFor="let l of logLines()">{{l}}</div>
       </div>
     </div>
 
-    <!-- ── Right panel: viewer + gallery ───────────────────── -->
+    <!-- ══════════════════════════════════════════════════════ -->
+    <!--  RIGHT — Viewer + gallery                              -->
+    <!-- ══════════════════════════════════════════════════════ -->
     <div>
 
       <!-- Render viewer -->
       <div class="render-view">
         <img *ngIf="previewUrl()" [src]="previewUrl()!" alt="render" />
         <span class="render-placeholder" *ngIf="!previewUrl()">
-          No render yet — press Render to start
+          No render yet
         </span>
       </div>
 
       <!-- Gallery -->
-      <div class="panel" style="margin-top:16px">
-        <div style="display:flex;align-items:center;justify-content:space-between">
+      <div class="panel" style="margin-top:14px">
+        <div class="gallery-header">
           <h2 style="margin:0">Render history</h2>
-          <button mat-icon-button matTooltip="Refresh" (click)="loadRenders()">
-            <mat-icon>refresh</mat-icon>
+          <button class="action-btn danger" style="padding:0 8px;height:28px"
+                  (click)="loadRenders()">
+            <mat-icon style="font-size:14px;width:14px;height:14px">refresh</mat-icon>
           </button>
         </div>
 
         <div class="gallery" *ngIf="renders.length > 0; else noRenders">
           <div class="gallery-thumb"
                *ngFor="let r of renders"
-               [class.active]="r.name === activeRender"
+               [class.active]="r.name === activeRender()"
                (click)="selectRender(r.name)">
-            <img [src]="svc.renderUrl(r.name)" [alt]="r.name"
-                 loading="lazy" />
-            <div class="fname" [title]="r.name">
-              {{r.name}} · {{fmtSize(r.size)}}
-            </div>
+            <img [src]="svc.renderUrl(r.name)" [alt]="r.name" loading="lazy" />
+            <div class="fname" [title]="r.name">{{r.name}}</div>
           </div>
         </div>
 
         <ng-template #noRenders>
-          <div style="color:#8b949e;font-size:13px;margin-top:8px">
-            No renders yet.
-          </div>
+          <div style="color:#333;font-size:12px;padding:8px 0">No renders yet.</div>
         </ng-template>
       </div>
     </div>
