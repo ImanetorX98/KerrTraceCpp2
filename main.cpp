@@ -24,9 +24,11 @@
 #include <atomic>
 #include <array>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -160,10 +162,80 @@ struct BackgroundImage {
 // ── Geodesic trace helpers ────────────────────────────────────
 enum class Outcome { ESCAPED, DISK_HIT, HORIZON };
 enum class CoordinateChart { KS, BL };
+enum class RaySolverMode { STANDARD, SEMI_ANALYTIC, ELLIPTIC_CLOSED };
 struct TraceResult {
     Outcome out; double r, redshift;
     double theta_esc=0.0, phi_esc=0.0;
 };
+
+static const char* solver_mode_name(RaySolverMode mode) {
+    switch (mode) {
+        case RaySolverMode::STANDARD:         return "standard";
+        case RaySolverMode::SEMI_ANALYTIC:    return "semi-analytic";
+        case RaySolverMode::ELLIPTIC_CLOSED:  return "elliptic-closed";
+    }
+    return "standard";
+}
+
+static bool solver_mode_requires_separable_kerr(RaySolverMode mode) {
+    return mode == RaySolverMode::SEMI_ANALYTIC || mode == RaySolverMode::ELLIPTIC_CLOSED;
+}
+
+struct SolverSelection {
+    RaySolverMode effective = RaySolverMode::STANDARD;
+    bool fallback = false;
+    const char* reason = nullptr;
+};
+
+static SolverSelection select_solver_mode(
+    RaySolverMode requested,
+    bool use_bundles,
+    CoordinateChart chart,
+    double Q_bh,
+    double Lam)
+{
+    SolverSelection sel{};
+    sel.effective = requested;
+
+    if (use_bundles && requested != RaySolverMode::STANDARD) {
+        sel.effective = RaySolverMode::STANDARD;
+        sel.fallback = true;
+        sel.reason = "requested solver is not available with ray bundles";
+        return sel;
+    }
+
+    if (solver_mode_requires_separable_kerr(requested)) {
+        if (chart != CoordinateChart::BL) {
+            sel.effective = RaySolverMode::STANDARD;
+            sel.fallback = true;
+            sel.reason = "requested solver currently supports BL chart only";
+            return sel;
+        }
+        if (std::abs(Q_bh) > 1e-15 || std::abs(Lam) > 1e-15) {
+            sel.effective = RaySolverMode::STANDARD;
+            sel.fallback = true;
+            sel.reason = "requested solver currently supports Kerr only (Q=0, Lambda=0)";
+            return sel;
+        }
+    }
+    return sel;
+}
+
+#if defined(USE_METAL)
+static bool metal_solver_supported(RaySolverMode mode, CoordinateChart chart, double Q_bh, double Lam) {
+    if (mode == RaySolverMode::STANDARD) return true;
+    return chart == CoordinateChart::BL && std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15;
+}
+
+static int metal_solver_mode_code(RaySolverMode mode) {
+    switch (mode) {
+        case RaySolverMode::STANDARD:        return 0;
+        case RaySolverMode::SEMI_ANALYTIC:   return 1;
+        case RaySolverMode::ELLIPTIC_CLOSED: return 2;
+    }
+    return 0;
+}
+#endif
 
 static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& g) {
     double Omega = g.keplerian_omega(r);
@@ -414,6 +486,275 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
     }
 
     return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+}
+
+// ── Elliptic-closed helpers (Carlson RF + Jacobi inversion) ──
+static double carlson_rf(double x, double y, double z) {
+    if (!(x >= 0.0 && y >= 0.0 && z >= 0.0)) return std::numeric_limits<double>::quiet_NaN();
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+        return std::numeric_limits<double>::quiet_NaN();
+
+    double xn = x, yn = y, zn = z;
+    constexpr double ERR_TOL = 1e-10;
+    for (int it = 0; it < 64; ++it) {
+        const double mu = (xn + yn + zn) / 3.0;
+        if (!(mu > 0.0) || !std::isfinite(mu))
+            return std::numeric_limits<double>::quiet_NaN();
+
+        const double X = 1.0 - xn / mu;
+        const double Y = 1.0 - yn / mu;
+        const double Z = 1.0 - zn / mu;
+        const double eps = std::max({std::abs(X), std::abs(Y), std::abs(Z)});
+        if (eps < ERR_TOL) {
+            const double E2 = X*Y - Z*Z;
+            const double E3 = X*Y*Z;
+            const double corr =
+                1.0
+                - E2 / 10.0
+                + E3 / 14.0
+                + (E2*E2) / 24.0
+                - (3.0 * E2 * E3) / 44.0;
+            return corr / std::sqrt(mu);
+        }
+
+        const double sx = std::sqrt(xn);
+        const double sy = std::sqrt(yn);
+        const double sz = std::sqrt(zn);
+        const double lam = sx*sy + sx*sz + sy*sz;
+        xn = 0.25 * (xn + lam);
+        yn = 0.25 * (yn + lam);
+        zn = 0.25 * (zn + lam);
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+static double ellint_F_incomplete(double phi, double m) {
+    const double s = std::sin(phi);
+    const double c = std::cos(phi);
+    const double x = c*c;
+    const double y = 1.0 - m*s*s;
+    if (y <= 0.0) return std::numeric_limits<double>::quiet_NaN();
+    const double rf = carlson_rf(x, y, 1.0);
+    return s * rf;
+}
+
+static double ellint_K_complete(double m) {
+    if (!(m >= 0.0 && m < 1.0)) return std::numeric_limits<double>::quiet_NaN();
+    return carlson_rf(0.0, 1.0 - m, 1.0);
+}
+
+static double jacobi_sn2_from_u(double u, double m, double Kc) {
+    if (!(m >= 0.0 && m < 1.0) || !(Kc > 0.0) || !std::isfinite(u))
+        return std::numeric_limits<double>::quiet_NaN();
+
+    double ur = std::fmod(u, 2.0 * Kc);
+    if (ur < 0.0) ur += 2.0 * Kc;
+    if (ur > Kc) ur = 2.0 * Kc - ur; // sn^2 symmetry on [0, 2K]
+
+    double lo = 0.0, hi = 0.5 * M_PI;
+    for (int it = 0; it < 64; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        const double Fm = ellint_F_incomplete(mid, m);
+        if (!std::isfinite(Fm)) return std::numeric_limits<double>::quiet_NaN();
+        if (Fm < ur) lo = mid;
+        else         hi = mid;
+    }
+    const double s = std::sin(0.5 * (lo + hi));
+    return s*s;
+}
+
+static std::complex<double> eval_monic_quartic(const std::array<double, 4>& b,
+                                               const std::complex<double>& z) {
+    // z^4 + b[0] z^3 + b[1] z^2 + b[2] z + b[3]
+    return (((z + b[0]) * z + b[1]) * z + b[2]) * z + b[3];
+}
+
+static bool quartic_real_roots_monic(const std::array<double, 4>& b,
+                                     std::array<double, 4>& roots_out) {
+    constexpr double PI = 3.141592653589793238462643383279502884;
+    const double radius = 1.0 + std::max({std::abs(b[0]), std::abs(b[1]), std::abs(b[2]), std::abs(b[3])});
+    std::array<std::complex<double>, 4> z = {
+        std::polar(radius, 0.0 * PI),
+        std::polar(radius, 0.5 * PI),
+        std::polar(radius, 1.0 * PI),
+        std::polar(radius, 1.5 * PI)
+    };
+
+    for (int it = 0; it < 128; ++it) {
+        double max_delta = 0.0;
+        std::array<std::complex<double>, 4> zn = z;
+        for (int i = 0; i < 4; ++i) {
+            std::complex<double> den = 1.0;
+            for (int j = 0; j < 4; ++j) {
+                if (i == j) continue;
+                den *= (z[i] - z[j]);
+            }
+            if (std::abs(den) < 1e-20) den = std::complex<double>(1e-20, 0.0);
+            const std::complex<double> delta = eval_monic_quartic(b, z[i]) / den;
+            zn[i] = z[i] - delta;
+            max_delta = std::max(max_delta, std::abs(delta));
+        }
+        z = zn;
+        if (max_delta < 1e-13) break;
+    }
+
+    std::vector<double> rr;
+    rr.reserve(4);
+    for (const auto& zi : z) {
+        const double tol = 1e-7 * std::max(1.0, std::abs(zi.real()));
+        if (std::abs(zi.imag()) <= tol && std::isfinite(zi.real()))
+            rr.push_back(zi.real());
+    }
+    if (rr.size() != 4) return false;
+
+    std::sort(rr.begin(), rr.end(), std::greater<double>());
+    for (int i = 0; i < 4; ++i) roots_out[i] = rr[(size_t)i];
+    return true;
+}
+
+struct EllipticRadialMap {
+    double r1=0.0, r2=0.0, r3=0.0, r4=0.0;
+    double r31=0.0, r41=0.0;
+    double m=0.0;          // Jacobi modulus squared
+    double Kc=0.0;         // complete elliptic integral K(m)
+    double omega=0.0;      // phase frequency in Mino time
+    double X0=0.0;         // initial phase
+    int x_sign=1;          // phase orientation matching initial dr sign
+};
+
+static double elliptic_radial_r_from_phase(const EllipticRadialMap& mp, double X) {
+    const double sn2 = jacobi_sn2_from_u(X, mp.m, mp.Kc);
+    if (!std::isfinite(sn2)) return std::numeric_limits<double>::quiet_NaN();
+    const double den = mp.r31 - mp.r41 * sn2;
+    if (std::abs(den) < 1e-14) return std::numeric_limits<double>::quiet_NaN();
+    return (mp.r4 * mp.r31 - mp.r3 * mp.r41 * sn2) / den;
+}
+
+static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
+                                     double r0, double dr0,
+                                     EllipticRadialMap& out) {
+    const double Kpot = c.Qc + (c.Lz - c.a*c.E)*(c.Lz - c.a*c.E);
+    const double A0 = c.E*c.a*c.a - c.a*c.Lz;
+    const double c4 = c.E*c.E;
+    if (!(c4 > 1e-18)) return false;
+    const double c2 = 2.0*c.E*A0 - Kpot;
+    const double c1 = 2.0*c.M*Kpot;
+    const double c0 = A0*A0 - c.a*c.a*Kpot;
+
+    const std::array<double, 4> b = {0.0, c2/c4, c1/c4, c0/c4}; // monic quartic
+    std::array<double, 4> rr{};
+    if (!quartic_real_roots_monic(b, rr)) return false;
+
+    out.r1 = rr[0]; out.r2 = rr[1]; out.r3 = rr[2]; out.r4 = rr[3];
+    out.r31 = out.r3 - out.r1;
+    out.r41 = out.r4 - out.r1;
+    if (std::abs(out.r31) < 1e-14 || std::abs(out.r41) < 1e-14) return false;
+
+    const double den = (out.r1 - out.r3) * (out.r2 - out.r4);
+    if (!(den > 0.0)) return false;
+    out.m = ((out.r1 - out.r2) * (out.r3 - out.r4)) / den;
+    if (!(out.m >= 0.0 && out.m < 1.0)) return false;
+    out.Kc = ellint_K_complete(out.m);
+    if (!std::isfinite(out.Kc) || !(out.Kc > 0.0)) return false;
+
+    const double u0_num = out.r31 * (r0 - out.r4);
+    const double u0_den = out.r41 * (r0 - out.r3);
+    if (std::abs(u0_den) < 1e-14) return false;
+    double u0 = u0_num / u0_den;
+    u0 = clamp(u0, 0.0, 1.0);
+    out.X0 = ellint_F_incomplete(std::asin(std::sqrt(u0)), out.m);
+    if (!std::isfinite(out.X0)) return false;
+
+    out.omega = 0.5 * std::sqrt(den);
+    if (!(out.omega > 0.0) || !std::isfinite(out.omega)) return false;
+
+    const double probe_tau = 1e-6;
+    const double r_plus = elliptic_radial_r_from_phase(out, out.X0 + out.omega * probe_tau);
+    const double r_minus = elliptic_radial_r_from_phase(out, out.X0 - out.omega * probe_tau);
+    if (!std::isfinite(r_plus) || !std::isfinite(r_minus)) return false;
+
+    const double d_plus = r_plus - r0;
+    const double d_minus = r_minus - r0;
+    if (dr0 >= 0.0) out.x_sign = (d_plus >= d_minus) ? +1 : -1;
+    else            out.x_sign = (d_plus <= d_minus) ? +1 : -1;
+    return true;
+}
+
+static bool first_equator_crossing_mino_time(const SeparableKerrConsts& c,
+                                             double theta0, double dtheta0,
+                                             double& tau_first, double& tau_period) {
+    const double A = c.a*c.a*c.E*c.E;
+    if (!(A > 1e-15)) return false;
+
+    const double B = A - c.Lz*c.Lz - c.Qc;
+    const double disc = B*B + 4.0*A*c.Qc;
+    if (!(disc >= 0.0)) return false;
+    const double sq = std::sqrt(disc);
+    const double u_plus  = (B + sq) / (2.0*A);
+    const double u_minus = (B - sq) / (2.0*A);
+    if (!(u_plus > 0.0 && u_minus < 0.0)) return false;
+
+    const double m = -u_plus / u_minus;
+    if (!(m >= 0.0 && m < 1.0)) return false;
+    const double Kc = ellint_K_complete(m);
+    if (!std::isfinite(Kc) || !(Kc > 0.0)) return false;
+
+    const double S = std::sqrt(-A * u_minus);
+    if (!(S > 0.0) || !std::isfinite(S)) return false;
+
+    const double u0 = clamp(std::cos(theta0) * std::cos(theta0), 0.0, u_plus);
+    const double psi0 = std::asin(std::sqrt(clamp(u0 / u_plus, 0.0, 1.0)));
+    const double F0 = ellint_F_incomplete(psi0, m);
+    if (!std::isfinite(F0)) return false;
+
+    tau_period = 2.0 * Kc / S;
+    if (!(tau_period > 0.0) || !std::isfinite(tau_period)) return false;
+
+    const bool toward_equator = (std::cos(theta0) * dtheta0) > 0.0;
+    const double tau_direct = F0 / S;
+    tau_first = toward_equator ? tau_direct : (tau_period - tau_direct);
+    if (tau_first < 0.0) tau_first += tau_period;
+    return std::isfinite(tau_first);
+}
+
+static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMetric& g,
+                                                double r_disk_in, double r_disk_out,
+                                                double r_escape) {
+    SeparableKerrConsts c{};
+    if (!init_separable_consts(s_bl, g, c))
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
+
+    double dr0=0.0, dth0=0.0, dpr0=0.0, dpth0=0.0;
+    geodesic_rhs(g, s_bl.r, s_bl.theta, s_bl.pr, s_bl.ptheta, s_bl.pt, s_bl.pphi,
+                 dr0, dth0, dpr0, dpth0);
+
+    double tau_first = 0.0, tau_period = 0.0;
+    if (!first_equator_crossing_mino_time(c, s_bl.theta, dth0, tau_first, tau_period))
+        return trace_single_separable_kerr(s_bl, g, r_disk_in, r_disk_out, r_escape);
+
+    EllipticRadialMap mp{};
+    if (!init_elliptic_radial_map(c, s_bl.r, dr0, mp))
+        return trace_single_separable_kerr(s_bl, g, r_disk_in, r_disk_out, r_escape);
+
+    const double rh = g.r_horizon();
+    for (int n = 0; n < 64; ++n) {
+        const double tau = tau_first + n * tau_period;
+        const double X = mp.X0 + double(mp.x_sign) * mp.omega * tau;
+        const double r_now = elliptic_radial_r_from_phase(mp, X);
+        if (!std::isfinite(r_now))
+            return trace_single_separable_kerr(s_bl, g, r_disk_in, r_disk_out, r_escape);
+
+        if (r_now < rh*1.03)
+            return {Outcome::HORIZON, r_now, 0.0};
+        if (r_now > r_escape)
+            return trace_single_separable_kerr(s_bl, g, r_disk_in, r_disk_out, r_escape);
+        if (r_now >= r_disk_in && r_now <= r_disk_out) {
+            return {Outcome::DISK_HIT, r_now,
+                    clamp(disk_redshift(r_now, s_bl.pt, s_bl.pphi, g), 0.0, 20.0)};
+        }
+    }
+
+    return trace_single_separable_kerr(s_bl, g, r_disk_in, r_disk_out, r_escape);
 }
 
 // ── KS single-ray tracing (CPU) ───────────────────────────────
@@ -799,7 +1140,7 @@ static std::vector<GeoPixel> trace_geodesics(
     int W, int H,
     const FrameParams& fp,
     bool use_bundles,
-    bool use_semi_analytic,
+    RaySolverMode solver_mode,
     CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
@@ -822,6 +1163,25 @@ static std::vector<GeoPixel> trace_geodesics(
             warned_bundle_ks = true;
         }
         eff_chart = CoordinateChart::BL;
+    }
+
+    const SolverSelection solver_sel = select_solver_mode(
+        solver_mode, use_bundles, eff_chart, Q_bh, Lam);
+    if (solver_sel.fallback) {
+        static bool warned_solver_fallback = false;
+        if (!warned_solver_fallback) {
+            std::cerr << "Info: requested solver '" << solver_mode_name(solver_mode)
+                      << "' not available here (" << solver_sel.reason
+                      << "); using standard integrator.\n";
+            warned_solver_fallback = true;
+        }
+    }
+    if (solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED) {
+        static bool warned_elliptic_mode = false;
+        if (!warned_elliptic_mode) {
+            std::cerr << "Info: elliptic-closed enabled (per-ray fallback to separable path when constraints are not met).\n";
+            warned_elliptic_mode = true;
+        }
     }
 
     const double r_isco   = g.r_isco();
@@ -857,11 +1217,16 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.phi_esc   = (float)res.phi_esc;
             } else {
                 auto s   = cam.pixel_ray(px_, py, g);
-                auto res = (eff_chart == CoordinateChart::KS)
-                         ? trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg)
-                         : (use_semi_analytic && std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15)
-                         ? trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape)
-                         : trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg);
+                TraceResult res{};
+                if (eff_chart == CoordinateChart::KS) {
+                    res = trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg);
+                } else if (solver_sel.effective == RaySolverMode::SEMI_ANALYTIC) {
+                    res = trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape);
+                } else if (solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED) {
+                    res = trace_single_elliptic_closed(s, g, r_disk_in, r_disk_out, r_escape);
+                } else {
+                    res = trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg);
+                }
                 pix.outcome   = (res.out==Outcome::DISK_HIT) ? 1
                               : (res.out==Outcome::HORIZON)   ? 2 : 0;
                 pix.r         = (float)res.r;
@@ -888,7 +1253,7 @@ static std::vector<RGB> render_image(
     const FrameParams& fp,
     const BackgroundImage& bg,
     bool use_bundles,
-    bool use_semi_analytic,
+    RaySolverMode solver_mode,
     CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
@@ -899,14 +1264,20 @@ static std::vector<RGB> render_image(
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
                               (chart == CoordinateChart::KS && ks_chart_supported);
-    if (!use_bundles && !use_semi_analytic && gpu_chart_ok) {
+    const bool solver_gpu_supported = metal_solver_supported(solver_mode, chart, Q_bh, Lam);
+    const bool can_use_gpu =
+        !use_bundles &&
+        gpu_chart_ok &&
+        solver_gpu_supported;
+
+    if (can_use_gpu) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
         KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
                          (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
         CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,
-                           W,H,(chart==CoordinateChart::KS)?1:0};
+                           W,H,(chart==CoordinateChart::KS)?1:0,metal_solver_mode_code(solver_mode)};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -924,8 +1295,9 @@ static std::vector<RGB> render_image(
     if (!warned_metal_fallback) {
         if (use_bundles)
             std::cerr << "Info: Metal backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
-        else if (use_semi_analytic)
-            std::cerr << "Info: semi-analytic BL path currently runs on CPU; using CPU fallback.\n";
+        else if (!solver_gpu_supported)
+            std::cerr << "Info: solver mode '" << solver_mode_name(solver_mode)
+                      << "' on Metal currently supports BL chart with Q=0 and Lambda=0; using CPU fallback.\n";
         else if (chart == CoordinateChart::KS && !ks_chart_supported)
             std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
         else
@@ -933,7 +1305,7 @@ static std::vector<RGB> render_image(
         warned_metal_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 
@@ -941,7 +1313,7 @@ static std::vector<RGB> render_image(
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
                               (chart == CoordinateChart::KS && ks_chart_supported);
-    if (!use_bundles && !use_semi_analytic && gpu_chart_ok) {
+    if (!use_bundles && solver_mode == RaySolverMode::STANDARD && gpu_chart_ok) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
@@ -962,8 +1334,9 @@ static std::vector<RGB> render_image(
     if (!warned_cuda_fallback) {
         if (use_bundles)
             std::cerr << "Info: CUDA backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
-        else if (use_semi_analytic)
-            std::cerr << "Info: semi-analytic BL path currently runs on CPU; using CPU fallback.\n";
+        else if (solver_mode != RaySolverMode::STANDARD)
+            std::cerr << "Info: solver mode '" << solver_mode_name(solver_mode)
+                      << "' on CUDA currently falls back to CPU.\n";
         else if (chart == CoordinateChart::KS && !ks_chart_supported)
             std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
         else
@@ -971,14 +1344,14 @@ static std::vector<RGB> render_image(
         warned_cuda_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 
 #else
     // CPU: two-phase
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
 #endif
@@ -1008,7 +1381,7 @@ int main(int argc, char** argv) {
     int  custom_w=0, custom_h=0;
     Integrator intg=Integrator::RK4_DOUBLING;
     CoordinateChart chart=CoordinateChart::KS;
-    bool use_semi_analytic=false;
+    RaySolverMode solver_mode=RaySolverMode::STANDARD;
     std::string bg_path;
 
     // ── Single-frame / base params ───────────────────────────
@@ -1043,7 +1416,16 @@ int main(int argc, char** argv) {
         // Resolution
         if (arg=="--bundles")  use_bundles=true;
         if (arg=="--dopri5")   intg=Integrator::DOPRI5;
-        if (arg=="--semi-analytic" || arg=="--elliptic") use_semi_analytic=true;
+        if (arg=="--semi-analytic" || arg=="--elliptic") solver_mode=RaySolverMode::SEMI_ANALYTIC;
+        if (arg=="--elliptic-closed") solver_mode=RaySolverMode::ELLIPTIC_CLOSED;
+        if (arg=="--solver-mode" && i+1<argc) {
+            const std::string s = argv[++i];
+            if (s=="standard") solver_mode=RaySolverMode::STANDARD;
+            else if (s=="semi" || s=="semi-analytic" || s=="semi_analytic")
+                solver_mode=RaySolverMode::SEMI_ANALYTIC;
+            else if (s=="elliptic" || s=="elliptic-closed" || s=="elliptic_closed")
+                solver_mode=RaySolverMode::ELLIPTIC_CLOSED;
+        }
         if (arg=="--bl")       chart=CoordinateChart::BL;
         if (arg=="--ks")       chart=CoordinateChart::KS;
         if (arg=="--chart" && i+1<argc) {
@@ -1185,7 +1567,7 @@ int main(int argc, char** argv) {
                   << "Mode: " << (use_bundles?"ray bundles":"single ray")
                   << "  chart=" << (chart==CoordinateChart::KS?"KS":"BL")
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
-                  << "  " << (use_semi_analytic?"semi-analytic":"standard")
+                  << "  " << solver_mode_name(solver_mode)
                   << "  " << W << "x" << H << "\n"
                   << "ColorParams: exp=" << cp.exposure
                   << " γ=" << cp.gamma
@@ -1196,7 +1578,7 @@ int main(int argc, char** argv) {
         if (geo_only) {
             // Phase 1 only: trace and save .kgeo
             KGeoMeta meta;
-            auto geo = trace_geodesics(W, H, fp, use_bundles, use_semi_analytic, chart, intg,
+            auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg,
                                        M_bh, Q_bh, Lam, &meta);
             double elapsed=get_time()-t0;
             std::cout << "Trace: " << elapsed << "s  ("
@@ -1213,7 +1595,7 @@ int main(int argc, char** argv) {
         } else {
             // Full render (Phase 1 + Phase 2, optionally save .kgeo)
             std::vector<GeoPixel> geo;
-            auto image = render_image(W, H, fp, bg, use_bundles, use_semi_analytic, chart, intg,
+            auto image = render_image(W, H, fp, bg, use_bundles, solver_mode, chart, intg,
                                       M_bh, Q_bh, Lam, cp,
                                       geo_file.empty() ? nullptr : &geo);
             double elapsed=get_time()-t0;
@@ -1314,7 +1696,7 @@ int main(int argc, char** argv) {
                  <<"°  r="<<std::setprecision(2)<<fp.r_obs
                  <<"  a="<<std::setprecision(4)<<fp.a<<" ...\n"<<std::flush;
 
-        auto image=render_image(W,H,fp,bg,use_bundles,use_semi_analytic,chart,intg,M_bh,Q_bh,Lam,cp);
+        auto image=render_image(W,H,fp,bg,use_bundles,solver_mode,chart,intg,M_bh,Q_bh,Lam,cp);
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;

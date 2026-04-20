@@ -41,6 +41,7 @@ export class App implements OnInit, OnDestroy {
     fov: 30,
     backend: 'cpu',
     integration_chart: 'ks',
+    solver_mode: 'standard',
     semi_analytic: false,
     bundles: false,
     dopri5: false,
@@ -132,6 +133,8 @@ export class App implements OnInit, OnDestroy {
   }
 
   startRender() {
+    // Keep legacy payload field in sync for backward compatibility.
+    this.params.semi_analytic = this.params.solver_mode === 'semi_analytic';
     this.svc.startRender(this.params).subscribe({
       next: () => { this.status.set('running'); this.progress.set(0); },
       error: err => {

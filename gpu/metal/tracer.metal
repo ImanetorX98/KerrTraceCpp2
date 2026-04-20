@@ -30,6 +30,7 @@ struct CameraParams {
     int   width;
     int   height;
     int   chart;       // 0 = BL, 1 = KS
+    int   solver_mode; // 0 = standard, 1 = semi-analytic, 2 = elliptic-closed (placeholder)
 };
 
 struct RenderParams {
@@ -382,6 +383,128 @@ static void rk4_KS(thread float& X, thread float& Y, thread float& Z,
     pZ += dlam/6.0f*(dpZ1 +2.0f*dpZ2 +2.0f*dpZ3 +dpZ4);
 }
 
+// ── Separable Kerr semi-analytic path (BL, Q=0, Lambda=0) ───
+struct SeparableConsts {
+    float M, a;
+    float E;   // E = -p_t
+    float Lz;  // p_phi
+    float Qc;  // Carter constant
+};
+
+struct SeparableState {
+    float r, theta, phi;
+    int sgn_r, sgn_th;
+};
+
+static float kerr_sep_delta(thread const SeparableConsts& c, float r) {
+    return r*r - 2.0f*c.M*r + c.a*c.a;
+}
+
+static float kerr_sep_R(thread const SeparableConsts& c, float r) {
+    const float r2 = r*r;
+    const float P = c.E*(r2 + c.a*c.a) - c.a*c.Lz;
+    const float K = c.Qc + (c.Lz - c.a*c.E)*(c.Lz - c.a*c.E);
+    return P*P - kerr_sep_delta(c, r) * K;
+}
+
+static float kerr_sep_Theta(thread const SeparableConsts& c, float theta) {
+    const float st = sin(theta);
+    const float ct = cos(theta);
+    const float st2 = max(st*st, 1e-14f);
+    return c.Qc - ct*ct * (c.Lz*c.Lz/st2 - c.a*c.a*c.E*c.E);
+}
+
+static bool kerr_sep_rhs(thread const SeparableConsts& c, thread SeparableState& s,
+                         thread float& dr, thread float& dth, thread float& dphi) {
+    const float st = sin(s.theta);
+    const float ct = cos(s.theta);
+    const float st2 = max(st*st, 1e-14f);
+    const float sigma = max(s.r*s.r + c.a*c.a*ct*ct, 1e-14f);
+    const float delta = kerr_sep_delta(c, s.r);
+    const float P = c.E*(s.r*s.r + c.a*c.a) - c.a*c.Lz;
+    const float R = kerr_sep_R(c, s.r);
+    const float Th = kerr_sep_Theta(c, s.theta);
+
+    dr = ((s.sgn_r >= 0) ? 1.0f : -1.0f) * sqrt(max(R, 0.0f)) / sigma;
+    dth = ((s.sgn_th >= 0) ? 1.0f : -1.0f) * sqrt(max(Th, 0.0f)) / sigma;
+    dphi = (c.Lz/st2 + c.a*(P/max(delta, 1e-14f) - c.E)) / sigma;
+    return isfinite(dr) && isfinite(dth) && isfinite(dphi);
+}
+
+static bool rk4_step_separable_kerr(thread const SeparableConsts& c, thread SeparableState& s, float h) {
+    float dr1,dth1,dphi1;
+    float dr2,dth2,dphi2;
+    float dr3,dth3,dphi3;
+    float dr4,dth4,dphi4;
+
+    SeparableState s0 = s;
+    if (!kerr_sep_rhs(c, s0, dr1, dth1, dphi1)) return false;
+
+    SeparableState s2 = s0;
+    s2.r     = s0.r     + 0.5f*h*dr1;
+    s2.theta = s0.theta + 0.5f*h*dth1;
+    s2.phi   = s0.phi   + 0.5f*h*dphi1;
+    if (!kerr_sep_rhs(c, s2, dr2, dth2, dphi2)) return false;
+
+    SeparableState s3 = s0;
+    s3.r     = s0.r     + 0.5f*h*dr2;
+    s3.theta = s0.theta + 0.5f*h*dth2;
+    s3.phi   = s0.phi   + 0.5f*h*dphi2;
+    if (!kerr_sep_rhs(c, s3, dr3, dth3, dphi3)) return false;
+
+    SeparableState s4 = s0;
+    s4.r     = s0.r     + h*dr3;
+    s4.theta = s0.theta + h*dth3;
+    s4.phi   = s0.phi   + h*dphi3;
+    if (!kerr_sep_rhs(c, s4, dr4, dth4, dphi4)) return false;
+
+    s.r     += h/6.0f*(dr1   + 2.0f*dr2   + 2.0f*dr3   + dr4);
+    s.theta += h/6.0f*(dth1  + 2.0f*dth2  + 2.0f*dth3  + dth4);
+    s.phi   += h/6.0f*(dphi1 + 2.0f*dphi2 + 2.0f*dphi3 + dphi4);
+    return isfinite(s.r) && isfinite(s.theta) && isfinite(s.phi);
+}
+
+static bool rk4_adaptive_separable_kerr(thread const SeparableConsts& c,
+                                        thread SeparableState& s,
+                                        thread float& h,
+                                        float tol = 1e-6f) {
+    const SeparableState s0 = s;
+
+    SeparableState sA = s0;
+    if (!rk4_step_separable_kerr(c, sA, h)) {
+        h = max(h*0.5f, 1e-10f);
+        return false;
+    }
+
+    SeparableState sB = s0;
+    if (!rk4_step_separable_kerr(c, sB, 0.5f*h) ||
+        !rk4_step_separable_kerr(c, sB, 0.5f*h)) {
+        h = max(h*0.5f, 1e-10f);
+        return false;
+    }
+
+    const float err = sqrt(
+        (sA.r - sB.r)*(sA.r - sB.r) +
+        (sA.theta - sB.theta)*(sA.theta - sB.theta) +
+        (sA.phi - sB.phi)*(sA.phi - sB.phi)
+    ) / 15.0f;
+
+    if (!isfinite(err)) {
+        h = max(h*0.5f, 1e-10f);
+        return false;
+    }
+
+    if (err < tol || h < 1e-10f) {
+        s = sB;
+        const float sc = (err > 1e-14f) ? 0.9f * pow(tol/err, 0.2f) : 4.0f;
+        h = clamp(h*sc, 1e-10f, 100.0f);
+        return true;
+    }
+
+    h = max(h * 0.9f * pow(tol/err, 0.25f), 1e-10f);
+    return false;
+}
+
 // ── Emissivity / tonemap helpers ──────────────────────────────
 // Page-Thorne emissivity f(r) = (1 − √(r_isco/r)) / r³, normalised to 1
 // at its peak r = 3·r_isco  (matches CPU disk_colour exactly)
@@ -501,6 +624,138 @@ kernel void trace_pixel(
     float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
+
+    // ── Separable Kerr semi-analytic path (BL only) ──────────
+    const bool want_semi_analytic =
+        (cp.solver_mode == 1 || cp.solver_mode == 2) &&
+        (cp.chart == 0) &&
+        (abs(Q) <= 1e-8f) &&
+        (abs(L) <= 1e-8f);
+    if (want_semi_analytic) {
+        SeparableConsts sc{};
+        sc.M = M;
+        sc.a = a;
+        sc.E = -pt;
+        sc.Lz = pphi;
+        const float st = sin(theta);
+        const float ct = cos(theta);
+        const float st2 = max(st*st, 1e-14f);
+        sc.Qc = pth*pth + ct*ct * (sc.Lz*sc.Lz/st2 - sc.a*sc.a*sc.E*sc.E);
+
+        bool semi_ok = isfinite(sc.E) && isfinite(sc.Lz) && isfinite(sc.Qc) && (sc.E > 0.0f);
+        if (semi_ok) {
+            float dr0=0.0f, dth0=0.0f, dphi0=0.0f, dpr0=0.0f, dpth0=0.0f;
+            geodesic_rhs(r, theta, pr, pth, pt, pphi, M, a, Q, L, dr0, dth0, dphi0, dpr0, dpth0);
+
+            SeparableState s{
+                r, theta, phi,
+                (dr0 >= 0.0f) ? 1 : -1,
+                (dth0 >= 0.0f) ? 1 : -1
+            };
+
+            float h = 1.0f;
+            float prev_r_sep = s.r;
+            float prev_theta_sep = s.theta;
+            float prev_phi_sep = s.phi;
+            float prev_cos_sep = cos(s.theta);
+            float prev_Rpot = kerr_sep_R(sc, s.r);
+            float prev_Thpot = kerr_sep_Theta(sc, s.theta);
+            constexpr float R_turn_eps = 1e-7f;
+            constexpr float Th_turn_eps = 1e-9f;
+            bool done = false;
+
+            for (int iter = 0; iter < 60000; ++iter) {
+                int rejects = 0;
+                while (!rk4_adaptive_separable_kerr(sc, s, h)) {
+                    if (!isfinite(h) || ++rejects > 64) {
+                        semi_ok = false;
+                        break;
+                    }
+                }
+                if (!semi_ok) break;
+
+                // Keep theta in [0, pi] and flip polar branch at reflections.
+                if (s.theta < 0.0f) {
+                    s.theta = -s.theta;
+                    s.sgn_th *= -1;
+                } else if (s.theta > 3.14159265358979323846f) {
+                    s.theta = 6.28318530717958647692f - s.theta;
+                    s.sgn_th *= -1;
+                }
+
+                const float Rnow = kerr_sep_R(sc, s.r);
+                const float Thnow = kerr_sep_Theta(sc, s.theta);
+                if (Rnow <= R_turn_eps && prev_Rpot > R_turn_eps) s.sgn_r *= -1;
+                if (Thnow <= Th_turn_eps && prev_Thpot > Th_turn_eps) s.sgn_th *= -1;
+
+                if (s.r < kp.r_horizon * 1.03f) {
+                    done = true; // black
+                    break;
+                }
+
+                if (s.r > cp.r_obs * 1.05f) {
+                    const float r_escape = cp.r_obs * 1.05f;
+                    const float denom = s.r - prev_r_sep;
+                    float w = (abs(denom) > 1e-8f) ? ((r_escape - prev_r_sep) / denom) : 1.0f;
+                    w = clamp(w, 0.0f, 1.0f);
+                    const float th_esc = prev_theta_sep + w*(s.theta - prev_theta_sep);
+                    const float ph_esc = prev_phi_sep + w*(s.phi - prev_phi_sep);
+                    float4 bgc = clamp(sample_background(bg_tex, bg_samp, th_esc, ph_esc), 0.0f, 1.0f);
+                    colour = (0xFFu << 24)
+                           | (uint32_t(bgc.b*255.0f) << 16)
+                           | (uint32_t(bgc.g*255.0f) << 8)
+                           |  uint32_t(bgc.r*255.0f);
+                    done = true;
+                    break;
+                }
+
+                const float cos_th = cos(s.theta);
+                if (prev_cos_sep * cos_th <= 0.0f) {
+                    const float denom = prev_cos_sep - cos_th;
+                    float w = (abs(denom) > 1e-8f) ? (prev_cos_sep / denom) : 0.5f;
+                    w = clamp(w, 0.0f, 1.0f);
+                    const float r_hit = prev_r_sep + w*(s.r - prev_r_sep);
+                    if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
+                        const float Omega = keplerian_omega(r_hit, M, a, Q, L);
+                        const float b_ip  = pphi / (-pt);
+                        float gll2[4][4];
+                        gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
+                        const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
+                        const float dv = 1.0f - Omega*b_ip;
+                        float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
+                        red = clamp(red, 0.0f, 20.0f);
+
+                        const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
+                        float I = page_thorne_norm(r_hit, kp.r_isco);
+                        I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+                        float4 bb = blackbody_rgb(T);
+                        float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
+                                          tonemap_ch(bb.g * I, 1.0f, 2.2f),
+                                          tonemap_ch(bb.b * I, 1.0f, 2.2f),
+                                          1.0f);
+                        colour = (0xFFu << 24)
+                               | (uint32_t(c.b*255.0f) << 16)
+                               | (uint32_t(c.g*255.0f) << 8)
+                               |  uint32_t(c.r*255.0f);
+                        done = true;
+                        break;
+                    }
+                }
+
+                prev_cos_sep = cos_th;
+                prev_r_sep = s.r;
+                prev_theta_sep = s.theta;
+                prev_phi_sep = s.phi;
+                prev_Rpot = Rnow;
+                prev_Thpot = Thnow;
+            }
+
+            if (semi_ok && done) {
+                output[py * width + px] = colour;
+                return;
+            }
+        }
+    }
 
     // ── KS chart path (Lambda=0 only) ─────────────────────────
     const bool want_ks = (cp.chart == 1 && abs(L) <= 1e-8f);

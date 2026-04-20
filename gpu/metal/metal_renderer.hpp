@@ -21,6 +21,7 @@ struct CameraParams_C {
     float r_obs, theta_obs, phi_obs, fov_h;
     int   width, height;
     int   chart; // 0 = BL, 1 = KS
+    int   solver_mode; // 0 = standard, 1 = semi-analytic, 2 = elliptic-closed (placeholder)
 };
 
 /// Renders the image on the default Metal GPU device.

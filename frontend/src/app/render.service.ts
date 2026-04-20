@@ -17,6 +17,7 @@ export interface RenderParams {
   // Options
   backend: string;
   integration_chart: 'ks' | 'bl';
+  solver_mode: 'standard' | 'semi_analytic' | 'elliptic_closed';
   semi_analytic: boolean;
   bundles: boolean;
   dopri5: boolean;

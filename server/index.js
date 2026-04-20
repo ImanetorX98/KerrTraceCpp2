@@ -185,7 +185,16 @@ app.post('/api/render', (req, res) => {
 
   if (p.bundles)  args.push('--bundles');
   if (p.dopri5)   args.push('--dopri5');
-  if (p.semi_analytic) args.push('--semi-analytic');
+  let solverMode = 'standard';
+  if (typeof p.solver_mode === 'string') {
+    const m = p.solver_mode.toLowerCase();
+    if (m === 'semi' || m === 'semi-analytic' || m === 'semi_analytic') solverMode = 'semi-analytic';
+    else if (m === 'elliptic' || m === 'elliptic-closed' || m === 'elliptic_closed') solverMode = 'elliptic-closed';
+  } else if (p.semi_analytic) {
+    // Backward compatibility with older frontend payloads.
+    solverMode = 'semi-analytic';
+  }
+  args.push('--solver-mode', solverMode);
   if (p.integration_chart === 'bl') args.push('--bl');
   else args.push('--ks');
 

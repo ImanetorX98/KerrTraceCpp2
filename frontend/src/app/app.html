@@ -158,9 +158,25 @@
           <label>DOPRI5 integrator</label>
           <button class="switch" [class.on]="params.dopri5"></button>
         </div>
-        <div class="switch-row" (click)="params.semi_analytic = !params.semi_analytic">
-          <label>Semi-analytic (experimental)</label>
-          <button class="switch" [class.on]="params.semi_analytic"></button>
+        <div style="margin:12px 0 6px">
+          <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:8px">Solver mode</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="backend-btn"
+                    [class.active]="params.solver_mode === 'standard'"
+                    (click)="params.solver_mode = 'standard'">
+              Standard RK
+            </button>
+            <button class="backend-btn"
+                    [class.active]="params.solver_mode === 'semi_analytic'"
+                    (click)="params.solver_mode = 'semi_analytic'">
+              Semi-analytic
+            </button>
+            <button class="backend-btn"
+                    [class.active]="params.solver_mode === 'elliptic_closed'"
+                    (click)="params.solver_mode = 'elliptic_closed'">
+              Elliptic-closed
+            </button>
+          </div>
         </div>
         <div class="switch-row" (click)="params.anim = !params.anim">
           <label>Animation mode</label>

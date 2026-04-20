@@ -102,15 +102,20 @@ Useful flags:
 - `--ks` / `--bl` (or `--chart ks|bl`)
 - `--bundles`
 - `--dopri5`
-- `--semi-analytic` / `--elliptic` (experimental scaffold; default OFF)
+- `--solver-mode standard|semi-analytic|elliptic-closed`
+- `--semi-analytic` / `--elliptic` (legacy alias for `--solver-mode semi-analytic`)
+- `--elliptic-closed` (alias for `--solver-mode elliptic-closed`)
 - `--bg <path>`
 - `--4k`, `--2k`, `--720p`, `--custom-res W H`
 
 Experimental note:
 
-- The separable semi-analytic path is intended as a foundation for
-  future elliptic-function acceleration in Kerr (`Q=0`, `Lambda=0`)
-  BL runs. It is selectable via CLI/UI and is not the default path.
+- `semi-analytic` and `elliptic-closed` modes currently target Kerr BL
+  (`Q=0`, `Lambda=0`) and are optional, never default.
+- `elliptic-closed` uses a closed-form elliptic CPU path (Carlson/Jacobi)
+  with per-ray fallback to separable stepping when constraints are not met.
+- Metal/CUDA currently execute `elliptic-closed` through the semi-analytic
+  GPU path while full closed-form GPU inversion is under integration.
 
 Rendered frames are written under `out/`.
 
