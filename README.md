@@ -114,8 +114,9 @@ Experimental note:
   (`Q=0`, `Lambda=0`) and are optional, never default.
 - `elliptic-closed` uses a closed-form elliptic CPU path (Carlson/Jacobi)
   with per-ray fallback to separable stepping when constraints are not met.
-- Metal/CUDA currently execute `elliptic-closed` through the semi-analytic
-  GPU path while full closed-form GPU inversion is under integration.
+- Metal executes `elliptic-closed` with a dedicated elliptic GPU path and
+  per-ray fallback to semi-analytic when needed for robustness.
+- CUDA currently routes `elliptic-closed` to CPU fallback.
 
 Rendered frames are written under `out/`.
 

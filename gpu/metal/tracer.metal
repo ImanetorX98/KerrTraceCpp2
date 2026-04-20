@@ -505,6 +505,281 @@ static bool rk4_adaptive_separable_kerr(thread const SeparableConsts& c,
     return false;
 }
 
+// ── Elliptic-closed helpers (GPU) ────────────────────────────
+struct Cx { float re, im; };
+static Cx cx_make(float re, float im) { Cx z{re, im}; return z; }
+static Cx cx_add(Cx a, Cx b) { return cx_make(a.re + b.re, a.im + b.im); }
+static Cx cx_sub(Cx a, Cx b) { return cx_make(a.re - b.re, a.im - b.im); }
+static Cx cx_mul(Cx a, Cx b) {
+    return cx_make(a.re*b.re - a.im*b.im, a.re*b.im + a.im*b.re);
+}
+static Cx cx_add_scalar(Cx a, float s) { return cx_make(a.re + s, a.im); }
+static float cx_abs(Cx a) { return sqrt(a.re*a.re + a.im*a.im); }
+static Cx cx_div(Cx a, Cx b) {
+    const float den = b.re*b.re + b.im*b.im;
+    if (den < 1e-20f) return cx_make(NAN, NAN);
+    return cx_make((a.re*b.re + a.im*b.im)/den, (a.im*b.re - a.re*b.im)/den);
+}
+
+static float carlson_rf(float x, float y, float z) {
+    if (!(x >= 0.0f && y >= 0.0f && z >= 0.0f)) return NAN;
+    if (!(isfinite(x) && isfinite(y) && isfinite(z))) return NAN;
+
+    float xn = x, yn = y, zn = z;
+    constexpr float ERR_TOL = 1e-6f;
+    for (int it = 0; it < 48; ++it) {
+        const float mu = (xn + yn + zn) / 3.0f;
+        if (!(mu > 0.0f) || !isfinite(mu)) return NAN;
+
+        const float X = 1.0f - xn / mu;
+        const float Y = 1.0f - yn / mu;
+        const float Z = 1.0f - zn / mu;
+        const float eps = max(max(abs(X), abs(Y)), abs(Z));
+        if (eps < ERR_TOL) {
+            const float E2 = X*Y - Z*Z;
+            const float E3 = X*Y*Z;
+            const float corr =
+                1.0f
+                - E2 / 10.0f
+                + E3 / 14.0f
+                + (E2*E2) / 24.0f
+                - (3.0f * E2 * E3) / 44.0f;
+            return corr / sqrt(mu);
+        }
+
+        const float sx = sqrt(xn);
+        const float sy = sqrt(yn);
+        const float sz = sqrt(zn);
+        const float lam = sx*sy + sx*sz + sy*sz;
+        xn = 0.25f * (xn + lam);
+        yn = 0.25f * (yn + lam);
+        zn = 0.25f * (zn + lam);
+    }
+    return NAN;
+}
+
+static float ellint_F_incomplete(float phi, float m) {
+    const float s = sin(phi);
+    const float c = cos(phi);
+    const float x = c*c;
+    const float y = 1.0f - m*s*s;
+    if (y <= 0.0f) return NAN;
+    const float rf = carlson_rf(x, y, 1.0f);
+    return s * rf;
+}
+
+static float ellint_K_complete(float m) {
+    if (!(m >= 0.0f && m < 1.0f)) return NAN;
+    return carlson_rf(0.0f, 1.0f - m, 1.0f);
+}
+
+static float jacobi_sn2_from_u(float u, float m, float Kc) {
+    if (!(m >= 0.0f && m < 1.0f) || !(Kc > 0.0f) || !isfinite(u)) return NAN;
+    float ur = fmod(u, 2.0f*Kc);
+    if (ur < 0.0f) ur += 2.0f*Kc;
+    if (ur > Kc) ur = 2.0f*Kc - ur;
+
+    float lo = 0.0f, hi = 0.5f * M_PI_F;
+    for (int it = 0; it < 40; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        const float Fm = ellint_F_incomplete(mid, m);
+        if (!isfinite(Fm)) return NAN;
+        if (Fm < ur) lo = mid; else hi = mid;
+    }
+    const float s = sin(0.5f * (lo + hi));
+    return s*s;
+}
+
+static Cx eval_monic_quartic(float b0, float b1, float b2, float b3, Cx z) {
+    Cx v = cx_add_scalar(z, b0);
+    v = cx_add(cx_mul(v, z), cx_make(b1, 0.0f));
+    v = cx_add(cx_mul(v, z), cx_make(b2, 0.0f));
+    v = cx_add(cx_mul(v, z), cx_make(b3, 0.0f));
+    return v;
+}
+
+static bool quartic_real_roots_monic(float b0, float b1, float b2, float b3,
+                                     thread float roots_out[4]) {
+    const float radius = 1.0f + max(max(abs(b0), abs(b1)), max(abs(b2), abs(b3)));
+    Cx z[4] = {
+        cx_make( radius, 0.0f),
+        cx_make(0.0f,  radius),
+        cx_make(-radius, 0.0f),
+        cx_make(0.0f, -radius)
+    };
+
+    for (int it = 0; it < 96; ++it) {
+        float max_delta = 0.0f;
+        Cx zn[4];
+        for (int i = 0; i < 4; ++i) {
+            Cx den = cx_make(1.0f, 0.0f);
+            for (int j = 0; j < 4; ++j) {
+                if (i == j) continue;
+                den = cx_mul(den, cx_sub(z[i], z[j]));
+            }
+            if (cx_abs(den) < 1e-16f) den = cx_make(1e-16f, 0.0f);
+            const Cx pz = eval_monic_quartic(b0, b1, b2, b3, z[i]);
+            const Cx delta = cx_div(pz, den);
+            zn[i] = cx_sub(z[i], delta);
+            max_delta = max(max_delta, cx_abs(delta));
+        }
+        for (int i = 0; i < 4; ++i) z[i] = zn[i];
+        if (max_delta < 1e-6f) break;
+    }
+
+    int nreal = 0;
+    for (int i = 0; i < 4; ++i) {
+        const float tol = 1e-3f * max(1.0f, abs(z[i].re));
+        if (abs(z[i].im) <= tol && isfinite(z[i].re))
+            roots_out[nreal++] = z[i].re;
+    }
+    if (nreal != 4) return false;
+
+    for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+            if (roots_out[j] > roots_out[i]) {
+                const float t = roots_out[i];
+                roots_out[i] = roots_out[j];
+                roots_out[j] = t;
+            }
+        }
+    }
+    return true;
+}
+
+struct EllipticRadialMap {
+    float r1, r2, r3, r4;
+    float r31, r41;
+    float m;
+    float Kc;
+    float omega;
+    float X0;
+    int x_sign;
+};
+
+static float elliptic_radial_r_from_phase(thread const EllipticRadialMap& mp, float X) {
+    const float sn2 = jacobi_sn2_from_u(X, mp.m, mp.Kc);
+    if (!isfinite(sn2)) return NAN;
+    const float den = mp.r31 - mp.r41 * sn2;
+    if (abs(den) < 1e-8f) return NAN;
+    return (mp.r4 * mp.r31 - mp.r3 * mp.r41 * sn2) / den;
+}
+
+static bool init_elliptic_radial_map(thread const SeparableConsts& c,
+                                     float r0, float dr0,
+                                     thread EllipticRadialMap& out) {
+    const float Kpot = c.Qc + (c.Lz - c.a*c.E)*(c.Lz - c.a*c.E);
+    const float A0 = c.E*c.a*c.a - c.a*c.Lz;
+    const float c4 = c.E*c.E;
+    if (!(c4 > 1e-10f)) return false;
+    const float c2 = 2.0f*c.E*A0 - Kpot;
+    const float c1 = 2.0f*c.M*Kpot;
+    const float c0 = A0*A0 - c.a*c.a*Kpot;
+
+    float rr[4];
+    if (!quartic_real_roots_monic(0.0f, c2/c4, c1/c4, c0/c4, rr)) return false;
+
+    out.r1 = rr[0]; out.r2 = rr[1]; out.r3 = rr[2]; out.r4 = rr[3];
+    out.r31 = out.r3 - out.r1;
+    out.r41 = out.r4 - out.r1;
+    if (abs(out.r31) < 1e-8f || abs(out.r41) < 1e-8f) return false;
+
+    const float den = (out.r1 - out.r3) * (out.r2 - out.r4);
+    if (!(den > 0.0f)) return false;
+    out.m = ((out.r1 - out.r2) * (out.r3 - out.r4)) / den;
+    if (!(out.m >= 0.0f && out.m < 1.0f)) return false;
+    out.Kc = ellint_K_complete(out.m);
+    if (!isfinite(out.Kc) || !(out.Kc > 0.0f)) return false;
+
+    const float u0_num = out.r31 * (r0 - out.r4);
+    const float u0_den = out.r41 * (r0 - out.r3);
+    if (abs(u0_den) < 1e-8f) return false;
+    float u0 = u0_num / u0_den;
+    u0 = clamp(u0, 0.0f, 1.0f);
+    out.X0 = ellint_F_incomplete(asin(sqrt(u0)), out.m);
+    if (!isfinite(out.X0)) return false;
+
+    out.omega = 0.5f * sqrt(den);
+    if (!(out.omega > 0.0f) || !isfinite(out.omega)) return false;
+
+    const float probe_tau = 1e-4f;
+    const float r_plus = elliptic_radial_r_from_phase(out, out.X0 + out.omega * probe_tau);
+    const float r_minus = elliptic_radial_r_from_phase(out, out.X0 - out.omega * probe_tau);
+    if (!(isfinite(r_plus) && isfinite(r_minus))) return false;
+
+    const float d_plus = r_plus - r0;
+    const float d_minus = r_minus - r0;
+    if (dr0 >= 0.0f) out.x_sign = (d_plus >= d_minus) ? +1 : -1;
+    else             out.x_sign = (d_plus <= d_minus) ? +1 : -1;
+    return true;
+}
+
+static bool first_equator_crossing_mino_time(thread const SeparableConsts& c,
+                                             float theta0, float dtheta0,
+                                             thread float& tau_first,
+                                             thread float& tau_period) {
+    const float A = c.a*c.a*c.E*c.E;
+    if (!(A > 1e-8f)) return false;
+
+    const float B = A - c.Lz*c.Lz - c.Qc;
+    const float disc = B*B + 4.0f*A*c.Qc;
+    if (!(disc >= 0.0f)) return false;
+    const float sq = sqrt(disc);
+    const float u_plus  = (B + sq) / (2.0f*A);
+    const float u_minus = (B - sq) / (2.0f*A);
+    if (!(u_plus > 0.0f && u_minus < 0.0f)) return false;
+
+    const float m = -u_plus / u_minus;
+    if (!(m >= 0.0f && m < 1.0f)) return false;
+    const float Kc = ellint_K_complete(m);
+    if (!isfinite(Kc) || !(Kc > 0.0f)) return false;
+
+    const float S = sqrt(-A * u_minus);
+    if (!(S > 0.0f) || !isfinite(S)) return false;
+
+    const float u0 = clamp(cos(theta0) * cos(theta0), 0.0f, u_plus);
+    const float psi0 = asin(sqrt(clamp(u0 / u_plus, 0.0f, 1.0f)));
+    const float F0 = ellint_F_incomplete(psi0, m);
+    if (!isfinite(F0)) return false;
+
+    tau_period = 2.0f * Kc / S;
+    if (!(tau_period > 0.0f) || !isfinite(tau_period)) return false;
+
+    const bool toward_equator = (cos(theta0) * dtheta0) > 0.0f;
+    const float tau_direct = F0 / S;
+    tau_first = toward_equator ? tau_direct : (tau_period - tau_direct);
+    if (tau_first < 0.0f) tau_first += tau_period;
+    return isfinite(tau_first);
+}
+
+// Returns: 0=inconclusive, 1=horizon, 2=disk
+static int elliptic_closed_first_hit(thread const SeparableConsts& c,
+                                     float r0, float theta0, float dr0, float dtheta0,
+                                     float r_horizon, float r_isco, float r_disk_out, float r_escape,
+                                     thread float& r_hit_out) {
+    float tau_first = 0.0f, tau_period = 0.0f;
+    if (!first_equator_crossing_mino_time(c, theta0, dtheta0, tau_first, tau_period))
+        return 0;
+
+    EllipticRadialMap mp{};
+    if (!init_elliptic_radial_map(c, r0, dr0, mp))
+        return 0;
+
+    for (int n = 0; n < 64; ++n) {
+        const float tau = tau_first + float(n) * tau_period;
+        const float X = mp.X0 + float(mp.x_sign) * mp.omega * tau;
+        const float r_now = elliptic_radial_r_from_phase(mp, X);
+        if (!isfinite(r_now)) return 0;
+        if (r_now < r_horizon * 1.03f) return 1;
+        if (r_now > r_escape) return 0;
+        if (r_now >= r_isco && r_now <= r_disk_out) {
+            r_hit_out = r_now;
+            return 2;
+        }
+    }
+    return 0;
+}
+
 // ── Emissivity / tonemap helpers ──────────────────────────────
 // Page-Thorne emissivity f(r) = (1 − √(r_isco/r)) / r³, normalised to 1
 // at its peak r = 3·r_isco  (matches CPU disk_colour exactly)
@@ -624,13 +899,67 @@ kernel void trace_pixel(
     float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
+    const bool can_bl_separable = (cp.chart == 0) && (abs(Q) <= 1e-8f) && (abs(L) <= 1e-8f);
+    bool semi_fallback_from_elliptic = false;
+
+    // ── Elliptic-closed path (BL only, per-ray fallback) ─────
+    if (cp.solver_mode == 2 && can_bl_separable) {
+        SeparableConsts sc{};
+        sc.M = M;
+        sc.a = a;
+        sc.E = -pt;
+        sc.Lz = pphi;
+        const float st = sin(theta);
+        const float ct = cos(theta);
+        const float st2 = max(st*st, 1e-14f);
+        sc.Qc = pth*pth + ct*ct * (sc.Lz*sc.Lz/st2 - sc.a*sc.a*sc.E*sc.E);
+
+        float dr0=0.0f, dth0=0.0f, dphi0=0.0f, dpr0=0.0f, dpth0=0.0f;
+        geodesic_rhs(r, theta, pr, pth, pt, pphi, M, a, Q, L, dr0, dth0, dphi0, dpr0, dpth0);
+
+        float r_hit_ell = 0.0f;
+        const int eout = elliptic_closed_first_hit(sc, r, theta, dr0, dth0,
+                                                   kp.r_horizon, kp.r_isco, kp.r_disk_out,
+                                                   cp.r_obs * 1.05f, r_hit_ell);
+        if (eout == 1) {
+            // horizon: keep black
+            output[py * width + px] = colour;
+            return;
+        }
+        if (eout == 2) {
+            const float Omega = keplerian_omega(r_hit_ell, M, a, Q, L);
+            const float b_ip  = pphi / (-pt);
+            float gll2[4][4];
+            gLL_BL(r_hit_ell, M_PI_2_F, M, a, Q, L, gll2);
+            const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
+            const float dv = 1.0f - Omega*b_ip;
+            float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
+            red = clamp(red, 0.0f, 20.0f);
+
+            const float T = 6500.0f * sqrt(6.0f*M/r_hit_ell) * clamp(red, 0.2f, 5.0f);
+            float I = page_thorne_norm(r_hit_ell, kp.r_isco);
+            I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+            float4 bb = blackbody_rgb(T);
+            float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
+                              tonemap_ch(bb.g * I, 1.0f, 2.2f),
+                              tonemap_ch(bb.b * I, 1.0f, 2.2f),
+                              1.0f);
+            colour = (0xFFu << 24)
+                   | (uint32_t(c.b*255.0f) << 16)
+                   | (uint32_t(c.g*255.0f) << 8)
+                   |  uint32_t(c.r*255.0f);
+            output[py * width + px] = colour;
+            return;
+        }
+
+        // Inconclusive for this ray: continue with semi-analytic fallback.
+        semi_fallback_from_elliptic = true;
+    }
 
     // ── Separable Kerr semi-analytic path (BL only) ──────────
     const bool want_semi_analytic =
-        (cp.solver_mode == 1 || cp.solver_mode == 2) &&
-        (cp.chart == 0) &&
-        (abs(Q) <= 1e-8f) &&
-        (abs(L) <= 1e-8f);
+        (cp.solver_mode == 1 || semi_fallback_from_elliptic) &&
+        can_bl_separable;
     if (want_semi_analytic) {
         SeparableConsts sc{};
         sc.M = M;
