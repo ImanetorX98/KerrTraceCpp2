@@ -1832,6 +1832,39 @@ int main(int argc, char** argv) {
         return ts;
     };
 
+    auto effective_chart_for_naming = [&](CoordinateChart requested)->CoordinateChart {
+        CoordinateChart eff = requested;
+        if (eff == CoordinateChart::KS && std::abs(Lam) > 1e-15)
+            eff = CoordinateChart::BL;
+        if (use_bundles && eff == CoordinateChart::KS)
+            eff = CoordinateChart::BL;
+        return eff;
+    };
+    auto chart_tag = [](CoordinateChart c)->const char* {
+        return (c == CoordinateChart::KS) ? "ks" : "bl";
+    };
+    auto integration_mode_tag = [&]()->std::string {
+        const CoordinateChart eff_chart = effective_chart_for_naming(chart);
+        const SolverSelection sel = select_solver_mode(
+            solver_mode, use_bundles, eff_chart, Q_bh, Lam);
+
+        if (use_bundles)
+            return std::string(chart_tag(eff_chart)) + "-ray-bundle";
+
+        if (sel.effective == RaySolverMode::SEMI_ANALYTIC)
+            return std::string(chart_tag(eff_chart)) + "-semi-analytic";
+        if (sel.effective == RaySolverMode::ELLIPTIC_CLOSED)
+            return std::string(chart_tag(eff_chart)) + "-elliptic-closed";
+
+        // Standard solver: in KS the current implementation always uses RK4.
+        const bool ks_uses_rk4 = (eff_chart == CoordinateChart::KS);
+        const char* intg_tag = (ks_uses_rk4 || intg == Integrator::RK4_DOUBLING)
+            ? "rk4"
+            : "dopri5";
+        return std::string(chart_tag(eff_chart)) + "-standard-" + intg_tag;
+    };
+    const std::string mode_tag = integration_mode_tag();
+
     // ── SINGLE FRAME mode ────────────────────────────────────
     if (!anim_mode) {
         FrameParams fp;
@@ -1873,6 +1906,7 @@ int main(int argc, char** argv) {
             std::string kgeo_path = geo_file.empty()
                 ? std::string(OUT_DIR)+"/"+res_tag
                   +"_"+std::to_string(W)+"x"+std::to_string(H)
+                  +"_"+mode_tag
                   +"_"+make_ts()+".kgeo"
                 : geo_file;
             save_kgeo(kgeo_path.c_str(), geo, meta);
@@ -1891,6 +1925,7 @@ int main(int argc, char** argv) {
             std::string ts_str = make_ts();
             std::string outfile = std::string(OUT_DIR)+"/"+res_tag
                                 +"_"+std::to_string(W)+"x"+std::to_string(H)
+                                +"_"+mode_tag
                                 +"_"+ts_str+".png";
             write_png(outfile.c_str(), image, W, H);
             std::cout << "Saved: " << outfile << "\n";
@@ -1930,6 +1965,7 @@ int main(int argc, char** argv) {
     if (theta_start!=theta_end)      tag_ss<<"_th"<<(int)theta_start<<"-"<<(int)theta_end;
     if (r_start!=r_end)              tag_ss<<"_r"<<(int)r_start<<"-"<<(int)r_end;
     if (a_start!=a_end)              tag_ss<<"_a"<<a_start<<"-"<<a_end;
+    tag_ss<<"_"<<mode_tag;
     tag_ss<<"_"<<anim_frames<<"f"<<anim_fps<<"fps";
     std::string anim_tag=tag_ss.str();
 
