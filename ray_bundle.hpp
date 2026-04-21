@@ -312,63 +312,114 @@ static BundleResult trace_bundle(int px, int py,
     init_bundle(cam, alpha, beta, g, bs.W);
 
     const double rh  = g.r_horizon();
+    const double rh_cut = rh * 1.03;
     double dlam      = 1.0;
-    double prev_cos  = std::cos(bs.geo.theta);
 
     for (int iter = 0; iter < 500000; ++iter) {
         const BundleState bs_prev = bs;
+        double step_used = dlam;
         int rejects = 0;
-        while (!bundle_adaptive(g, bs, dlam)) {
+        while (true) {
+            step_used = dlam;
+            if (bundle_adaptive(g, bs, dlam)) break;
             if (!std::isfinite(dlam) || ++rejects > 64) return {};
         }
 
         const double r = bs.geo.r;
 
-        if (r < rh * 1.03) return {};
-        if (r > r_escape)  return {false, r, 1.0, 1.0, bs.geo.theta, bs.geo.phi};
+        double best_alpha = 2.0;
+        enum class StepEvent { NONE, DISK, HORIZON, ESCAPE };
+        StepEvent best_event = StepEvent::NONE;
 
-        const double cos_th = std::cos(bs.geo.theta);
-        const bool crossed  = (prev_cos * cos_th <= 0.0);
+        double disk_r_hit = 0.0;
+        double disk_red = 1.0;
+        double disk_det = 1.0;
 
-        if (crossed) {
-            const double denom = prev_cos - cos_th;
-            double w = (std::abs(denom) > 1e-14) ? (prev_cos / denom) : 0.5;
-            w = w < 0.0 ? 0.0 : w > 1.0 ? 1.0 : w;
-            const double r_hit = bs_prev.geo.r + w*(bs.geo.r - bs_prev.geo.r);
-            if (!(r_hit >= r_disk_in && r_hit <= r_disk_out)) {
-                prev_cos = cos_th;
+        const double q0 = bs_prev.geo.theta - M_PI/2.0;
+        const double q1 = bs.geo.theta      - M_PI/2.0;
+        const bool maybe_equator = sign_change(q0, q1) ||
+                                   (std::min(std::abs(q0), std::abs(q1)) < 0.35);
+        if (maybe_equator) {
+            double dr0,dth0,dpr0,dpth0;
+            double dr1,dth1,dpr1,dpth1;
+            geodesic_rhs(g, bs_prev.geo.r, bs_prev.geo.theta, bs_prev.geo.pr, bs_prev.geo.ptheta,
+                         bs_prev.geo.pt, bs_prev.geo.pphi, dr0,dth0,dpr0,dpth0);
+            geodesic_rhs(g, bs.geo.r, bs.geo.theta, bs.geo.pr, bs.geo.ptheta,
+                         bs.geo.pt, bs.geo.pphi, dr1,dth1,dpr1,dpth1);
+            double alpha = 0.0;
+            if (!first_event_alpha_hermite(
+                    bs_prev.geo.theta, bs.geo.theta, dth0, dth1, step_used, M_PI/2.0,
+                    alpha, 8, 8)) {
                 continue;
             }
+            const double r_hit = hermite_interp_scalar(
+                bs_prev.geo.r, bs.geo.r, dr0, dr1, step_used, alpha);
+            if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
+                // ── Redshift ──────────────────────────────────────
+                const double Omega = g.keplerian_omega(r_hit);
+                const double b     = -bs.geo.pphi / (-bs.geo.pt);
+                double gLL[4][4];
+                g.covariant_BL(r_hit, M_PI/2.0, gLL);
+                const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
+                const double dv = 1.0 - Omega*b;
+                double red = (d2 > 0.0 && std::abs(dv) > 1e-10)
+                             ? std::sqrt(d2)/dv : 1.0;
+                red = red < 0.0 ? 0.0 : red > 20.0 ? 20.0 : red;
 
-            // ── Redshift ──────────────────────────────────────
-            const double Omega = g.keplerian_omega(r_hit);
-            const double b     = bs.geo.pphi / (-bs.geo.pt);
-            double gLL[4][4];
-            g.covariant_BL(r_hit, M_PI/2.0, gLL);
-            const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
-            const double dv = 1.0 - Omega*b;
-            double red = (d2 > 0.0 && std::abs(dv) > 1e-10)
-                         ? std::sqrt(d2)/dv : 1.0;
-            red = red < 0.0 ? 0.0 : red > 20.0 ? 20.0 : red;
+                // ── Jacobi map  J: screen (α,β) → disk (r,φ) ────
+                // Project the (r,θ) sub-block of W onto the disk tangent plane.
+                // At equatorial crossing (θ≈π/2), φ-variation ≈ W[1]/sinθ·(dφ/dθ)
+                // but more directly: use W[0] (δr) and approximate δφ from W[1]
+                // via the disk metric: dφ ≈ (dθ/dr_disk) · W[1] ... complex.
+                // Simpler: use only the 2×2 sub-block (δr, δθ) as proxy for
+                // (δr_disk, δφ_disk)  — gives the right shape up to a constant.
+                const double J00 = bs_prev.W[0][0] + alpha*(bs.W[0][0] - bs_prev.W[0][0]);
+                const double J01 = bs_prev.W[0][1] + alpha*(bs.W[0][1] - bs_prev.W[0][1]);
+                const double J10 = bs_prev.W[1][0] + alpha*(bs.W[1][0] - bs_prev.W[1][0]);
+                const double J11 = bs_prev.W[1][1] + alpha*(bs.W[1][1] - bs_prev.W[1][1]);
 
-            // ── Jacobi map  J: screen (α,β) → disk (r,φ) ────
-            // Project the (r,θ) sub-block of W onto the disk tangent plane.
-            // At equatorial crossing (θ≈π/2), φ-variation ≈ W[1]/sinθ·(dφ/dθ)
-            // but more directly: use W[0] (δr) and approximate δφ from W[1]
-            // via the disk metric: dφ ≈ (dθ/dr_disk) · W[1] ... complex.
-            // Simpler: use only the 2×2 sub-block (δr, δθ) as proxy for
-            // (δr_disk, δφ_disk)  — gives the right shape up to a constant.
-            const double J00 = bs_prev.W[0][0] + w*(bs.W[0][0] - bs_prev.W[0][0]);
-            const double J01 = bs_prev.W[0][1] + w*(bs.W[0][1] - bs_prev.W[0][1]);
-            const double J10 = bs_prev.W[1][0] + w*(bs.W[1][0] - bs_prev.W[1][0]);
-            const double J11 = bs_prev.W[1][1] + w*(bs.W[1][1] - bs_prev.W[1][1]);
-
-            double det = std::abs(J00*J11 - J01*J10);
-            det = det < 1e-12 ? 1e-12 : det;
-
-            return {true, r_hit, red, det};
+                double det = std::abs(J00*J11 - J01*J10);
+                det = det < 1e-12 ? 1e-12 : det;
+                disk_r_hit = r_hit;
+                disk_red = red;
+                disk_det = det;
+                best_alpha = alpha;
+                best_event = StepEvent::DISK;
+            }
         }
-        prev_cos = cos_th;
+        const bool horizon_cross = ((bs_prev.geo.r > rh_cut) && (r <= rh_cut)) || (r <= rh_cut);
+        if (horizon_cross) {
+            const double denom_h = bs_prev.geo.r - r;
+            double alpha_h = (std::abs(denom_h) > 1e-12) ? ((bs_prev.geo.r - rh_cut) / denom_h) : 0.0;
+            alpha_h = alpha_h < 0.0 ? 0.0 : alpha_h > 1.0 ? 1.0 : alpha_h;
+            if (alpha_h < best_alpha) {
+                best_alpha = alpha_h;
+                best_event = StepEvent::HORIZON;
+            }
+        }
+
+        const bool escape_cross = ((bs_prev.geo.r < r_escape) && (r >= r_escape)) || (r >= r_escape);
+        if (escape_cross) {
+            const double denom_e = r - bs_prev.geo.r;
+            double alpha_e = (std::abs(denom_e) > 1e-12) ? ((r_escape - bs_prev.geo.r) / denom_e) : 1.0;
+            alpha_e = alpha_e < 0.0 ? 0.0 : alpha_e > 1.0 ? 1.0 : alpha_e;
+            if (alpha_e < best_alpha) {
+                best_alpha = alpha_e;
+                best_event = StepEvent::ESCAPE;
+            }
+        }
+
+        if (best_event == StepEvent::DISK) {
+            return {true, disk_r_hit, disk_red, disk_det};
+        }
+        if (best_event == StepEvent::HORIZON) {
+            return {};
+        }
+        if (best_event == StepEvent::ESCAPE) {
+            const double th_esc = bs_prev.geo.theta + best_alpha * (bs.geo.theta - bs_prev.geo.theta);
+            const double ph_esc = bs_prev.geo.phi   + best_alpha * (bs.geo.phi   - bs_prev.geo.phi);
+            return {false, r_escape, 1.0, 1.0, th_esc, ph_esc};
+        }
     }
     return {false, bs.geo.r, 1.0, 1.0};
 }

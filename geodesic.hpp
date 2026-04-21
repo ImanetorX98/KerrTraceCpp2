@@ -44,6 +44,101 @@ inline double dphi_vel(const KNdSMetric& g, double r, double th,
     return gUU[3][0]*pt + gUU[3][3]*pphi;
 }
 
+// ── Event interpolation helpers (Hermite + bisection) ────────
+// For robust crossing localization inside an accepted integrator step.
+inline double clamp01(double x) {
+    if (x < 0.0) return 0.0;
+    if (x > 1.0) return 1.0;
+    return x;
+}
+
+inline double hermite_interp_scalar(double y0, double y1,
+                                    double dy0, double dy1,
+                                    double h, double alpha) {
+    alpha = clamp01(alpha);
+    const double a2 = alpha * alpha;
+    const double a3 = a2 * alpha;
+    const double h00 =  2.0*a3 - 3.0*a2 + 1.0;
+    const double h10 =        a3 - 2.0*a2 + alpha;
+    const double h01 = -2.0*a3 + 3.0*a2;
+    const double h11 =        a3 -       a2;
+    return h00*y0 + h10*(h*dy0) + h01*y1 + h11*(h*dy1);
+}
+
+inline bool sign_change(double f0, double f1) {
+    return ((f0 <= 0.0 && f1 >= 0.0) || (f0 >= 0.0 && f1 <= 0.0));
+}
+
+inline double refine_event_alpha_hermite(double y0, double y1,
+                                         double dy0, double dy1,
+                                         double h, double target,
+                                         int iterations = 8) {
+    const double f0 = y0 - target;
+    const double f1 = y1 - target;
+    double alpha = std::abs(f0) / (std::abs(f0) + std::abs(f1) + 1e-12);
+    alpha = clamp01(alpha);
+
+    if (!sign_change(f0, f1)) return alpha;
+
+    double lo = 0.0;
+    double hi = 1.0;
+    for (int i = 0; i < iterations; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        const double y_mid = hermite_interp_scalar(y0, y1, dy0, dy1, h, mid);
+        const double f_mid = y_mid - target;
+        if (sign_change(f0, f_mid)) hi = mid;
+        else lo = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+// Find the first root in [0,1] by scanning Hermite-interpolated sub-intervals.
+// This is more robust than a pure endpoint sign check when multiple crossings
+// occur inside one accepted integration step.
+inline bool first_event_alpha_hermite(double y0, double y1,
+                                      double dy0, double dy1,
+                                      double h, double target,
+                                      double& alpha_out,
+                                      int bins = 8,
+                                      int iterations = 8) {
+    bins = std::max(2, bins);
+    const double f_eps = 1e-12;
+    auto f = [&](double a) {
+        return hermite_interp_scalar(y0, y1, dy0, dy1, h, a) - target;
+    };
+
+    double a0 = 0.0;
+    double f0 = y0 - target;
+    if (std::abs(f0) <= f_eps) {
+        alpha_out = 0.0;
+        return true;
+    }
+
+    for (int i = 1; i <= bins; ++i) {
+        const double a1 = double(i) / double(bins);
+        const double f1 = (i == bins) ? (y1 - target) : f(a1);
+        if (std::abs(f1) <= f_eps) {
+            alpha_out = a1;
+            return true;
+        }
+        if (sign_change(f0, f1)) {
+            double lo = a0;
+            double hi = a1;
+            for (int k = 0; k < iterations; ++k) {
+                const double mid = 0.5 * (lo + hi);
+                const double fm = f(mid);
+                if (sign_change(f0, fm)) hi = mid;
+                else lo = mid;
+            }
+            alpha_out = 0.5 * (lo + hi);
+            return true;
+        }
+        a0 = a1;
+        f0 = f1;
+    }
+    return false;
+}
+
 // ── RHS via Hamiltonian (numerical ∂H/∂r, ∂H/∂θ) ─────────────
 inline void geodesic_rhs(const KNdSMetric& g,
                          double r,  double theta,

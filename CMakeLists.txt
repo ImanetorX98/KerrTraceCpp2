@@ -113,4 +113,13 @@ if(BUILD_TESTING)
     target_compile_options(kerrtrace_bump_detector PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
     add_test(NAME kerrtrace.bump_detector COMMAND kerrtrace_bump_detector --self-test)
+
+    add_executable(kerrtrace_spin_orientation_regression
+        tests/spin_orientation_regression.cpp)
+    target_include_directories(kerrtrace_spin_orientation_regression
+        PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_spin_orientation_regression PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
+    add_test(NAME kerrtrace.spin_orientation
+        COMMAND kerrtrace_spin_orientation_regression $<TARGET_FILE:kerr_tracer>)
 endif()

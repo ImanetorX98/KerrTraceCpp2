@@ -24,6 +24,7 @@ struct CameraParams_C {
     int   solver_mode; // 0 = standard, 1 = semi-analytic, 2 = elliptic-closed
     int   use_bundles; // 0 = single ray, 1 = ray-bundle (GPU finite-difference bundle)
     int   metal_kernel_mode; // 0 = auto, 1 = unified(legacy), 2 = single, 3 = bundle
+    int   intersection_mode; // 0 = linear, 1 = hermite
 };
 
 /// Renders the image on the default Metal GPU device.

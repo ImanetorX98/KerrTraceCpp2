@@ -67,22 +67,52 @@ public:
         const double ca = std::cos(alpha), sa = std::sin(alpha);
         const double cb = std::cos(beta),  sb = std::sin(beta);
 
-        const double sqrt_grr  = std::sqrt(std::abs(gLL[1][1]));
-        const double sqrt_gthth= std::sqrt(std::abs(gLL[2][2]));
-        const double sqrt_gphph= std::sqrt(std::abs(gLL[3][3]));
+        const double gtt   = gLL[0][0];
+        const double gtphi = gLL[0][3];
+        const double grr   = gLL[1][1];
+        const double gthth = gLL[2][2];
+        const double gphph = gLL[3][3];
 
-        const double pUr   = -ca*cb / sqrt_grr;
-        const double pUth  = -sb    / sqrt_gthth;
-        // Keep image orientation consistent with the Metal backend and
-        // the expected spin convention: a>0 bright side on the left.
-        const double pUphi = -sa*cb / sqrt_gphph;
-        const double pUt   =  1.0;
+        const double sqrt_grr   = std::sqrt(std::abs(grr));
+        const double sqrt_gthth = std::sqrt(std::abs(gthth));
+        const double denom_phi  = gphph - (gtphi*gtphi)/gtt;
 
-        // Covariant momenta  p_μ = g_μν p^ν  (only non-zero off-diag: g_tφ)
-        double pt   = gLL[0][0]*pUt + gLL[0][3]*pUphi;
-        double pr   = gLL[1][1]*pUr;
-        double pth  = gLL[2][2]*pUth;
-        double pphi = gLL[3][0]*pUt + gLL[3][3]*pUphi;
+        // Local static-observer tetrad (exact for stationary axisymmetric metrics):
+        // u = (1/sqrt(-g_tt), 0,0,0),
+        // e_(phi) = A (∂_phi - (g_tphi/g_tt) ∂_t), A = 1/sqrt(g_phiphi - g_tphi^2/g_tt).
+        // Fallback to the old approximation if the local frame degenerates.
+        const bool tetrad_ok =
+            (gtt < -1e-14) &&
+            std::isfinite(denom_phi) && (denom_phi > 1e-14) &&
+            std::isfinite(sqrt_grr)   && (sqrt_grr > 1e-14) &&
+            std::isfinite(sqrt_gthth) && (sqrt_gthth > 1e-14);
+
+        double pUt = 1.0;
+        double pUr = -ca*cb / std::max(sqrt_grr, 1e-14);
+        double pUth= -sb    / std::max(sqrt_gthth, 1e-14);
+        // Standard screen-to-azimuth orientation: +alpha points toward +phi.
+        double pUphi = sa*cb / std::sqrt(std::max(std::abs(gphph), 1e-14));
+
+        if (tetrad_ok) {
+            const double ut     = 1.0 / std::sqrt(-gtt);
+            const double ephi_p = 1.0 / std::sqrt(denom_phi);
+            const double ephi_t = -gtphi/gtt * ephi_p;
+
+            const double n_r  = -ca * cb;
+            const double n_th = -sb;
+            const double n_ph = sa * cb;
+
+            pUt   = ut + n_ph * ephi_t;
+            pUr   = n_r  / sqrt_grr;
+            pUth  = n_th / sqrt_gthth;
+            pUphi = n_ph * ephi_p;
+        }
+
+        // Covariant momenta p_μ = g_μν p^ν.
+        double pt   = gtt* pUt + gtphi*pUphi;
+        double pr   = grr* pUr;
+        double pth  = gthth*pUth;
+        double pphi = gtphi*pUt + gphph*pUphi;
 
         // ── Enforce null condition: solve  2H = 0  for p_t ───
         // 2H = g^tt p_t² + 2 g^tφ p_t p_φ + C = 0

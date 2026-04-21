@@ -373,14 +373,14 @@ public:
         //   Y = √(r²+a²) sinθ sin(φ − arctan(a/r))
         //   Z = r cosθ
         // Equivalently (avoiding arctan):
-        //   X = sinθ (r cosφ + a sinφ)   [uses r and a combined]
-        //   Y = sinθ (r sinφ − a cosφ)
+        //   X = sinθ (r cosφ − a sinφ)   [standard Kerr-Schild embedding]
+        //   Y = sinθ (r sinφ + a cosφ)
         //   Z = r cosθ
         // Note: X²+Y² = (r²+a²)sin²θ  ✓
         const double st = std::sin(theta), ct = std::cos(theta);
         const double sf = std::sin(phi),   cf = std::cos(phi);
-        X = st*(r*cf + a_spin*sf);
-        Y = st*(r*sf - a_spin*cf);
+        X = st*(r*cf - a_spin*sf);
+        Y = st*(r*sf + a_spin*cf);
         Z = r*ct;
     }
 
@@ -396,12 +396,9 @@ public:
         double Zr = Z/r;
         theta = std::acos(Zr < -1.0 ? -1.0 : Zr > 1.0 ? 1.0 : Zr);
         phi   = std::atan2(Y*r - X*a_spin, X*r + Y*a_spin);
-        // Derived from:  X = sinθ(r cosφ + a sinφ),  Y = sinθ(r sinφ − a cosφ)
-        // X*r + Y*a = sinθ(r²cosφ + ra sinφ − ra sinφ + a² cosφ) ... hmm
-        // Let me use the direct formula:
-        // r X/r2a2 = sinθ cosφ ... wait, no:
-        // X = st(r cf + a sf), so X·r - Y·a = st(r²cf + rasf - rasf + a²cf) = st(r²+a²)cf
-        // So cosφ = (Xr - Ya) / (st(r²+a²))  ... st = sinθ = √(1-(Z/r)²)
+        // Derived from:  X = sinθ(r cosφ − a sinφ),  Y = sinθ(r sinφ + a cosφ)
+        // X*r + Y*a = sinθ(r²+a²) cosφ
+        // Y*r − X*a = sinθ(r²+a²) sinφ
         double st_val = std::sqrt(std::max(1.0 - Z*Z/(r*r), 0.0));
         double r2a2   = r*r + a_spin*a_spin;
         if (st_val > 1e-10) {

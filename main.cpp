@@ -165,6 +165,7 @@ struct BackgroundImage {
 enum class Outcome { ESCAPED, DISK_HIT, HORIZON };
 enum class CoordinateChart { KS, BL };
 enum class RaySolverMode { STANDARD, SEMI_ANALYTIC, ELLIPTIC_CLOSED };
+enum class IntersectionMode { LINEAR, HERMITE };
 struct TraceResult {
     Outcome out; double r, redshift;
     double theta_esc=0.0, phi_esc=0.0;
@@ -181,6 +182,14 @@ static const char* solver_mode_name(RaySolverMode mode) {
 
 static bool solver_mode_requires_separable_kerr(RaySolverMode mode) {
     return mode == RaySolverMode::SEMI_ANALYTIC || mode == RaySolverMode::ELLIPTIC_CLOSED;
+}
+
+static const char* intersection_mode_name(IntersectionMode mode) {
+    switch (mode) {
+        case IntersectionMode::LINEAR:  return "linear";
+        case IntersectionMode::HERMITE: return "hermite";
+    }
+    return "hermite";
 }
 
 struct SolverSelection {
@@ -238,6 +247,10 @@ static int metal_solver_mode_code(RaySolverMode mode) {
     return 0;
 }
 
+static int intersection_mode_code(IntersectionMode mode) {
+    return (mode == IntersectionMode::LINEAR) ? 0 : 1;
+}
+
 enum class MetalKernelMode {
     AUTO = 0,
     UNIFIED = 1, // legacy all-in-one kernel entrypoint
@@ -268,7 +281,7 @@ static const char* metal_kernel_mode_name(MetalKernelMode mode) {
 
 static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& g) {
     double Omega = g.keplerian_omega(r);
-    double b     = pphi / (-pt);
+    double b     = -pphi / (-pt);
     double gLL[4][4]; g.covariant_BL(r, M_PI/2.0, gLL);
     double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
     if (d2 <= 0.0) return 1.0;
@@ -281,28 +294,87 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                                 double r_disk_in, double r_disk_out,
                                 double r_escape,
                                 Integrator intg=Integrator::RK4_DOUBLING) {
-    double rh=g.r_horizon(), dlam=1.0, prev_cos=std::cos(s.theta);
+    double rh=g.r_horizon(), dlam=1.0;
+    const double rh_cut = rh * 1.03;
     Vec4d fsal=Vec4d::nan_init();
     for (int it=0; it<500000; ++it) {
         const GeodesicState s_prev = s;
+        double step_used = dlam;
         int rejects = 0;
-        while (!adaptive_step(g, s, dlam, intg, fsal)) {
+        while (true) {
+            step_used = dlam;
+            if (adaptive_step(g, s, dlam, intg, fsal)) break;
             if (!std::isfinite(dlam) || ++rejects > 64)
                 return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
         }
-        if (s.r < rh*1.03)  return {Outcome::HORIZON,  s.r, 0.0};
-        if (s.r > r_escape)  return {Outcome::ESCAPED,  s.r, 1.0, s.theta, s.phi};
-        double cc=std::cos(s.theta);
-        if (prev_cos*cc<=0.0) {
-            const double denom = prev_cos - cc;
-            double w = (std::abs(denom) > 1e-14) ? (prev_cos / denom) : 0.5;
-            w = clamp(w, 0.0, 1.0);
-            const double r_hit = s_prev.r + w*(s.r - s_prev.r);
-            if (r_hit>=r_disk_in && r_hit<=r_disk_out)
-                return {Outcome::DISK_HIT, r_hit,
-                        clamp(disk_redshift(r_hit, s.pt, s.pphi, g), 0.0, 20.0)};
+
+        double best_alpha = 2.0;
+        enum class StepEvent { NONE, DISK, HORIZON, ESCAPE };
+        StepEvent best_event = StepEvent::NONE;
+
+        double disk_r_hit = 0.0;
+        double disk_redshift_hit = 1.0;
+
+        const double q0 = s_prev.theta - M_PI/2.0;
+        const double q1 = s.theta      - M_PI/2.0;
+        const bool maybe_equator = sign_change(q0, q1) ||
+                                   (std::min(std::abs(q0), std::abs(q1)) < 0.35);
+        if (maybe_equator) {
+            double dr0,dth0,dpr0,dpth0;
+            double dr1,dth1,dpr1,dpth1;
+            geodesic_rhs(g, s_prev.r, s_prev.theta, s_prev.pr, s_prev.ptheta,
+                         s_prev.pt, s_prev.pphi, dr0,dth0,dpr0,dpth0);
+            geodesic_rhs(g, s.r, s.theta, s.pr, s.ptheta,
+                         s.pt, s.pphi, dr1,dth1,dpr1,dpth1);
+            double alpha = 0.0;
+            if (first_event_alpha_hermite(
+                    s_prev.theta, s.theta, dth0, dth1, step_used, M_PI/2.0,
+                    alpha, 8, 8)) {
+                const double r_hit = hermite_interp_scalar(
+                    s_prev.r, s.r, dr0, dr1, step_used, alpha);
+                if (r_hit>=r_disk_in && r_hit<=r_disk_out) {
+                    disk_r_hit = r_hit;
+                    disk_redshift_hit = clamp(disk_redshift(r_hit, s.pt, s.pphi, g), 0.0, 20.0);
+                    best_alpha = alpha;
+                    best_event = StepEvent::DISK;
+                }
+            }
         }
-        prev_cos=cc;
+
+        const bool horizon_cross = ((s_prev.r > rh_cut) && (s.r <= rh_cut)) || (s.r <= rh_cut);
+        if (horizon_cross) {
+            const double denom_h = s_prev.r - s.r;
+            double alpha_h = (std::abs(denom_h) > 1e-12) ? ((s_prev.r - rh_cut) / denom_h) : 0.0;
+            alpha_h = clamp(alpha_h, 0.0, 1.0);
+            if (alpha_h < best_alpha) {
+                best_alpha = alpha_h;
+                best_event = StepEvent::HORIZON;
+            }
+        }
+
+        const bool escape_cross = ((s_prev.r < r_escape) && (s.r >= r_escape)) || (s.r >= r_escape);
+        if (escape_cross) {
+            const double denom_e = s.r - s_prev.r;
+            double alpha_e = (std::abs(denom_e) > 1e-12) ? ((r_escape - s_prev.r) / denom_e) : 1.0;
+            alpha_e = clamp(alpha_e, 0.0, 1.0);
+            if (alpha_e < best_alpha) {
+                best_alpha = alpha_e;
+                best_event = StepEvent::ESCAPE;
+            }
+        }
+
+        if (best_event == StepEvent::DISK) {
+            return {Outcome::DISK_HIT, disk_r_hit, disk_redshift_hit};
+        }
+        if (best_event == StepEvent::HORIZON) {
+            const double r_h = s_prev.r + best_alpha * (s.r - s_prev.r);
+            return {Outcome::HORIZON, r_h, 0.0};
+        }
+        if (best_event == StepEvent::ESCAPE) {
+            const double th_esc = s_prev.theta + best_alpha * (s.theta - s_prev.theta);
+            const double ph_esc = s_prev.phi   + best_alpha * (s.phi   - s_prev.phi);
+            return {Outcome::ESCAPED, r_escape, 1.0, th_esc, ph_esc};
+        }
     }
     return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
 }
@@ -464,17 +536,22 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
                       (dth0 >= 0.0 ? 1 : -1) };
 
     const double rh = g.r_horizon();
+    const double rh_cut = rh * 1.03;
     double h = 1.0;
-    double prev_r = s.r;
-    double prev_cos = std::cos(s.theta);
     double prev_Rpot = kerr_sep_R(c, s.r);
     double prev_Thpot = kerr_sep_Theta(c, s.theta);
     const double R_turn_eps = 1e-9;
     const double Th_turn_eps = 1e-11;
 
     for (int it = 0; it < 500000; ++it) {
+        const SeparableState s_prev = s;
+        const double prev_Rpot_step = prev_Rpot;
+        const double prev_Thpot_step = prev_Thpot;
+        double step_used = h;
         int rejects = 0;
-        while (!rk4_adaptive_separable_kerr(c, s, h)) {
+        while (true) {
+            step_used = h;
+            if (rk4_adaptive_separable_kerr(c, s, h)) break;
             if (!std::isfinite(h) || ++rejects > 64)
                 return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
         }
@@ -491,25 +568,75 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
         // Turning points in separated potentials: flip branch signs.
         const double Rnow = kerr_sep_R(c, s.r);
         const double Thnow = kerr_sep_Theta(c, s.theta);
-        if (Rnow <= R_turn_eps && prev_Rpot > R_turn_eps) s.sgn_r *= -1;
-        if (Thnow <= Th_turn_eps && prev_Thpot > Th_turn_eps) s.sgn_th *= -1;
+        if (Rnow <= R_turn_eps && prev_Rpot_step > R_turn_eps) s.sgn_r *= -1;
+        if (Thnow <= Th_turn_eps && prev_Thpot_step > Th_turn_eps) s.sgn_th *= -1;
 
-        if (s.r < rh*1.03)  return {Outcome::HORIZON, s.r, 0.0};
-        if (s.r > r_escape) return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+        double best_alpha = 2.0;
+        enum class StepEvent { NONE, DISK, HORIZON, ESCAPE };
+        StepEvent best_event = StepEvent::NONE;
+        double disk_r_hit = 0.0;
+        double disk_red_hit = 1.0;
 
-        const double cc = std::cos(s.theta);
-        if (prev_cos*cc <= 0.0) {
-            const double denom = prev_cos - cc;
-            double w = (std::abs(denom) > 1e-14) ? (prev_cos / denom) : 0.5;
-            w = clamp(w, 0.0, 1.0);
-            const double r_hit = prev_r + w*(s.r - prev_r);
-            if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
-                return {Outcome::DISK_HIT, r_hit,
-                        clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g), 0.0, 20.0)};
+        const double q0 = s_prev.theta - M_PI/2.0;
+        const double q1 = s.theta      - M_PI/2.0;
+        const bool maybe_equator = sign_change(q0, q1) ||
+                                   (std::min(std::abs(q0), std::abs(q1)) < 0.35);
+        if (maybe_equator) {
+            double dr0=0.0, dth0=0.0, dphi0=0.0;
+            double dr1=0.0, dth1=0.0, dphi1=0.0;
+            if (!kerr_sep_rhs(c, s_prev, dr0, dth0, dphi0) ||
+                !kerr_sep_rhs(c, s,      dr1, dth1, dphi1)) {
+                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
+            }
+
+            double alpha = 0.0;
+            if (first_event_alpha_hermite(
+                    s_prev.theta, s.theta, dth0, dth1, step_used, M_PI/2.0,
+                    alpha, 8, 8)) {
+                const double r_hit = hermite_interp_scalar(
+                    s_prev.r, s.r, dr0, dr1, step_used, alpha);
+                if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
+                    disk_r_hit = r_hit;
+                    disk_red_hit = clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g), 0.0, 20.0);
+                    best_alpha = alpha;
+                    best_event = StepEvent::DISK;
+                }
             }
         }
-        prev_cos = cc;
-        prev_r = s.r;
+
+        const bool horizon_cross = ((s_prev.r > rh_cut) && (s.r <= rh_cut)) || (s.r <= rh_cut);
+        if (horizon_cross) {
+            const double denom_h = s_prev.r - s.r;
+            double alpha_h = (std::abs(denom_h) > 1e-12) ? ((s_prev.r - rh_cut) / denom_h) : 0.0;
+            alpha_h = clamp(alpha_h, 0.0, 1.0);
+            if (alpha_h < best_alpha) {
+                best_alpha = alpha_h;
+                best_event = StepEvent::HORIZON;
+            }
+        }
+
+        const bool escape_cross = ((s_prev.r < r_escape) && (s.r >= r_escape)) || (s.r >= r_escape);
+        if (escape_cross) {
+            const double denom_e = s.r - s_prev.r;
+            double alpha_e = (std::abs(denom_e) > 1e-12) ? ((r_escape - s_prev.r) / denom_e) : 1.0;
+            alpha_e = clamp(alpha_e, 0.0, 1.0);
+            if (alpha_e < best_alpha) {
+                best_alpha = alpha_e;
+                best_event = StepEvent::ESCAPE;
+            }
+        }
+
+        if (best_event == StepEvent::DISK)
+            return {Outcome::DISK_HIT, disk_r_hit, disk_red_hit};
+        if (best_event == StepEvent::HORIZON) {
+            const double r_h = s_prev.r + best_alpha * (s.r - s_prev.r);
+            return {Outcome::HORIZON, r_h, 0.0};
+        }
+        if (best_event == StepEvent::ESCAPE) {
+            const double th_esc = s_prev.theta + best_alpha * (s.theta - s_prev.theta);
+            const double ph_esc = s_prev.phi   + best_alpha * (s.phi   - s_prev.phi);
+            return {Outcome::ESCAPED, r_escape, 1.0, th_esc, ph_esc};
+        }
         prev_Rpot = Rnow;
         prev_Thpot = Thnow;
     }
@@ -1030,13 +1157,17 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
     }
 
     const double rh = g.r_horizon();
+    const double rh_cut = rh * 1.03;
     double dlam = 1.0;
-    double prev_Z = s.Z;
+    double prev_r_ks = KNdSMetric::r_KS(s.X, s.Y, s.Z, g.a);
 
     for (int it = 0; it < 500000; ++it) {
         const KSState s_prev = s;
+        double step_used = dlam;
         int rejects = 0;
-        while (!rk4_adaptive_ks(g, s, dlam)) {
+        while (true) {
+            step_used = dlam;
+            if (rk4_adaptive_ks(g, s, dlam)) break;
             if (!std::isfinite(dlam) || ++rejects > 64) {
                 double r_tmp, th_tmp, ph_tmp;
                 KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_tmp, th_tmp, ph_tmp);
@@ -1045,36 +1176,84 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
         }
 
         const double r_now = KNdSMetric::r_KS(s.X, s.Y, s.Z, g.a);
-        if (r_now < rh * 1.03) return {Outcome::HORIZON, r_now, 0.0};
+        double best_alpha = 2.0;
+        enum class StepEvent { NONE, DISK, HORIZON, ESCAPE };
+        StepEvent best_event = StepEvent::NONE;
+        double disk_r_hit = 0.0;
+        double disk_red_hit = 1.0;
 
-        if (r_now > r_escape) {
-            double r_esc, th_esc, ph_esc;
-            KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_esc, th_esc, ph_esc);
-            return {Outcome::ESCAPED, r_esc, 1.0, th_esc, ph_esc};
-        }
+        const bool maybe_equator = sign_change(s_prev.Z, s.Z) ||
+                                   (std::min(std::abs(s_prev.Z), std::abs(s.Z)) < 0.35);
+        if (maybe_equator) {
+            double dX0=0.0, dY0=0.0, dZ0=0.0, dpX0=0.0, dpY0=0.0, dpZ0=0.0;
+            double dX1=0.0, dY1=0.0, dZ1=0.0, dpX1=0.0, dpY1=0.0, dpZ1=0.0;
+            geodesic_rhs_ks(g, s_prev, dX0, dY0, dZ0, dpX0, dpY0, dpZ0);
+            geodesic_rhs_ks(g, s,      dX1, dY1, dZ1, dpX1, dpY1, dpZ1);
 
-        if (prev_Z * s.Z <= 0.0) {
-            const double denom = prev_Z - s.Z;
-            double w = (std::abs(denom) > 1e-14) ? (prev_Z / denom) : 0.5;
-            w = clamp(w, 0.0, 1.0);
+            double alpha = 0.0;
+            if (!first_event_alpha_hermite(
+                    s_prev.Z, s.Z, dZ0, dZ1, step_used, 0.0, alpha, 8, 8)) {
+                continue;
+            }
 
-            const double Xh = s_prev.X + w * (s.X - s_prev.X);
-            const double Yh = s_prev.Y + w * (s.Y - s_prev.Y);
-            const double Zh = s_prev.Z + w * (s.Z - s_prev.Z);
-            const double pXh = s_prev.pX + w * (s.pX - s_prev.pX);
-            const double pYh = s_prev.pY + w * (s.pY - s_prev.pY);
-            const double pZh = s_prev.pZ + w * (s.pZ - s_prev.pZ);
-            const double pTh = s_prev.pT + w * (s.pT - s_prev.pT);
+            const double Xh = hermite_interp_scalar(s_prev.X,  s.X,  dX0,  dX1,  step_used, alpha);
+            const double Yh = hermite_interp_scalar(s_prev.Y,  s.Y,  dY0,  dY1,  step_used, alpha);
+            const double Zh = hermite_interp_scalar(s_prev.Z,  s.Z,  dZ0,  dZ1,  step_used, alpha);
+            const double pXh = hermite_interp_scalar(s_prev.pX, s.pX, dpX0, dpX1, step_used, alpha);
+            const double pYh = hermite_interp_scalar(s_prev.pY, s.pY, dpY0, dpY1, step_used, alpha);
+            const double pZh = hermite_interp_scalar(s_prev.pZ, s.pZ, dpZ0, dpZ1, step_used, alpha);
+            const double pTh = s_prev.pT;
 
             double r_hit, th_hit, ph_hit;
             KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
             if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
                 const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
-                const double red = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
-                return {Outcome::DISK_HIT, r_hit, red};
+                disk_r_hit = r_hit;
+                disk_red_hit = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
+                best_alpha = alpha;
+                best_event = StepEvent::DISK;
             }
         }
-        prev_Z = s.Z;
+
+        const bool horizon_cross = ((prev_r_ks > rh_cut) && (r_now <= rh_cut)) || (r_now <= rh_cut);
+        if (horizon_cross) {
+            const double denom_h = prev_r_ks - r_now;
+            double alpha_h = (std::abs(denom_h) > 1e-12) ? ((prev_r_ks - rh_cut) / denom_h) : 0.0;
+            alpha_h = clamp(alpha_h, 0.0, 1.0);
+            if (alpha_h < best_alpha) {
+                best_alpha = alpha_h;
+                best_event = StepEvent::HORIZON;
+            }
+        }
+
+        const bool escape_cross = ((prev_r_ks < r_escape) && (r_now >= r_escape)) || (r_now >= r_escape);
+        if (escape_cross) {
+            const double denom_e = r_now - prev_r_ks;
+            double alpha_e = (std::abs(denom_e) > 1e-12) ? ((r_escape - prev_r_ks) / denom_e) : 1.0;
+            alpha_e = clamp(alpha_e, 0.0, 1.0);
+            if (alpha_e < best_alpha) {
+                best_alpha = alpha_e;
+                best_event = StepEvent::ESCAPE;
+            }
+        }
+
+        if (best_event == StepEvent::DISK) {
+            return {Outcome::DISK_HIT, disk_r_hit, disk_red_hit};
+        }
+        if (best_event == StepEvent::HORIZON) {
+            const double r_h = prev_r_ks + best_alpha * (r_now - prev_r_ks);
+            return {Outcome::HORIZON, r_h, 0.0};
+        }
+        if (best_event == StepEvent::ESCAPE) {
+            const double X_esc = s_prev.X + best_alpha * (s.X - s_prev.X);
+            const double Y_esc = s_prev.Y + best_alpha * (s.Y - s_prev.Y);
+            const double Z_esc = s_prev.Z + best_alpha * (s.Z - s_prev.Z);
+            double r_esc, th_esc, ph_esc;
+            KNdSMetric::KS_to_BL_spatial(X_esc, Y_esc, Z_esc, g.a, r_esc, th_esc, ph_esc);
+            return {Outcome::ESCAPED, r_esc, 1.0, th_esc, ph_esc};
+        }
+
+        prev_r_ks = r_now;
     }
 
     double r_end, th_end, ph_end;
@@ -1314,11 +1493,13 @@ static std::vector<RGB> render_image(
     CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
+    IntersectionMode intersection_mode = IntersectionMode::HERMITE,
     int metal_kernel_mode = 0,
     const ColorParams& cp = ColorParams{},
     std::vector<GeoPixel>* geo_out = nullptr)
 {
     (void)metal_kernel_mode;
+    (void)intersection_mode;
 #if defined(USE_METAL)
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
@@ -1343,7 +1524,8 @@ static std::vector<RGB> render_image(
         CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,
                            W,H,(chart==CoordinateChart::KS)?1:0,metal_solver_mode_code(solver_mode),
                            use_bundles ? 1 : 0,
-                           metal_kernel_mode_code(static_cast<MetalKernelMode>(metal_kernel_mode))};
+                           metal_kernel_mode_code(static_cast<MetalKernelMode>(metal_kernel_mode)),
+                           intersection_mode_code(intersection_mode)};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -1452,6 +1634,7 @@ int main(int argc, char** argv) {
     Integrator intg=Integrator::RK4_DOUBLING;
     CoordinateChart chart=CoordinateChart::KS;
     RaySolverMode solver_mode=RaySolverMode::STANDARD;
+    IntersectionMode intersection_mode=IntersectionMode::HERMITE;
     int metal_kernel_mode=0; // 0=auto, 1=unified, 2=single, 3=bundle (Metal only)
     std::string bg_path;
 
@@ -1489,6 +1672,19 @@ int main(int argc, char** argv) {
         if (arg=="--dopri5")   intg=Integrator::DOPRI5;
         if (arg=="--semi-analytic" || arg=="--elliptic") solver_mode=RaySolverMode::SEMI_ANALYTIC;
         if (arg=="--elliptic-closed") solver_mode=RaySolverMode::ELLIPTIC_CLOSED;
+        if (arg=="--intersection-linear" || arg=="--linear-intersection")
+            intersection_mode=IntersectionMode::LINEAR;
+        if (arg=="--intersection-hermite" || arg=="--hermite-intersection")
+            intersection_mode=IntersectionMode::HERMITE;
+        if (arg=="--intersection" && i+1<argc) {
+            const std::string m = argv[++i];
+            if (m=="linear" || m=="lin") intersection_mode=IntersectionMode::LINEAR;
+            else if (m=="hermite" || m=="cubic" || m=="event-hermite")
+                intersection_mode=IntersectionMode::HERMITE;
+            else
+                std::cerr << "Warning: unknown --intersection value '" << m
+                          << "', using hermite\n";
+        }
         if (arg=="--solver-mode" && i+1<argc) {
             const std::string s = argv[++i];
             if (s=="standard") solver_mode=RaySolverMode::STANDARD;
@@ -1652,6 +1848,7 @@ int main(int argc, char** argv) {
                   << "  chart=" << (chart==CoordinateChart::KS?"KS":"BL")
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
                   << "  " << solver_mode_name(solver_mode)
+                  << "  intersection=" << intersection_mode_name(intersection_mode)
 #if defined(USE_METAL)
                   << "  metal-kernel="
                   << metal_kernel_mode_name(static_cast<MetalKernelMode>(metal_kernel_mode))
@@ -1684,7 +1881,7 @@ int main(int argc, char** argv) {
             // Full render (Phase 1 + Phase 2, optionally save .kgeo)
             std::vector<GeoPixel> geo;
             auto image = render_image(W, H, fp, bg, use_bundles, solver_mode, chart, intg,
-                                      M_bh, Q_bh, Lam, metal_kernel_mode, cp,
+                                      M_bh, Q_bh, Lam, intersection_mode, metal_kernel_mode, cp,
                                       geo_file.empty() ? nullptr : &geo);
             double elapsed=get_time()-t0;
             std::cout << "Time: " << elapsed << "s  ("
@@ -1785,7 +1982,7 @@ int main(int argc, char** argv) {
                  <<"  a="<<std::setprecision(4)<<fp.a<<" ...\n"<<std::flush;
 
         auto image=render_image(W,H,fp,bg,use_bundles,solver_mode,chart,intg,
-                                M_bh,Q_bh,Lam,metal_kernel_mode,cp);
+                                M_bh,Q_bh,Lam,intersection_mode,metal_kernel_mode,cp);
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;
