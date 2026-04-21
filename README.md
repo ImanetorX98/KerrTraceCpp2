@@ -103,6 +103,7 @@ Useful flags:
 - `--bundles`
 - `--dopri5`
 - `--solver-mode standard|semi-analytic|elliptic-closed`
+- `--metal-kernel auto|unified|single|bundle` (Metal only)
 - `--semi-analytic` / `--elliptic` (legacy alias for `--solver-mode semi-analytic`)
 - `--elliptic-closed` (alias for `--solver-mode elliptic-closed`)
 - `--bg <path>`
@@ -117,6 +118,16 @@ Experimental note:
 - Metal executes `elliptic-closed` with a dedicated elliptic GPU path and
   per-ray fallback to semi-analytic when needed for robustness.
 - CUDA currently routes `elliptic-closed` to CPU fallback.
+- Metal dispatch is adaptive-tiled for high resolutions (2K/4K). You can
+  override tile rows with `KERR_METAL_TILE_ROWS=<n>` when tuning stability
+  vs throughput.
+- `--bundles` on Metal is GPU-native for BL + `standard` solver (finite-
+  difference bundle proxy). Other bundle configurations fall back to CPU.
+- Kernel entrypoints are selectable:
+  - `auto` (default): picks `single` or `bundle` by mode
+  - `unified`: legacy all-in-one kernel (`trace_pixel`)
+  - `single`: force single-ray kernel
+  - `bundle`: force ray-bundle kernel
 
 Rendered frames are written under `out/`.
 

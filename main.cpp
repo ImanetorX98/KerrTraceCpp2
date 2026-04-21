@@ -33,8 +33,10 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(USE_METAL)
@@ -234,6 +236,33 @@ static int metal_solver_mode_code(RaySolverMode mode) {
         case RaySolverMode::ELLIPTIC_CLOSED: return 2;
     }
     return 0;
+}
+
+enum class MetalKernelMode {
+    AUTO = 0,
+    UNIFIED = 1, // legacy all-in-one kernel entrypoint
+    SINGLE = 2,  // force single-ray entrypoint
+    BUNDLE = 3   // force ray-bundle entrypoint
+};
+
+static int metal_kernel_mode_code(MetalKernelMode mode) {
+    switch (mode) {
+        case MetalKernelMode::AUTO:    return 0;
+        case MetalKernelMode::UNIFIED: return 1;
+        case MetalKernelMode::SINGLE:  return 2;
+        case MetalKernelMode::BUNDLE:  return 3;
+    }
+    return 0;
+}
+
+static const char* metal_kernel_mode_name(MetalKernelMode mode) {
+    switch (mode) {
+        case MetalKernelMode::AUTO:    return "auto";
+        case MetalKernelMode::UNIFIED: return "unified";
+        case MetalKernelMode::SINGLE:  return "single";
+        case MetalKernelMode::BUNDLE:  return "bundle";
+    }
+    return "auto";
 }
 #endif
 
@@ -1202,9 +1231,9 @@ static std::vector<GeoPixel> trace_geodesics(
     std::vector<GeoPixel> geo(W*H);
     std::atomic<int> rows_done{0};
     const double t0_geo = get_time();
+    std::mutex progress_mu;
 
-    #pragma omp parallel for schedule(dynamic, 4)
-    for (int py=0; py<H; ++py) {
+    auto trace_row = [&](int py) {
         for (int px_=0; px_<W; ++px_) {
             GeoPixel& pix = geo[py*W+px_];
             if (use_bundles) {
@@ -1239,10 +1268,38 @@ static std::vector<GeoPixel> trace_geodesics(
         }
         int done = ++rows_done;
         if (done%4==0 || done==H) {
-            #pragma omp critical
+            std::lock_guard<std::mutex> lk(progress_mu);
             print_progress(done, H, get_time()-t0_geo);
         }
+    };
+
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int py=0; py<H; ++py) {
+        trace_row(py);
     }
+#else
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned workers = std::max(1u, hw);
+    if (workers == 1 || H < 4) {
+        for (int py = 0; py < H; ++py) trace_row(py);
+    } else {
+        std::atomic<int> next_row{0};
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+        for (unsigned t = 0; t < workers; ++t) {
+            pool.emplace_back([&]() {
+                while (true) {
+                    const int py = next_row.fetch_add(1);
+                    if (py >= H) break;
+                    trace_row(py);
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+    }
+#endif
+
     std::cerr << "\n";
     return geo;
 }
@@ -1257,18 +1314,25 @@ static std::vector<RGB> render_image(
     CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
+    int metal_kernel_mode = 0,
     const ColorParams& cp = ColorParams{},
     std::vector<GeoPixel>* geo_out = nullptr)
 {
+    (void)metal_kernel_mode;
 #if defined(USE_METAL)
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
                               (chart == CoordinateChart::KS && ks_chart_supported);
     const bool solver_gpu_supported = metal_solver_supported(solver_mode, chart, Q_bh, Lam);
-    const bool can_use_gpu =
+    const bool bundle_gpu_supported =
+        use_bundles &&
+        chart == CoordinateChart::BL &&
+        solver_mode == RaySolverMode::STANDARD;
+    const bool single_ray_gpu_supported =
         !use_bundles &&
         gpu_chart_ok &&
         solver_gpu_supported;
+    const bool can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
 
     if (can_use_gpu) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
@@ -1277,7 +1341,9 @@ static std::vector<RGB> render_image(
         KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
                          (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
         CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,
-                           W,H,(chart==CoordinateChart::KS)?1:0,metal_solver_mode_code(solver_mode)};
+                           W,H,(chart==CoordinateChart::KS)?1:0,metal_solver_mode_code(solver_mode),
+                           use_bundles ? 1 : 0,
+                           metal_kernel_mode_code(static_cast<MetalKernelMode>(metal_kernel_mode))};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -1293,8 +1359,12 @@ static std::vector<RGB> render_image(
 
     static bool warned_metal_fallback = false;
     if (!warned_metal_fallback) {
-        if (use_bundles)
-            std::cerr << "Info: Metal backend does not support ray bundles yet; using CPU fallback for --bundles.\n";
+        if (use_bundles && chart != CoordinateChart::BL)
+            std::cerr << "Info: Metal ray bundles currently support BL chart only; using CPU fallback for --bundles.\n";
+        else if (use_bundles && solver_mode != RaySolverMode::STANDARD)
+            std::cerr << "Info: Metal ray bundles currently support standard solver only; using CPU fallback for --bundles.\n";
+        else if (use_bundles)
+            std::cerr << "Info: Metal ray bundles fallback to CPU for this configuration.\n";
         else if (!solver_gpu_supported)
             std::cerr << "Info: solver mode '" << solver_mode_name(solver_mode)
                       << "' on Metal currently supports BL chart with Q=0 and Lambda=0; using CPU fallback.\n";
@@ -1382,6 +1452,7 @@ int main(int argc, char** argv) {
     Integrator intg=Integrator::RK4_DOUBLING;
     CoordinateChart chart=CoordinateChart::KS;
     RaySolverMode solver_mode=RaySolverMode::STANDARD;
+    int metal_kernel_mode=0; // 0=auto, 1=unified, 2=single, 3=bundle (Metal only)
     std::string bg_path;
 
     // ── Single-frame / base params ───────────────────────────
@@ -1425,6 +1496,19 @@ int main(int argc, char** argv) {
                 solver_mode=RaySolverMode::SEMI_ANALYTIC;
             else if (s=="elliptic" || s=="elliptic-closed" || s=="elliptic_closed")
                 solver_mode=RaySolverMode::ELLIPTIC_CLOSED;
+        }
+        if (arg=="--metal-kernel" && i+1<argc) {
+            const std::string k = argv[++i];
+            if (k=="auto") metal_kernel_mode = 0;
+            else if (k=="unified" || k=="legacy") metal_kernel_mode = 1;
+            else if (k=="single" || k=="single-ray" || k=="single_ray") metal_kernel_mode = 2;
+            else if (k=="bundle" || k=="bundles" || k=="ray-bundle" || k=="ray_bundle")
+                metal_kernel_mode = 3;
+            else {
+                std::cerr << "Warning: unknown --metal-kernel value '" << k
+                          << "', using auto\n";
+                metal_kernel_mode = 0;
+            }
         }
         if (arg=="--bl")       chart=CoordinateChart::BL;
         if (arg=="--ks")       chart=CoordinateChart::KS;
@@ -1568,6 +1652,10 @@ int main(int argc, char** argv) {
                   << "  chart=" << (chart==CoordinateChart::KS?"KS":"BL")
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
                   << "  " << solver_mode_name(solver_mode)
+#if defined(USE_METAL)
+                  << "  metal-kernel="
+                  << metal_kernel_mode_name(static_cast<MetalKernelMode>(metal_kernel_mode))
+#endif
                   << "  " << W << "x" << H << "\n"
                   << "ColorParams: exp=" << cp.exposure
                   << " γ=" << cp.gamma
@@ -1596,7 +1684,7 @@ int main(int argc, char** argv) {
             // Full render (Phase 1 + Phase 2, optionally save .kgeo)
             std::vector<GeoPixel> geo;
             auto image = render_image(W, H, fp, bg, use_bundles, solver_mode, chart, intg,
-                                      M_bh, Q_bh, Lam, cp,
+                                      M_bh, Q_bh, Lam, metal_kernel_mode, cp,
                                       geo_file.empty() ? nullptr : &geo);
             double elapsed=get_time()-t0;
             std::cout << "Time: " << elapsed << "s  ("
@@ -1696,7 +1784,8 @@ int main(int argc, char** argv) {
                  <<"°  r="<<std::setprecision(2)<<fp.r_obs
                  <<"  a="<<std::setprecision(4)<<fp.a<<" ...\n"<<std::flush;
 
-        auto image=render_image(W,H,fp,bg,use_bundles,solver_mode,chart,intg,M_bh,Q_bh,Lam,cp);
+        auto image=render_image(W,H,fp,bg,use_bundles,solver_mode,chart,intg,
+                                M_bh,Q_bh,Lam,metal_kernel_mode,cp);
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;

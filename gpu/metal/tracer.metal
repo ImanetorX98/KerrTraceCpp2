@@ -30,12 +30,16 @@ struct CameraParams {
     int   width;
     int   height;
     int   chart;       // 0 = BL, 1 = KS
-    int   solver_mode; // 0 = standard, 1 = semi-analytic, 2 = elliptic-closed (placeholder)
+    int   solver_mode; // 0 = standard, 1 = semi-analytic, 2 = elliptic-closed
+    int   use_bundles; // 0 = single ray, 1 = ray-bundle (finite-difference proxy)
+    int   metal_kernel_mode; // 0 = auto, 1 = unified(legacy), 2 = single, 3 = bundle
 };
 
 struct RenderParams {
     uint width;
     uint height;
+    uint x_offset;
+    uint tile_w;
     uint y_offset;
     uint tile_h;
 };
@@ -827,22 +831,187 @@ static float4 sample_background(texture2d<float, access::sample> bg_tex,
     return bg_tex.sample(bg_samp, float2(u, v));
 }
 
-// ── Main compute kernel ───────────────────────────────────────
-kernel void trace_pixel(
-    device uint32_t*   output    [[buffer(0)]],
-    constant KNdSParams& kp      [[buffer(1)]],
-    constant CameraParams& cp    [[buffer(2)]],
-    constant RenderParams& rp    [[buffer(3)]],
-    texture2d<float, access::sample> bg_tex [[texture(0)]],
-    sampler             bg_samp   [[sampler(0)]],
-    uint2              gid       [[thread_position_in_grid]])
+struct RayTraceResultBL {
+    int outcome;   // 0 = escape, 1 = disk, 2 = horizon
+    float r_hit;
+    float redshift;
+    float theta_esc;
+    float phi_esc;
+    float phi_hit;
+};
+
+static float wrap_delta_phi(float dphi) {
+    constexpr float PI_F = 3.14159265358979323846f;
+    constexpr float TWO_PI_F = 6.28318530717958647692f;
+    dphi = fmod(dphi + PI_F, TWO_PI_F);
+    if (dphi < 0.0f) dphi += TWO_PI_F;
+    return dphi - PI_F;
+}
+
+static uint32_t pack_abgr(float r, float g, float b) {
+    const uint32_t rr = uint32_t(clamp(r, 0.0f, 1.0f) * 255.0f);
+    const uint32_t gg = uint32_t(clamp(g, 0.0f, 1.0f) * 255.0f);
+    const uint32_t bb = uint32_t(clamp(b, 0.0f, 1.0f) * 255.0f);
+    return (0xFFu << 24) | (bb << 16) | (gg << 8) | rr;
+}
+
+static uint32_t disk_color_abgr(float r_hit, float redshift, float magnif,
+                                float M, float r_isco) {
+    const float red = clamp(redshift, 0.0f, 20.0f);
+    const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
+    float I = page_thorne_norm(r_hit, r_isco);
+    I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+    I *= clamp(1.0f / max(magnif, 1e-12f), 0.05f, 5.0f);
+    const float4 bb = blackbody_rgb(T);
+    const float rr = tonemap_ch(bb.r * I, 1.0f, 2.2f);
+    const float gg = tonemap_ch(bb.g * I, 1.0f, 2.2f);
+    const float bbv = tonemap_ch(bb.b * I, 1.0f, 2.2f);
+    return pack_abgr(rr, gg, bbv);
+}
+
+static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
+                                                      float M, float a, float Q, float L,
+                                                      float r_obs, float theta_obs, float phi_obs,
+                                                      float r_horizon, float r_isco, float r_disk_out) {
+    RayTraceResultBL res{};
+    res.outcome = 2;
+    res.r_hit = 0.0f;
+    res.redshift = 1.0f;
+    res.theta_esc = theta_obs;
+    res.phi_esc = phi_obs;
+    res.phi_hit = phi_obs;
+
+    float gll[4][4];
+    gLL_BL(r_obs, theta_obs, M, a, Q, L, gll);
+
+    float gu[4][4];
+    gUU(r_obs, theta_obs, M, a, Q, L, gu);
+
+    const float ca = cos(alpha), sa = sin(alpha);
+    const float cb = cos(beta),  sb = sin(beta);
+
+    const float sqrt_grr   = sqrt(abs(gll[1][1]));
+    const float sqrt_gthth = sqrt(abs(gll[2][2]));
+    const float sqrt_gphph = sqrt(abs(gll[3][3]));
+
+    const float pUr   = -ca*cb / sqrt_grr;
+    const float pUth  = -sb    / sqrt_gthth;
+    const float pUphi = -sa*cb / sqrt_gphph;
+
+    float pt   = gll[0][0]*1.0f + gll[0][3]*pUphi;
+    float pr   = gll[1][1]*pUr;
+    float pth  = gll[2][2]*pUth;
+    float pphi = gll[3][0]*1.0f + gll[3][3]*pUphi;
+
+    const float A = gu[0][0];
+    const float B = 2.0f * gu[0][3] * pphi;
+    const float C = gu[1][1]*pr*pr + gu[2][2]*pth*pth + gu[3][3]*pphi*pphi;
+    const float disc = B*B - 4.0f*A*C;
+    if (disc >= 0.0f && abs(A) > 1e-15f) {
+        const float sq  = sqrt(disc);
+        const float pt1 = (-B - sq)/(2.0f*A);
+        const float pt2 = (-B + sq)/(2.0f*A);
+        pt = (pt1 < 0.0f) ? pt1 : pt2;
+        if (pt > 0.0f) pt = min(pt1, pt2);
+    }
+
+    float r = r_obs, theta = theta_obs, phi = phi_obs;
+    float dlam = 1.0f;
+    float prev_r = r_obs;
+    float prev_theta = theta_obs;
+    float prev_phi = phi_obs;
+    float prev_cos = cos(theta_obs);
+    const float r_escape = r_obs * 1.05f;
+
+    for (int iter = 0; iter < 60000; ++iter) {
+        float r_h = r, th_h = theta, ph_h = phi, pr_h = pr, pth_h = pth;
+        rk4(r_h, th_h, ph_h, pr_h, pth_h, pt, pphi, M, a, Q, L, dlam);
+
+        float r_f = r, th_f = theta, ph_f = phi, pr_f = pr, pth_f = pth;
+        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
+        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
+
+        const float err = length(float4(r_h-r_f, th_h-th_f, pr_h-pr_f, pth_h-pth_f)) / 15.0f;
+        const float tol = 2e-5f;
+        if (err < tol || dlam < 1e-6f) {
+            r = r_f; theta = th_f; phi = ph_f; pr = pr_f; pth = pth_f;
+            const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
+            dlam = clamp(dlam*sc, 1e-6f, 50.0f);
+        } else {
+            dlam = clamp(dlam*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam*0.5f);
+            continue;
+        }
+
+        if (!(isfinite(r) && isfinite(theta) && isfinite(phi) && isfinite(pr) && isfinite(pth))) {
+            return res;
+        }
+
+        if (r < r_horizon * 1.03f) {
+            res.outcome = 2;
+            return res;
+        }
+
+        if (r > r_escape) {
+            const float denom = r - prev_r;
+            float w = (abs(denom) > 1e-8f) ? ((r_escape - prev_r) / denom) : 1.0f;
+            w = clamp(w, 0.0f, 1.0f);
+            res.outcome = 0;
+            res.theta_esc = prev_theta + w*(theta - prev_theta);
+            res.phi_esc = prev_phi + w*(phi - prev_phi);
+            return res;
+        }
+
+        const float cos_th = cos(theta);
+        if (prev_cos * cos_th <= 0.0f) {
+            const float denom = prev_cos - cos_th;
+            float w = (abs(denom) > 1e-8f) ? (prev_cos / denom) : 0.5f;
+            w = clamp(w, 0.0f, 1.0f);
+            const float r_hit = prev_r + w*(r - prev_r);
+            if (r_hit >= r_isco && r_hit <= r_disk_out) {
+                const float Omega = keplerian_omega(r_hit, M, a, Q, L);
+                const float b_ip  = pphi / (-pt);
+                float gll2[4][4];
+                gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
+                const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
+                const float dv = 1.0f - Omega*b_ip;
+                float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
+                red = clamp(red, 0.0f, 20.0f);
+
+                res.outcome = 1;
+                res.r_hit = r_hit;
+                res.redshift = red;
+                res.phi_hit = prev_phi + w*(phi - prev_phi);
+                return res;
+            }
+        }
+
+        prev_cos = cos_th;
+        prev_r = r;
+        prev_theta = theta;
+        prev_phi = phi;
+    }
+
+    return res;
+}
+
+// ── Main compute implementation (shared by all entry kernels) ─
+static inline void trace_pixel_impl(
+    device uint32_t*   output,
+    KNdSParams         kp,
+    CameraParams       cp,
+    RenderParams       rp,
+    texture2d<float, access::sample> bg_tex,
+    sampler            bg_samp,
+    uint2              gid)
 {
-    const int px = (int)gid.x;
+    const int px_local = (int)gid.x;
     const int py_local = (int)gid.y;
     const int width = (int)rp.width;
     const int height = (int)rp.height;
-    if (px >= width || py_local >= (int)rp.tile_h) return;
+    if (px_local >= (int)rp.tile_w || py_local >= (int)rp.tile_h) return;
+    const int px = px_local + (int)rp.x_offset;
     const int py = py_local + (int)rp.y_offset;
+    if (px >= width || py >= height) return;
 
     const float M = kp.M, a = kp.a, Q = kp.Q, L = kp.Lambda;
 
@@ -850,6 +1019,61 @@ kernel void trace_pixel(
     const int span = max(width - 1, 1);
     const float alpha = cp.fov_h*(float(px) - 0.5f*(width-1))  / float(span);
     const float beta  = cp.fov_h*(0.5f*(height-1) - float(py)) / float(span);
+
+    // ── Ray-bundle mode (GPU native, BL + standard solver) ───
+    if (cp.use_bundles != 0 && cp.chart == 0 && cp.solver_mode == 0) {
+        uint32_t colour = 0xFF000000u;
+        const RayTraceResultBL c = trace_standard_bl_from_angles(
+            alpha, beta, M, a, Q, L,
+            cp.r_obs, cp.theta_obs, cp.phi_obs,
+            kp.r_horizon, kp.r_isco, kp.r_disk_out);
+
+        if (c.outcome == 0) {
+            const float4 bgc = clamp(sample_background(bg_tex, bg_samp, c.theta_esc, c.phi_esc), 0.0f, 1.0f);
+            colour = pack_abgr(bgc.r, bgc.g, bgc.b);
+            output[py * width + px] = colour;
+            return;
+        }
+
+        if (c.outcome == 1) {
+            float magnif = 1.0f;
+            const float eps = cp.fov_h / float(max(cp.width, 1)) * 0.5f;
+            if (eps > 1e-8f) {
+                const RayTraceResultBL ap = trace_standard_bl_from_angles(
+                    alpha + eps, beta, M, a, Q, L,
+                    cp.r_obs, cp.theta_obs, cp.phi_obs,
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out);
+                const RayTraceResultBL am = trace_standard_bl_from_angles(
+                    alpha - eps, beta, M, a, Q, L,
+                    cp.r_obs, cp.theta_obs, cp.phi_obs,
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out);
+                const RayTraceResultBL bp = trace_standard_bl_from_angles(
+                    alpha, beta + eps, M, a, Q, L,
+                    cp.r_obs, cp.theta_obs, cp.phi_obs,
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out);
+                const RayTraceResultBL bm = trace_standard_bl_from_angles(
+                    alpha, beta - eps, M, a, Q, L,
+                    cp.r_obs, cp.theta_obs, cp.phi_obs,
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out);
+
+                if (ap.outcome == 1 && am.outcome == 1 && bp.outcome == 1 && bm.outcome == 1) {
+                    const float dr_da = (ap.r_hit - am.r_hit) / (2.0f * eps);
+                    const float dr_db = (bp.r_hit - bm.r_hit) / (2.0f * eps);
+                    const float dphi_da = wrap_delta_phi(ap.phi_hit - am.phi_hit) / (2.0f * eps);
+                    const float dphi_db = wrap_delta_phi(bp.phi_hit - bm.phi_hit) / (2.0f * eps);
+                    magnif = abs(dr_da * dphi_db - dr_db * dphi_da);
+                    magnif = max(magnif, 1e-12f);
+                }
+            }
+
+            colour = disk_color_abgr(c.r_hit, c.redshift, magnif, M, kp.r_isco);
+            output[py * width + px] = colour;
+            return;
+        }
+
+        output[py * width + px] = colour;
+        return;
+    }
 
     // ── Initial conditions (approx. flat at large r) ──────────
     const float r0  = cp.r_obs;
@@ -1313,4 +1537,48 @@ kernel void trace_pixel(
     }
 
     output[py * width + px] = colour;
+}
+
+// ── Kernel entrypoints (selectable) ──────────────────────────
+kernel void trace_pixel(
+    device uint32_t*   output    [[buffer(0)]],
+    constant KNdSParams& kp      [[buffer(1)]],
+    constant CameraParams& cp    [[buffer(2)]],
+    constant RenderParams& rp    [[buffer(3)]],
+    texture2d<float, access::sample> bg_tex [[texture(0)]],
+    sampler             bg_samp   [[sampler(0)]],
+    uint2               gid       [[thread_position_in_grid]])
+{
+    trace_pixel_impl(output, kp, cp, rp, bg_tex, bg_samp, gid);
+}
+
+kernel void trace_pixel_single(
+    device uint32_t*   output    [[buffer(0)]],
+    constant KNdSParams& kp      [[buffer(1)]],
+    constant CameraParams& cp    [[buffer(2)]],
+    constant RenderParams& rp    [[buffer(3)]],
+    texture2d<float, access::sample> bg_tex [[texture(0)]],
+    sampler             bg_samp   [[sampler(0)]],
+    uint2               gid       [[thread_position_in_grid]])
+{
+    CameraParams local = cp;
+    local.use_bundles = 0;
+    trace_pixel_impl(output, kp, local, rp, bg_tex, bg_samp, gid);
+}
+
+kernel void trace_pixel_bundle(
+    device uint32_t*   output    [[buffer(0)]],
+    constant KNdSParams& kp      [[buffer(1)]],
+    constant CameraParams& cp    [[buffer(2)]],
+    constant RenderParams& rp    [[buffer(3)]],
+    texture2d<float, access::sample> bg_tex [[texture(0)]],
+    sampler             bg_samp   [[sampler(0)]],
+    uint2               gid       [[thread_position_in_grid]])
+{
+    CameraParams local = cp;
+    local.use_bundles = 1;
+    // Bundle GPU path currently targets BL + standard solver.
+    local.chart = 0;
+    local.solver_mode = 0;
+    trace_pixel_impl(output, kp, local, rp, bg_tex, bg_samp, gid);
 }

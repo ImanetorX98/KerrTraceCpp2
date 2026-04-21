@@ -92,6 +92,11 @@ if(APPLE AND NOT USE_METAL)
         "-framework Metal"
         "-framework Foundation"
         "-framework CoreGraphics")
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(kerr_tracer_metal PRIVATE OpenMP::OpenMP_CXX)
+        target_compile_definitions(kerr_tracer_metal PRIVATE _OPENMP)
+        message(STATUS "OpenMP enabled for kerr_tracer_metal fallback paths")
+    endif()
     message(STATUS "Metal GPU binary: kerr_tracer_metal")
 endif()
 
