@@ -34,6 +34,7 @@ struct CameraParams {
     int   use_bundles; // 0 = single ray, 1 = ray-bundle (finite-difference proxy)
     int   metal_kernel_mode; // 0 = auto, 1 = unified(legacy), 2 = single, 3 = bundle
     int   intersection_mode; // 0 = linear, 1 = hermite
+    int   elliptic_fallback_black; // 0 = normal fallback, 1 = force black on fallback rays
 };
 
 struct RenderParams {
@@ -65,7 +66,7 @@ static float Delta_th(float theta, float a, float L) {
 static float Xi(float a, float L) { return 1.0f + L*a*a/3.0f; }
 
 static float keplerian_omega(float r, float M, float a, float Q, float L) {
-    const float s    = (a < 0.0f) ? -1.0f : 1.0f;
+    const float s    = (a < 0.0f) ? 1.0f : -1.0f;
     const float Meff = M - Q*Q/(2.0f*r) + L*a*r*r/3.0f;
     const float sq   = sqrt(max(Meff, 0.0f));
     const float den  = r*sqrt(r) + s*a*sq;
@@ -258,7 +259,10 @@ static bool first_event_alpha_mode_f(float y0, float y1,
                                      int mode,
                                      thread float& alpha_out) {
     if (mode == 0) return first_event_alpha_linear_f(y0, y1, target, alpha_out);
-    return first_event_alpha_hermite_f(y0, y1, dy0, dy1, h, target, alpha_out, 8, 7);
+    if (first_event_alpha_hermite_f(y0, y1, dy0, dy1, h, target, alpha_out, 8, 7))
+        return true;
+    // Robust fallback: if Hermite misses a true sign-crossing, recover linearly.
+    return first_event_alpha_linear_f(y0, y1, target, alpha_out);
 }
 
 static float interp_scalar_mode_f(float y0, float y1,
@@ -813,8 +817,10 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
     const float u0_num = out.r31 * (r0 - out.r4);
     const float u0_den = out.r41 * (r0 - out.r3);
     if (abs(u0_den) < 1e-8f) return false;
-    float u0 = u0_num / u0_den;
-    u0 = clamp(u0, 0.0f, 1.0f);
+    const float u0_raw = u0_num / u0_den;
+    if (!isfinite(u0_raw)) return false;
+    if (u0_raw < -1e-4f || u0_raw > 1.0f + 1e-4f) return false;
+    const float u0 = clamp(u0_raw, 0.0f, 1.0f);
     out.X0 = ellint_F_incomplete(asin(sqrt(u0)), out.m);
     if (!isfinite(out.X0)) return false;
 
@@ -833,6 +839,13 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
     return true;
 }
 
+static float separable_radial_potential(thread const SeparableConsts& c, float r) {
+    const float Kpot = c.Qc + (c.Lz - c.a*c.E) * (c.Lz - c.a*c.E);
+    const float A0 = c.E * (r*r + c.a*c.a) - c.a * c.Lz;
+    const float Delta = r*r - 2.0f*c.M*r + c.a*c.a;
+    return A0*A0 - Delta*Kpot;
+}
+
 static bool first_equator_crossing_mino_time(thread const SeparableConsts& c,
                                              float theta0, float dtheta0,
                                              thread float& tau_first,
@@ -848,25 +861,29 @@ static bool first_equator_crossing_mino_time(thread const SeparableConsts& c,
     const float u_minus = (B - sq) / (2.0f*A);
     if (!(u_plus > 0.0f && u_minus < 0.0f)) return false;
 
-    const float m = -u_plus / u_minus;
+    // Dexter & Agol 2009 (M_- < 0 branch, Eq. 42):
+    //   mu(tau) = mu_+ * cn(u, k),  k^2 = u_+ / (u_+ - u_-)
+    const float m = u_plus / (u_plus - u_minus);
     if (!(m >= 0.0f && m < 1.0f)) return false;
     const float Kc = ellint_K_complete(m);
     if (!isfinite(Kc) || !(Kc > 0.0f)) return false;
 
-    const float S = sqrt(-A * u_minus);
-    if (!(S > 0.0f) || !isfinite(S)) return false;
+    const float omega = sqrt(A * (u_plus - u_minus));
+    if (!(omega > 0.0f) || !isfinite(omega)) return false;
 
-    const float u0 = clamp(cos(theta0) * cos(theta0), 0.0f, u_plus);
-    const float psi0 = asin(sqrt(clamp(u0 / u_plus, 0.0f, 1.0f)));
-    const float F0 = ellint_F_incomplete(psi0, m);
-    if (!isfinite(F0)) return false;
+    const float mu_plus = sqrt(u_plus);
+    const float mu0 = cos(theta0);
+    const float c0 = clamp(abs(mu0) / max(mu_plus, 1e-8f), 0.0f, 1.0f);
+    const float phi0 = acos(c0);
+    const float u_base = ellint_F_incomplete(phi0, m);
+    if (!isfinite(u_base)) return false;
 
-    tau_period = 2.0f * Kc / S;
+    tau_period = 4.0f * Kc / omega;
     if (!(tau_period > 0.0f) || !isfinite(tau_period)) return false;
 
     const bool toward_equator = (cos(theta0) * dtheta0) > 0.0f;
-    const float tau_direct = F0 / S;
-    tau_first = toward_equator ? tau_direct : (tau_period - tau_direct);
+    const float u0_phase = toward_equator ? u_base : -u_base;
+    tau_first = (Kc - u0_phase) / omega;
     if (tau_first < 0.0f) tau_first += tau_period;
     return isfinite(tau_first);
 }
@@ -879,22 +896,25 @@ static int elliptic_closed_first_hit(thread const SeparableConsts& c,
     float tau_first = 0.0f, tau_period = 0.0f;
     if (!first_equator_crossing_mino_time(c, theta0, dtheta0, tau_first, tau_period))
         return 0;
+    (void)tau_period;
 
     EllipticRadialMap mp{};
     if (!init_elliptic_radial_map(c, r0, dr0, mp))
         return 0;
 
-    for (int n = 0; n < 64; ++n) {
-        const float tau = tau_first + float(n) * tau_period;
-        const float X = mp.X0 + float(mp.x_sign) * mp.omega * tau;
-        const float r_now = elliptic_radial_r_from_phase(mp, X);
-        if (!isfinite(r_now)) return 0;
-        if (r_now < r_horizon * 1.03f) return 1;
-        if (r_now > r_escape) return 0;
-        if (r_now >= r_isco && r_now <= r_disk_out) {
-            r_hit_out = r_now;
-            return 2;
-        }
+    // Keep GPU behaviour aligned with CPU elliptic-closed:
+    // evaluate the radial map only at the first equatorial crossing.
+    const float X = mp.X0 + float(mp.x_sign) * mp.omega * tau_first;
+    const float r_now = elliptic_radial_r_from_phase(mp, X);
+    if (!isfinite(r_now)) return 0;
+    const float R = separable_radial_potential(c, r_now);
+    const float R_scale = max(1.0f, abs(c.E*c.E*r_now*r_now*r_now*r_now));
+    if (R < -1e-6f * R_scale) return 0;
+    if (r_now < r_horizon * 1.03f) return 1;
+    if (r_now > r_escape) return 0;
+    if (r_now >= r_isco && r_now <= r_disk_out) {
+        r_hit_out = r_now;
+        return 2;
     }
     return 0;
 }
@@ -915,6 +935,31 @@ static float tonemap_ch(float x, float exposure, float gamma) {
     x = x * exposure;
     x = x / (1.0f + x);
     return pow(clamp(x, 0.0f, 1.0f), 1.0f / gamma);
+}
+
+static inline float doppler_intensity_scale(float redshift) {
+    const float red_c = clamp(redshift, 0.1f, 10.0f);
+    const float receding_lift = 1.0f + 0.85f * clamp(1.0f - red_c, 0.0f, 1.0f);
+    return pow(red_c, 4.0f) * receding_lift;
+}
+
+static inline float robust_disk_redshift(float r_hit,
+                                         float pt_cov,
+                                         float pphi_cov,
+                                         float M, float a, float Q, float L) {
+    const float pt_abs = max(abs(pt_cov), 1e-12f);
+    const float Omega = keplerian_omega(r_hit, M, a, Q, L);
+    const float b_ip  = -pphi_cov / pt_abs;
+    float gll2[4][4];
+    gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
+    const float d2 = -(gll2[0][0] + 2.0f*gll2[0][3]*Omega + gll2[3][3]*Omega*Omega);
+    if (!(d2 > 0.0f)) return 1.0f;
+    // Avoid sign-flip seams from tiny interpolation errors around dv≈0.
+    const float dv = abs(1.0f - Omega*b_ip);
+    if (dv < 1e-8f) return 20.0f;
+    const float red = sqrt(d2) / dv;
+    if (!isfinite(red)) return 1.0f;
+    return clamp(red, 0.0f, 20.0f);
 }
 
 // ── Colour helpers ────────────────────────────────────────────
@@ -975,7 +1020,7 @@ static uint32_t disk_color_abgr(float r_hit, float redshift, float magnif,
     const float red = clamp(redshift, 0.0f, 20.0f);
     const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
     float I = page_thorne_norm(r_hit, r_isco);
-    I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+    I *= doppler_intensity_scale(red);
     I *= clamp(1.0f / max(magnif, 1e-12f), 0.05f, 5.0f);
     const float4 bb = blackbody_rgb(T);
     const float rr = tonemap_ch(bb.r * I, 1.0f, 2.2f);
@@ -1019,7 +1064,7 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
     float pUt   = 1.0f;
     float pUr   = -ca*cb / max(sqrt_grr, 1e-14f);
     float pUth  = -sb    / max(sqrt_gthth, 1e-14f);
-    float pUphi = sa*cb / sqrt(max(abs(gphph), 1e-14f));
+    float pUphi = -sa*cb / sqrt(max(abs(gphph), 1e-14f));
 
     const bool tetrad_ok =
         (gtt < -1e-14f) &&
@@ -1032,7 +1077,7 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
         const float ephi_t = -gtphi/gtt * ephi_p;
         const float n_r  = -ca * cb;
         const float n_th = -sb;
-        const float n_ph = sa * cb;
+        const float n_ph = -sa * cb;
         pUt   = ut + n_ph * ephi_t;
         pUr   = n_r  / sqrt_grr;
         pUth  = n_th / sqrt_gthth;
@@ -1111,14 +1156,7 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
                 const float r_hit = interp_scalar_mode_f(
                     prev_r, r, dr0, dr1, step_used, alpha, intersection_mode);
                 if (r_hit >= r_isco && r_hit <= r_disk_out) {
-                    const float Omega = keplerian_omega(r_hit, M, a, Q, L);
-                    const float b_ip  = -pphi / (-pt);
-                    float gll2[4][4];
-                    gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
-                    const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
-                    const float dv = 1.0f - Omega*b_ip;
-                    float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
-                    red = clamp(red, 0.0f, 20.0f);
+                    const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
 
                     res.r_hit = r_hit;
                     res.redshift = red;
@@ -1178,6 +1216,253 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
     return res;
 }
 
+static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
+                                                      float M, float a, float Q, float L,
+                                                      float r_obs, float theta_obs, float phi_obs,
+                                                      float r_horizon, float r_isco, float r_disk_out,
+                                                      int intersection_mode) {
+    RayTraceResultBL res{};
+    res.outcome = 2;
+    res.r_hit = 0.0f;
+    res.redshift = 1.0f;
+    res.theta_esc = theta_obs;
+    res.phi_esc = phi_obs;
+    res.phi_hit = phi_obs;
+
+    float gll[4][4];
+    gLL_BL(r_obs, theta_obs, M, a, Q, L, gll);
+
+    float gu[4][4];
+    gUU(r_obs, theta_obs, M, a, Q, L, gu);
+
+    const float ca = cos(alpha), sa = sin(alpha);
+    const float cb = cos(beta),  sb = sin(beta);
+
+    const float gtt   = gll[0][0];
+    const float gtphi = gll[0][3];
+    const float grr   = gll[1][1];
+    const float gthth = gll[2][2];
+    const float gphph = gll[3][3];
+
+    const float sqrt_grr   = sqrt(abs(grr));
+    const float sqrt_gthth = sqrt(abs(gthth));
+    const float denom_phi  = gphph - (gtphi*gtphi)/gtt;
+
+    float pUt   = 1.0f;
+    float pUr   = -ca*cb / max(sqrt_grr, 1e-14f);
+    float pUth  = -sb    / max(sqrt_gthth, 1e-14f);
+    float pUphi = -sa*cb / sqrt(max(abs(gphph), 1e-14f));
+
+    const bool tetrad_ok =
+        (gtt < -1e-14f) &&
+        isfinite(denom_phi) && (denom_phi > 1e-14f) &&
+        isfinite(sqrt_grr)  && (sqrt_grr  > 1e-14f) &&
+        isfinite(sqrt_gthth)&& (sqrt_gthth> 1e-14f);
+    if (tetrad_ok) {
+        const float ut     = 1.0f / sqrt(-gtt);
+        const float ephi_p = 1.0f / sqrt(denom_phi);
+        const float ephi_t = -gtphi/gtt * ephi_p;
+        const float n_r  = -ca * cb;
+        const float n_th = -sb;
+        const float n_ph = -sa * cb;
+        pUt   = ut + n_ph * ephi_t;
+        pUr   = n_r  / sqrt_grr;
+        pUth  = n_th / sqrt_gthth;
+        pUphi = n_ph * ephi_p;
+    }
+
+    float pt   = gtt* pUt + gtphi*pUphi;
+    float pr   = grr* pUr;
+    float pth  = gthth*pUth;
+    float pphi = gtphi*pUt + gphph*pUphi;
+
+    const float A = gu[0][0];
+    const float B = 2.0f * gu[0][3] * pphi;
+    const float C = gu[1][1]*pr*pr + gu[2][2]*pth*pth + gu[3][3]*pphi*pphi;
+    const float disc = B*B - 4.0f*A*C;
+    if (disc >= 0.0f && abs(A) > 1e-15f) {
+        const float sq  = sqrt(disc);
+        const float pt1 = (-B - sq)/(2.0f*A);
+        const float pt2 = (-B + sq)/(2.0f*A);
+        pt = (pt1 < 0.0f) ? pt1 : pt2;
+        if (pt > 0.0f) pt = min(pt1, pt2);
+    }
+
+    float X, Y, Z;
+    BL_to_KS_spatial(r_obs, theta_obs, phi_obs, a, X, Y, Z);
+    float pX, pY, pZ;
+    bool ks_ok = BL_covector_to_KS(r_obs, theta_obs, phi_obs, a, pr, pth, pphi, pX, pY, pZ);
+    float pT = pt;
+
+    if (ks_ok) {
+        float gu_ks[4][4];
+        gUU_KS(X, Y, Z, M, a, Q, gu_ks);
+        const float Aks = gu_ks[0][0];
+        const float Bks = 2.0f * (gu_ks[0][1]*pX + gu_ks[0][2]*pY + gu_ks[0][3]*pZ);
+        const float Cks = gu_ks[1][1]*pX*pX + gu_ks[2][2]*pY*pY + gu_ks[3][3]*pZ*pZ
+                        + 2.0f*gu_ks[1][2]*pX*pY + 2.0f*gu_ks[1][3]*pX*pZ + 2.0f*gu_ks[2][3]*pY*pZ;
+        const float dks = Bks*Bks - 4.0f*Aks*Cks;
+        if (dks >= 0.0f && abs(Aks) > 1e-12f) {
+            const float sq = sqrt(dks);
+            const float pT1 = (-Bks - sq) / (2.0f*Aks);
+            const float pT2 = (-Bks + sq) / (2.0f*Aks);
+            pT = (pT1 < 0.0f) ? pT1 : pT2;
+            if (pT > 0.0f) pT = min(pT1, pT2);
+            ks_ok = isfinite(pT);
+        } else {
+            ks_ok = false;
+        }
+    }
+    if (!ks_ok) return res;
+
+    float dlam_ks = 1.0f;
+    float prevX = X, prevY = Y, prevZ = Z;
+    float prevPX = pX, prevPY = pY, prevPZ = pZ;
+    float prev_r_ks = r_obs;
+    const float rh_cut = r_horizon * 1.03f;
+    const float r_escape = r_obs * 1.05f;
+
+    for (int iter = 0; iter < 60000; ++iter) {
+        const float step_used_ks = dlam_ks;
+        float X_h = X, Y_h = Y, Z_h = Z, pX_h = pX, pY_h = pY, pZ_h = pZ;
+        rk4_KS(X_h, Y_h, Z_h, pX_h, pY_h, pZ_h, pT, M, a, Q, step_used_ks);
+
+        float X_f = X, Y_f = Y, Z_f = Z, pX_f = pX, pY_f = pY, pZ_f = pZ;
+        rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used_ks*0.5f);
+        rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used_ks*0.5f);
+
+        const float err = sqrt(
+            (X_h-X_f)*(X_h-X_f) + (Y_h-Y_f)*(Y_h-Y_f) + (Z_h-Z_f)*(Z_h-Z_f) +
+            (pX_h-pX_f)*(pX_h-pX_f) + (pY_h-pY_f)*(pY_h-pY_f) + (pZ_h-pZ_f)*(pZ_h-pZ_f)
+        ) / 15.0f;
+        const float tol = 2e-5f;
+        if (err < tol || dlam_ks < 1e-6f) {
+            X = X_f; Y = Y_f; Z = Z_f; pX = pX_f; pY = pY_f; pZ = pZ_f;
+            const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
+            dlam_ks = clamp(dlam_ks*sc, 1e-6f, 50.0f);
+        } else {
+            dlam_ks = clamp(dlam_ks*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam_ks*0.5f);
+            continue;
+        }
+
+        if (!(isfinite(X) && isfinite(Y) && isfinite(Z) &&
+              isfinite(pX) && isfinite(pY) && isfinite(pZ))) {
+            return res;
+        }
+
+        const float r_now = r_KS(X, Y, Z, a);
+        float best_alpha = 2.0f;
+        int best_event = 0; // 0 none, 1 disk, 2 horizon, 3 escape
+
+        {
+            const bool maybe_eq_ks = sign_change_f(prevZ, Z) ||
+                                     (intersection_mode != 0 && min(abs(prevZ), abs(Z)) < 0.35f);
+            float alpha_evt = 0.0f;
+            bool hit_event = false;
+
+            float dX0=0.0f, dY0=0.0f, dZ0=0.0f, dpX0=0.0f, dpY0=0.0f, dpZ0=0.0f;
+            float dX1=0.0f, dY1=0.0f, dZ1=0.0f, dpX1=0.0f, dpY1=0.0f, dpZ1=0.0f;
+            if (maybe_eq_ks) {
+                geodesic_rhs_KS(prevX, prevY, prevZ, pT, prevPX, prevPY, prevPZ,
+                                M, a, Q, dX0,dY0,dZ0,dpX0,dpY0,dpZ0);
+                geodesic_rhs_KS(X, Y, Z, pT, pX, pY, pZ,
+                                M, a, Q, dX1,dY1,dZ1,dpX1,dpY1,dpZ1);
+                hit_event = first_event_alpha_mode_f(
+                    prevZ, Z, dZ0, dZ1, step_used_ks, 0.0f,
+                    intersection_mode, alpha_evt);
+            }
+
+            if (hit_event) {
+                const float Xh = interp_scalar_mode_f(prevX, X, dX0, dX1, step_used_ks, alpha_evt, intersection_mode);
+                const float Yh = interp_scalar_mode_f(prevY, Y, dY0, dY1, step_used_ks, alpha_evt, intersection_mode);
+                const float Zh = interp_scalar_mode_f(prevZ, Z, dZ0, dZ1, step_used_ks, alpha_evt, intersection_mode);
+                const float pXh = interp_scalar_mode_f(prevPX, pX, dpX0, dpX1, step_used_ks, alpha_evt, intersection_mode);
+                const float pYh = interp_scalar_mode_f(prevPY, pY, dpY0, dpY1, step_used_ks, alpha_evt, intersection_mode);
+                const float pZh = interp_scalar_mode_f(prevPZ, pZ, dpZ0, dpZ1, step_used_ks, alpha_evt, intersection_mode);
+                float r_hit, th_hit, ph_hit;
+                KS_to_BL_spatial(Xh, Yh, Zh, a, r_hit, th_hit, ph_hit);
+                if (r_hit >= r_isco && r_hit <= r_disk_out) {
+                    float pr_hit, pth_hit, pphi_hit;
+                    KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
+                                      pr_hit, pth_hit, pphi_hit);
+                    const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
+
+                    res.r_hit = r_hit;
+                    res.redshift = red;
+                    res.phi_hit = ph_hit;
+                    best_alpha = alpha_evt;
+                    best_event = 1;
+                }
+            }
+        }
+
+        const bool horizon_cross = ((prev_r_ks > rh_cut) && (r_now <= rh_cut)) || (r_now <= rh_cut);
+        if (horizon_cross) {
+            const float denom_h = prev_r_ks - r_now;
+            float alpha_h = (abs(denom_h) > 1e-8f) ? ((prev_r_ks - rh_cut) / denom_h) : 0.0f;
+            alpha_h = clamp(alpha_h, 0.0f, 1.0f);
+            if (alpha_h < best_alpha) {
+                best_alpha = alpha_h;
+                best_event = 2;
+            }
+        }
+
+        const bool escape_cross = ((prev_r_ks < r_escape) && (r_now >= r_escape)) || (r_now >= r_escape);
+        if (escape_cross) {
+            const float denom_e = r_now - prev_r_ks;
+            float alpha_e = (abs(denom_e) > 1e-8f) ? ((r_escape - prev_r_ks) / denom_e) : 1.0f;
+            alpha_e = clamp(alpha_e, 0.0f, 1.0f);
+            if (alpha_e < best_alpha) {
+                best_alpha = alpha_e;
+                best_event = 3;
+            }
+        }
+
+        if (best_event == 1) {
+            res.outcome = 1;
+            return res;
+        }
+        if (best_event == 2) {
+            res.outcome = 2;
+            return res;
+        }
+        if (best_event == 3) {
+            const float X_esc = prevX + best_alpha*(X - prevX);
+            const float Y_esc = prevY + best_alpha*(Y - prevY);
+            const float Z_esc = prevZ + best_alpha*(Z - prevZ);
+            float r_esc, th_esc, ph_esc;
+            KS_to_BL_spatial(X_esc, Y_esc, Z_esc, a, r_esc, th_esc, ph_esc);
+            res.outcome = 0;
+            res.theta_esc = th_esc;
+            res.phi_esc = ph_esc;
+            return res;
+        }
+
+        prevX = X; prevY = Y; prevZ = Z;
+        prevPX = pX; prevPY = pY; prevPZ = pZ;
+        prev_r_ks = r_now;
+    }
+
+    return res;
+}
+
+static RayTraceResultBL trace_standard_chart_from_angles(float alpha, float beta,
+                                                         float M, float a, float Q, float L,
+                                                         float r_obs, float theta_obs, float phi_obs,
+                                                         float r_horizon, float r_isco, float r_disk_out,
+                                                         int chart, int intersection_mode) {
+    if (chart == 1 && abs(L) <= 1e-8f) {
+        return trace_standard_ks_from_angles(alpha, beta, M, a, Q, L,
+                                             r_obs, theta_obs, phi_obs,
+                                             r_horizon, r_isco, r_disk_out,
+                                             intersection_mode);
+    }
+    return trace_standard_bl_from_angles(alpha, beta, M, a, Q, L,
+                                         r_obs, theta_obs, phi_obs,
+                                         r_horizon, r_isco, r_disk_out,
+                                         intersection_mode);
+}
+
 // ── Main compute implementation (shared by all entry kernels) ─
 static inline void trace_pixel_impl(
     device uint32_t*   output,
@@ -1204,13 +1489,15 @@ static inline void trace_pixel_impl(
     const float alpha = cp.fov_h*(float(px) - 0.5f*(width-1))  / float(span);
     const float beta  = cp.fov_h*(0.5f*(height-1) - float(py)) / float(span);
 
-    // ── Ray-bundle mode (GPU native, BL + standard solver) ───
-    if (cp.use_bundles != 0 && cp.chart == 0 && cp.solver_mode == 0) {
+    // ── Ray-bundle mode (GPU native, standard solver; BL and KS) ─
+    const bool bundle_chart_ok = (cp.chart == 0) || (cp.chart == 1 && abs(L) <= 1e-8f);
+    if (cp.use_bundles != 0 && cp.solver_mode == 0 && bundle_chart_ok) {
         uint32_t colour = 0xFF000000u;
-        const RayTraceResultBL c = trace_standard_bl_from_angles(
+        const RayTraceResultBL c = trace_standard_chart_from_angles(
             alpha, beta, M, a, Q, L,
             cp.r_obs, cp.theta_obs, cp.phi_obs,
-            kp.r_horizon, kp.r_isco, kp.r_disk_out, cp.intersection_mode);
+            kp.r_horizon, kp.r_isco, kp.r_disk_out,
+            cp.chart, cp.intersection_mode);
 
         if (c.outcome == 0) {
             const float4 bgc = clamp(sample_background(bg_tex, bg_samp, c.theta_esc, c.phi_esc), 0.0f, 1.0f);
@@ -1223,22 +1510,26 @@ static inline void trace_pixel_impl(
             float magnif = 1.0f;
             const float eps = cp.fov_h / float(max(cp.width, 1)) * 0.5f;
             if (eps > 1e-8f) {
-                const RayTraceResultBL ap = trace_standard_bl_from_angles(
+                const RayTraceResultBL ap = trace_standard_chart_from_angles(
                     alpha + eps, beta, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
-                    kp.r_horizon, kp.r_isco, kp.r_disk_out, cp.intersection_mode);
-                const RayTraceResultBL am = trace_standard_bl_from_angles(
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out,
+                    cp.chart, cp.intersection_mode);
+                const RayTraceResultBL am = trace_standard_chart_from_angles(
                     alpha - eps, beta, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
-                    kp.r_horizon, kp.r_isco, kp.r_disk_out, cp.intersection_mode);
-                const RayTraceResultBL bp = trace_standard_bl_from_angles(
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out,
+                    cp.chart, cp.intersection_mode);
+                const RayTraceResultBL bp = trace_standard_chart_from_angles(
                     alpha, beta + eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
-                    kp.r_horizon, kp.r_isco, kp.r_disk_out, cp.intersection_mode);
-                const RayTraceResultBL bm = trace_standard_bl_from_angles(
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out,
+                    cp.chart, cp.intersection_mode);
+                const RayTraceResultBL bm = trace_standard_chart_from_angles(
                     alpha, beta - eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
-                    kp.r_horizon, kp.r_isco, kp.r_disk_out, cp.intersection_mode);
+                    kp.r_horizon, kp.r_isco, kp.r_disk_out,
+                    cp.chart, cp.intersection_mode);
 
                 if (ap.outcome == 1 && am.outcome == 1 && bp.outcome == 1 && bm.outcome == 1) {
                     const float dr_da = (ap.r_hit - am.r_hit) / (2.0f * eps);
@@ -1285,7 +1576,7 @@ static inline void trace_pixel_impl(
     float pUt   = 1.0f;
     float pUr   = -ca*cb / max(sqrt_grr, 1e-14f);
     float pUth  = -sb    / max(sqrt_gthth, 1e-14f);
-    float pUphi = sa*cb / sqrt(max(abs(gphph), 1e-14f));
+    float pUphi = -sa*cb / sqrt(max(abs(gphph), 1e-14f));
 
     const bool tetrad_ok =
         (gtt < -1e-14f) &&
@@ -1298,7 +1589,7 @@ static inline void trace_pixel_impl(
         const float ephi_t = -gtphi/gtt * ephi_p;
         const float n_r  = -ca * cb;
         const float n_th = -sb;
-        const float n_ph = sa * cb;
+        const float n_ph = -sa * cb;
         pUt   = ut + n_ph * ephi_t;
         pUr   = n_r  / sqrt_grr;
         pUth  = n_th / sqrt_gthth;
@@ -1332,11 +1623,15 @@ static inline void trace_pixel_impl(
     float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
-    const bool can_bl_separable = (cp.chart == 0) && (abs(Q) <= 1e-8f) && (abs(L) <= 1e-8f);
-    bool semi_fallback_from_elliptic = false;
+    const bool can_separable_kerr = (abs(Q) <= 1e-8f) && (abs(L) <= 1e-8f);
+    const bool can_bl_separable = (cp.chart == 0) && can_separable_kerr;
 
-    // ── Elliptic-closed path (BL only, per-ray fallback) ─────
-    if (cp.solver_mode == 2 && can_bl_separable) {
+    // ── Elliptic-closed path (Kerr, per-ray fallback) ────────
+    if (cp.solver_mode == 2 && !can_separable_kerr && cp.elliptic_fallback_black != 0) {
+        output[py * width + px] = colour;
+        return;
+    }
+    if (cp.solver_mode == 2 && can_separable_kerr) {
         SeparableConsts sc{};
         sc.M = M;
         sc.a = a;
@@ -1360,18 +1655,11 @@ static inline void trace_pixel_impl(
             return;
         }
         if (eout == 2) {
-            const float Omega = keplerian_omega(r_hit_ell, M, a, Q, L);
-            const float b_ip  = -pphi / (-pt);
-            float gll2[4][4];
-            gLL_BL(r_hit_ell, M_PI_2_F, M, a, Q, L, gll2);
-            const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
-            const float dv = 1.0f - Omega*b_ip;
-            float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
-            red = clamp(red, 0.0f, 20.0f);
+            const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L);
 
             const float T = 6500.0f * sqrt(6.0f*M/r_hit_ell) * clamp(red, 0.2f, 5.0f);
             float I = page_thorne_norm(r_hit_ell, kp.r_isco);
-            I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+            I *= doppler_intensity_scale(red);
             float4 bb = blackbody_rgb(T);
             float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
                               tonemap_ch(bb.g * I, 1.0f, 2.2f),
@@ -1385,13 +1673,17 @@ static inline void trace_pixel_impl(
             return;
         }
 
-        // Inconclusive for this ray: continue with semi-analytic fallback.
-        semi_fallback_from_elliptic = true;
+        // Inconclusive for this ray: optionally force black, otherwise continue on
+        // the chart-native standard integrator path.
+        if (cp.elliptic_fallback_black != 0) {
+            output[py * width + px] = colour;
+            return;
+        }
     }
 
     // ── Separable Kerr semi-analytic path (BL only) ──────────
     const bool want_semi_analytic =
-        (cp.solver_mode == 1 || semi_fallback_from_elliptic) &&
+        (cp.solver_mode == 1) &&
         can_bl_separable;
     if (want_semi_analytic) {
         SeparableConsts sc{};
@@ -1494,18 +1786,11 @@ static inline void trace_pixel_impl(
                         const float r_hit = hermite_interp_f(
                             s_prev.r, s.r, dr_prev, dr_now, step_used, alpha);
                         if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
-                            const float Omega = keplerian_omega(r_hit, M, a, Q, L);
-                            const float b_ip  = -pphi / (-pt);
-                            float gll2[4][4];
-                            gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
-                            const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
-                            const float dv = 1.0f - Omega*b_ip;
-                            float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
-                            red = clamp(red, 0.0f, 20.0f);
+                            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
 
                             const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
                             float I = page_thorne_norm(r_hit, kp.r_isco);
-                            I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+                            I *= doppler_intensity_scale(red);
                             float4 bb = blackbody_rgb(T);
                             float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
                                               tonemap_ch(bb.g * I, 1.0f, 2.2f),
@@ -1635,18 +1920,11 @@ static inline void trace_pixel_impl(
                             float pr_hit, pth_hit, pphi_hit;
                             KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                               pr_hit, pth_hit, pphi_hit);
-                            const float Omega = keplerian_omega(r_hit, M, a, Q, L);
-                            const float b_ip  = -pphi_hit / (-pT);
-                            float gll2[4][4];
-                            gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
-                            const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
-                            const float dv = 1.0f - Omega*b_ip;
-                            float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
-                            red = clamp(red, 0.0f, 20.0f);
+                            const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
 
                             const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
                             float I = page_thorne_norm(r_hit, kp.r_isco);
-                            I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+                            I *= doppler_intensity_scale(red);
                             float4 bb = blackbody_rgb(T);
                             float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
                                               tonemap_ch(bb.g * I, 1.0f, 2.2f),
@@ -1767,14 +2045,7 @@ static inline void trace_pixel_impl(
             }
 
             // Disk hit
-            const float Omega = keplerian_omega(r_hit, M, a, Q, L);
-            const float b_ip  = -pphi / (-pt);
-            float gll2[4][4];
-            gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
-            const float d2 = -(gll2[0][0]+2.0f*gll2[0][3]*Omega+gll2[3][3]*Omega*Omega);
-            const float dv = 1.0f - Omega*b_ip;
-            float red = (d2 > 0.0f && abs(dv) > 1e-8f) ? sqrt(d2)/dv : 1.0f;
-            red = clamp(red, 0.0f, 20.0f);
+            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
 
             // Match CPU disk_colour():
             //   T = 6500 * sqrt(6M/r) * clamp(red,0.2,5)
@@ -1782,7 +2053,7 @@ static inline void trace_pixel_impl(
             //   output = tonemap(blackbody(T) * I, exposure=1, gamma=2.2)
             const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
             float I = page_thorne_norm(r_hit, kp.r_isco);
-            I *= pow(clamp(red, 0.1f, 10.0f), 4.0f);
+            I *= doppler_intensity_scale(red);
             float4 bb = blackbody_rgb(T);
             float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
                               tonemap_ch(bb.g * I, 1.0f, 2.2f),
@@ -1843,8 +2114,8 @@ kernel void trace_pixel_bundle(
 {
     CameraParams local = cp;
     local.use_bundles = 1;
-    // Bundle GPU path currently targets BL + standard solver.
-    local.chart = 0;
+    // Bundle GPU path uses the requested chart when supported.
     local.solver_mode = 0;
+    if (local.chart == 1 && abs(kp.Lambda) > 1e-8f) local.chart = 0;
     trace_pixel_impl(output, kp, local, rp, bg_tex, bg_samp, gid);
 }

@@ -74,13 +74,13 @@ bool test_dopri5_adaptive_step_preserves_null() {
     return step_and_check(Integrator::DOPRI5);
 }
 
-bool test_keplerian_omega_follows_spin_sign() {
+bool test_keplerian_omega_matches_screen_convention() {
     const double r = 8.0;
     KNdSMetric gp(1.0, 0.5, 0.0, 0.0);
     KNdSMetric gn(1.0, -0.5, 0.0, 0.0);
     const double op = gp.keplerian_omega(r);
     const double on = gn.keplerian_omega(r);
-    return op > 0.0 && on < 0.0 && approx(std::abs(op), std::abs(on), 1e-14);
+    return op < 0.0 && on > 0.0 && approx(std::abs(op), std::abs(on), 1e-14);
 }
 
 bool test_ks_radius_recovery() {
@@ -104,7 +104,7 @@ int main() {
         {"camera ray is null and future-directed", test_camera_ray_is_null_and_future_directed},
         {"RK4 adaptive step preserves null residual", test_rk4_adaptive_step_preserves_null},
         {"DOPRI5 adaptive step preserves null residual", test_dopri5_adaptive_step_preserves_null},
-        {"keplerian omega follows spin sign", test_keplerian_omega_follows_spin_sign},
+        {"keplerian omega matches screen convention", test_keplerian_omega_matches_screen_convention},
         {"KS radius recovery", test_ks_radius_recovery},
     };
 

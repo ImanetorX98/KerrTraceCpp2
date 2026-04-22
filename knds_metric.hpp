@@ -352,9 +352,9 @@ public:
     //  For KNdS: Ω_K = [M − Q²/(2r) + Λar²/3] / [r^{3/2} + a·√(M − Q²/(2r))]
     //  (reduces to standard Kerr formula for Q=Λ=0)
     double keplerian_omega(double r) const {
-        // Tie disk orbital direction to BH spin sign:
-        // a > 0 -> Ω > 0, a < 0 -> Ω < 0.
-        const double s = (a < 0.0) ? -1.0 : 1.0;
+        // Screen/sign convention used in this renderer:
+        // keep observed approaching side consistent with +a on the left.
+        const double s = (a < 0.0) ? 1.0 : -1.0;
         const double Meff = M - Q*Q/(2.0*r) + Lambda*a*r*r/3.0;
         const double sq   = std::sqrt(std::max(Meff, 0.0));
         const double den  = r*std::sqrt(r) + s*a*sq;

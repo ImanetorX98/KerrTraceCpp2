@@ -34,7 +34,7 @@ export class App implements OnInit, OnDestroy {
     a: 0.998,
     q: 0.0,
     lambda: 0.0,
-    disk_out: 25,
+    disk_out: 12,
     theta: 80,
     phi: 0,
     r_obs: 30,
@@ -60,8 +60,8 @@ export class App implements OnInit, OnDestroy {
     anim_phi_end: 360,
     anim_r_start: 30,
     anim_r_end: 30,
-    anim_disk_start: 25,
-    anim_disk_end: 25,
+    anim_disk_start: 12,
+    anim_disk_end: 12,
   };
 
   // ── State signals ─────────────────────────────────────────────

@@ -199,63 +199,85 @@ std::vector<uint32_t> metal_render(
     }
 
     MTLSize tg = MTLSizeMake(16, 16, 1);
+
+    // Build an explicit tile list, then split failed tiles.
+    // This guarantees full image coverage even when retries shrink tile size.
+    struct Tile {
+        int x;
+        int y;
+        int w;
+        int h;
+    };
+    std::vector<Tile> tiles;
+    tiles.reserve(((cp.width + tile_cols - 1) / tile_cols) *
+                  ((cp.height + tile_rows - 1) / tile_rows));
     for (int y0 = 0; y0 < cp.height; y0 += tile_rows) {
-        const int base_rows = std::min(tile_rows, cp.height - y0);
-        for (int x0 = 0; x0 < cp.width;) {
-            int try_rows = base_rows;
-            int try_cols = std::min(tile_cols, cp.width - x0);
-            std::string last_error;
-            bool submitted = false;
-
-            while (!submitted) {
-                const RenderParams_C rp{
-                    (uint32_t)cp.width, (uint32_t)cp.height,
-                    (uint32_t)x0, (uint32_t)try_cols,
-                    (uint32_t)y0, (uint32_t)try_rows
-                };
-                id<MTLBuffer> rpBuf = [device
-                    newBufferWithBytes:&rp
-                    length:sizeof(rp)
-                    options:MTLResourceStorageModeShared];
-
-                id<MTLCommandBuffer> cmd = [queue commandBuffer];
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                [enc setComputePipelineState:pso];
-                [enc setBuffer:outBuf  offset:0 atIndex:0];
-                [enc setBuffer:kpBuf   offset:0 atIndex:1];
-                [enc setBuffer:cpBuf   offset:0 atIndex:2];
-                [enc setBuffer:rpBuf   offset:0 atIndex:3];
-                [enc setTexture:bgTex atIndex:0];
-                [enc setSamplerState:bgSamp atIndex:0];
-
-                MTLSize grid = MTLSizeMake(
-                    ((NSUInteger)try_cols + 15) / 16 * 16,
-                    ((NSUInteger)try_rows + 15) / 16 * 16,
-                    1);
-                [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-                [enc endEncoding];
-                [cmd commit];
-                [cmd waitUntilCompleted];
-
-                if (cmd.status == MTLCommandBufferStatusCompleted) {
-                    submitted = true;
-                    x0 += try_cols;
-                } else {
-                    NSString* why = cmd.error ? cmd.error.localizedDescription : @"unknown Metal failure";
-                    last_error = [why UTF8String];
-
-                    if (try_rows > 1) {
-                        try_rows = std::max(1, try_rows / 2);
-                        continue;
-                    }
-                    if (try_cols > 16) {
-                        try_cols = std::max(16, try_cols / 2);
-                        continue;
-                    }
-                    throw std::runtime_error("Metal command failed: " + last_error);
-                }
-            }
+        const int h = std::min(tile_rows, cp.height - y0);
+        for (int x0 = 0; x0 < cp.width; x0 += tile_cols) {
+            const int w = std::min(tile_cols, cp.width - x0);
+            tiles.push_back(Tile{x0, y0, w, h});
         }
+    }
+
+    for (size_t i = 0; i < tiles.size();) {
+        const Tile t = tiles[i];
+        const RenderParams_C rp{
+            (uint32_t)cp.width, (uint32_t)cp.height,
+            (uint32_t)t.x, (uint32_t)t.w,
+            (uint32_t)t.y, (uint32_t)t.h
+        };
+        id<MTLBuffer> rpBuf = [device
+            newBufferWithBytes:&rp
+            length:sizeof(rp)
+            options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:outBuf  offset:0 atIndex:0];
+        [enc setBuffer:kpBuf   offset:0 atIndex:1];
+        [enc setBuffer:cpBuf   offset:0 atIndex:2];
+        [enc setBuffer:rpBuf   offset:0 atIndex:3];
+        [enc setTexture:bgTex atIndex:0];
+        [enc setSamplerState:bgSamp atIndex:0];
+
+        MTLSize grid = MTLSizeMake(
+            ((NSUInteger)t.w + 15) / 16 * 16,
+            ((NSUInteger)t.h + 15) / 16 * 16,
+            1);
+        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.status == MTLCommandBufferStatusCompleted) {
+            ++i;
+            continue;
+        }
+
+        NSString* why = cmd.error ? cmd.error.localizedDescription : @"unknown Metal failure";
+        const std::string last_error = [why UTF8String];
+
+        if (t.h > 1) {
+            const int h0 = t.h / 2;
+            const int h1 = t.h - h0;
+            tiles[i] = Tile{t.x, t.y, t.w, h0};
+            tiles.insert(tiles.begin() + static_cast<std::ptrdiff_t>(i + 1),
+                         Tile{t.x, t.y + h0, t.w, h1});
+            continue;
+        }
+        if (t.w > 16) {
+            const int w0 = std::max(16, t.w / 2);
+            const int w1 = t.w - w0;
+            tiles[i] = Tile{t.x, t.y, w0, t.h};
+            if (w1 > 0) {
+                tiles.insert(tiles.begin() + static_cast<std::ptrdiff_t>(i + 1),
+                             Tile{t.x + w0, t.y, w1, t.h});
+            }
+            continue;
+        }
+
+        throw std::runtime_error("Metal command failed: " + last_error);
     }
 
     // ── Copy result ───────────────────────────────────────────

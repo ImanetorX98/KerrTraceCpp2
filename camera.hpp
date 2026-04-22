@@ -90,8 +90,9 @@ public:
         double pUt = 1.0;
         double pUr = -ca*cb / std::max(sqrt_grr, 1e-14);
         double pUth= -sb    / std::max(sqrt_gthth, 1e-14);
-        // Standard screen-to-azimuth orientation: +alpha points toward +phi.
-        double pUphi = sa*cb / std::sqrt(std::max(std::abs(gphph), 1e-14));
+        // Screen convention used by the UI/reference shots:
+        // +alpha maps toward -phi (horizontal mirror of the previous convention).
+        double pUphi = -sa*cb / std::sqrt(std::max(std::abs(gphph), 1e-14));
 
         if (tetrad_ok) {
             const double ut     = 1.0 / std::sqrt(-gtt);
@@ -100,7 +101,7 @@ public:
 
             const double n_r  = -ca * cb;
             const double n_th = -sb;
-            const double n_ph = sa * cb;
+            const double n_ph = -sa * cb;
 
             pUt   = ut + n_ph * ephi_t;
             pUr   = n_r  / sqrt_grr;

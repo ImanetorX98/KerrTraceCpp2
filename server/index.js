@@ -48,6 +48,9 @@ const RESOLUTIONS = {
   '4K':    { w: 3840, h: 2160 },
 };
 
+const DEFAULT_R_OBS = 30;
+const DEFAULT_DISK_OUT = 12;
+
 app.use(cors());
 app.use(express.json());
 app.use('/renders', express.static(OUT_DIR));
@@ -197,11 +200,13 @@ app.post('/api/render', (req, res) => {
   args.push('--solver-mode', solverMode);
   if (p.integration_chart === 'bl') args.push('--bl');
   else args.push('--ks');
+  // Keep disk-ray intersection on Hermite by default for smoother event localization.
+  args.push('--intersection-hermite');
 
   if (p.a      !== undefined) args.push('--a',       String(p.a));
-  if (p.disk_out !== undefined) args.push('--disk-out', String(p.disk_out));
+  args.push('--disk-out', String(p.disk_out !== undefined ? p.disk_out : DEFAULT_DISK_OUT));
   if (p.theta  !== undefined) args.push('--theta',   String(p.theta));
-  if (p.r_obs  !== undefined) args.push('--r-obs',   String(p.r_obs));
+  args.push('--r-obs', String(p.r_obs !== undefined ? p.r_obs : DEFAULT_R_OBS));
   if (p.q      !== undefined && p.q  !== 0) args.push('--charge', String(p.q));
   if (p.lambda !== undefined && p.lambda !== 0) args.push('--lambda', String(p.lambda));
   if (p.fov    !== undefined && p.fov !== 30) args.push('--fov', String(p.fov));

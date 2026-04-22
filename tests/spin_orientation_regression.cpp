@@ -87,6 +87,7 @@ bool render_geo(const std::string& tracer_bin,
         << " --geo-only"
         << " --geo-file \"" << geo_path.string() << "\""
         << " --custom-res 320 180"
+        << " --solver-mode standard"
         << " --ks"
         << " --a " << a_spin
         << " --theta 80"
@@ -223,8 +224,8 @@ int main(int argc, char** argv) {
     const auto geo_pos = tmp / "kerrtrace_spin_pos.kgeo";
     const auto geo_neg = tmp / "kerrtrace_spin_neg.kgeo";
 
-    const bool ok_pos = check_case(tracer_bin, +0.5, false, true, geo_pos);
-    const bool ok_neg = check_case(tracer_bin, -0.5, true, false, geo_neg);
+    const bool ok_pos = check_case(tracer_bin, +0.5, false, false, geo_pos);
+    const bool ok_neg = check_case(tracer_bin, -0.5, true, true, geo_neg);
 
     std::error_code ec;
     std::filesystem::remove(geo_pos, ec);
