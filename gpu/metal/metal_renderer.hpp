@@ -22,10 +22,12 @@ struct CameraParams_C {
     int   width, height;
     int   chart; // 0 = BL, 1 = KS
     int   solver_mode; // 0 = standard, 1 = semi-analytic, 2 = elliptic-closed
+    int   integrator_mode; // 0 = RK4-doubling, 1 = DOPRI5
     int   use_bundles; // 0 = single ray, 1 = ray-bundle (GPU finite-difference bundle)
     int   metal_kernel_mode; // 0 = auto, 1 = unified(legacy), 2 = single, 3 = bundle
     int   intersection_mode; // 0 = linear, 1 = hermite
     int   elliptic_fallback_black; // 0 = normal fallback, 1 = fallback pixels forced to black
+    int   anti_fireflies; // 0 = off, 1 = robust anti-fireflies filter (ray-bundle path)
 };
 
 /// Renders the image on the default Metal GPU device.

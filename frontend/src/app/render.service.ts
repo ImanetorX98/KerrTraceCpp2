@@ -20,6 +20,7 @@ export interface RenderParams {
   solver_mode: 'standard' | 'semi_analytic' | 'elliptic_closed';
   semi_analytic: boolean;
   bundles: boolean;
+  anti_fireflies: boolean;
   dopri5: boolean;
   background: string;
   // Animation

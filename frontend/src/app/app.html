@@ -154,6 +154,10 @@
           <label>Ray bundles</label>
           <button class="switch" [class.on]="params.bundles"></button>
         </div>
+        <div class="switch-row" (click)="params.anti_fireflies = !params.anti_fireflies">
+          <label>Anti-fireflies (bundle)</label>
+          <button class="switch" [class.on]="params.anti_fireflies"></button>
+        </div>
         <div class="switch-row" (click)="params.dopri5 = !params.dopri5">
           <label>DOPRI5 integrator</label>
           <button class="switch" [class.on]="params.dopri5"></button>

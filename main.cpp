@@ -75,7 +75,7 @@ struct ColorParams {
 // ── Per-pixel geodesic result (Phase 1 output) ───────────────
 struct GeoPixel {
     uint8_t outcome;    // 0 = escaped, 1 = disk_hit, 2 = horizon
-    uint8_t _pad[3];
+    uint8_t _pad[3];    // _pad[0]: debug solver tag (EllipticFallbackReason) when --debug-elliptic
     float   r;          // BL radius at disk crossing (or final r)
     float   redshift;   // g = ν_obs/ν_em
     float   magnif;     // flux magnification (bundle mode; 1 in single-ray)
@@ -759,8 +759,8 @@ static std::complex<double> eval_monic_quartic(const std::array<double, 4>& b,
     return (((z + b[0]) * z + b[1]) * z + b[2]) * z + b[3];
 }
 
-static bool quartic_real_roots_monic(const std::array<double, 4>& b,
-                                     std::array<double, 4>& roots_out) {
+static void quartic_roots_monic_complex(const std::array<double, 4>& b,
+                                        std::array<std::complex<double>, 4>& roots_out) {
     constexpr double PI = 3.141592653589793238462643383279502884;
     const double radius = 1.0 + std::max({std::abs(b[0]), std::abs(b[1]), std::abs(b[2]), std::abs(b[3])});
     std::array<std::complex<double>, 4> z = {
@@ -770,7 +770,7 @@ static bool quartic_real_roots_monic(const std::array<double, 4>& b,
         std::polar(radius, 1.5 * PI)
     };
 
-    for (int it = 0; it < 128; ++it) {
+    for (int it = 0; it < 160; ++it) {
         double max_delta = 0.0;
         std::array<std::complex<double>, 4> zn = z;
         for (int i = 0; i < 4; ++i) {
@@ -787,6 +787,13 @@ static bool quartic_real_roots_monic(const std::array<double, 4>& b,
         z = zn;
         if (max_delta < 1e-13) break;
     }
+    roots_out = z;
+}
+
+static bool quartic_real_roots_monic(const std::array<double, 4>& b,
+                                     std::array<double, 4>& roots_out) {
+    std::array<std::complex<double>, 4> z{};
+    quartic_roots_monic_complex(b, z);
 
     std::vector<double> rr;
     rr.reserve(4);
@@ -802,22 +809,121 @@ static bool quartic_real_roots_monic(const std::array<double, 4>& b,
     return true;
 }
 
+static bool jacobi_sn_cn_from_u(double u, double m, double Kc, double& sn, double& cn) {
+    sn = std::numeric_limits<double>::quiet_NaN();
+    cn = std::numeric_limits<double>::quiet_NaN();
+    if (!(m >= 0.0 && m < 1.0) || !(Kc > 0.0) || !std::isfinite(u)) return false;
+
+    const double twoK = 2.0 * Kc;
+    long long n = static_cast<long long>(std::floor(u / twoK));
+    double ur = u - static_cast<double>(n) * twoK;
+    if (ur < 0.0) {
+        ur += twoK;
+        --n;
+    }
+
+    const bool second_half = (ur > Kc);
+    const double target = second_half ? (twoK - ur) : ur; // in [0, K]
+
+    double lo = 0.0;
+    double hi = 0.5 * M_PI;
+    for (int it = 0; it < 72; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        const double Fm = ellint_F_incomplete(mid, m);
+        if (!std::isfinite(Fm)) return false;
+        if (Fm < target) lo = mid;
+        else             hi = mid;
+    }
+
+    const double amp = 0.5 * (lo + hi);
+    const double s = std::sin(amp);
+    const double c = std::cos(amp);
+    double sn_local = s;
+    double cn_local = second_half ? -c : c;
+
+    if ((n & 1LL) != 0) {
+        sn_local = -sn_local;
+        cn_local = -cn_local;
+    }
+
+    sn = sn_local;
+    cn = cn_local;
+    return std::isfinite(sn) && std::isfinite(cn);
+}
+
+static bool jacobi_sc_from_u(double u, double m, double Kc, double& sc) {
+    sc = std::numeric_limits<double>::quiet_NaN();
+    double sn = 0.0, cn = 0.0;
+    if (!jacobi_sn_cn_from_u(u, m, Kc, sn, cn)) return false;
+    if (std::abs(cn) < 1e-14) return false;
+    sc = sn / cn;
+    return std::isfinite(sc);
+}
+
+enum class EllipticRadialCase : uint8_t {
+    REGION_I_II_REAL4 = 0,
+    REGION_III_REAL2_COMPLEX2,
+    REGION_IV_COMPLEX4,
+};
+
 struct EllipticRadialMap {
+    EllipticRadialCase radial_case = EllipticRadialCase::REGION_I_II_REAL4;
+
+    // Real-root ordering (descending, code convention) when available.
     double r1=0.0, r2=0.0, r3=0.0, r4=0.0;
-    double r31=0.0, r41=0.0;
-    double m=0.0;          // Jacobi modulus squared
-    double Kc=0.0;         // complete elliptic integral K(m)
-    double omega=0.0;      // phase frequency in Mino time
-    double X0=0.0;         // initial phase
-    int x_sign=1;          // phase orientation matching initial dr sign
+
+    double m=0.0;      // Jacobi modulus squared (k^2)
+    double Kc=0.0;     // complete elliptic integral K(m)
+    double omega=0.0;  // linear phase frequency in Mino time
+    double X0=0.0;     // absolute source phase magnitude
+
+    // X(tau) = phase_sign * X0 + tau_sign * omega * tau
+    int phase_sign=1;
+    int tau_sign=1;
+
+    // Region III parameters (two real + one complex-conjugate pair)
+    double A=0.0, B=0.0;
+    double r_lo=0.0, r_hi=0.0; // ascending real roots: r_lo < r_hi
+
+    // Region IV parameters (two complex-conjugate pairs)
+    double a2=0.0, b1=0.0, g0=0.0;
 };
 
 static double elliptic_radial_r_from_phase(const EllipticRadialMap& mp, double X) {
-    const double sn2 = jacobi_sn2_from_u(X, mp.m, mp.Kc);
-    if (!std::isfinite(sn2)) return std::numeric_limits<double>::quiet_NaN();
-    const double den = mp.r31 - mp.r41 * sn2;
+    if (mp.radial_case == EllipticRadialCase::REGION_I_II_REAL4) {
+        const double sn2 = jacobi_sn2_from_u(X, mp.m, mp.Kc);
+        if (!std::isfinite(sn2)) return std::numeric_limits<double>::quiet_NaN();
+
+        // GL Eq. (B46) mapped to code-descending roots (NotebookLM mapping).
+        const double r24 = mp.r2 - mp.r4;
+        const double r14 = mp.r1 - mp.r4;
+        const double den = r24 - r14 * sn2;
+        if (std::abs(den) < 1e-14) return std::numeric_limits<double>::quiet_NaN();
+        return (mp.r1 * r24 - mp.r2 * r14 * sn2) / den;
+    }
+
+    if (mp.radial_case == EllipticRadialCase::REGION_III_REAL2_COMPLEX2) {
+        double sn = 0.0, cn = 0.0;
+        if (!jacobi_sn_cn_from_u(X, mp.m, mp.Kc, sn, cn))
+            return std::numeric_limits<double>::quiet_NaN();
+
+        // GL Eq. (B75)
+        const double num = (mp.B * mp.r_hi - mp.A * mp.r_lo)
+                         + (mp.B * mp.r_hi + mp.A * mp.r_lo) * cn;
+        const double den = (mp.B - mp.A) + (mp.B + mp.A) * cn;
+        if (std::abs(den) < 1e-14) return std::numeric_limits<double>::quiet_NaN();
+        return num / den;
+    }
+
+    // REGION_IV_COMPLEX4
+    double sc = 0.0;
+    if (!jacobi_sc_from_u(X, mp.m, mp.Kc, sc))
+        return std::numeric_limits<double>::quiet_NaN();
+
+    // GL Eq. (B109)
+    const double den = 1.0 + mp.g0 * sc;
     if (std::abs(den) < 1e-14) return std::numeric_limits<double>::quiet_NaN();
-    return (mp.r4 * mp.r31 - mp.r3 * mp.r41 * sn2) / den;
+    return -mp.a2 * ((mp.g0 - sc) / den) - mp.b1;
 }
 
 static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
@@ -832,44 +938,203 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
     const double c0 = A0*A0 - c.a*c.a*Kpot;
 
     const std::array<double, 4> b = {0.0, c2/c4, c1/c4, c0/c4}; // monic quartic
-    std::array<double, 4> rr{};
-    if (!quartic_real_roots_monic(b, rr)) return false;
 
-    out.r1 = rr[0]; out.r2 = rr[1]; out.r3 = rr[2]; out.r4 = rr[3];
-    out.r31 = out.r3 - out.r1;
-    out.r41 = out.r4 - out.r1;
-    if (std::abs(out.r31) < 1e-14 || std::abs(out.r41) < 1e-14) return false;
+    std::array<std::complex<double>, 4> z{};
+    quartic_roots_monic_complex(b, z);
 
-    const double den = (out.r1 - out.r3) * (out.r2 - out.r4);
-    if (!(den > 0.0)) return false;
-    out.m = ((out.r1 - out.r2) * (out.r3 - out.r4)) / den;
-    if (!(out.m >= 0.0 && out.m < 1.0)) return false;
-    out.Kc = ellint_K_complete(out.m);
-    if (!std::isfinite(out.Kc) || !(out.Kc > 0.0)) return false;
+    std::vector<double> real_roots;
+    std::vector<std::complex<double>> complex_roots;
+    real_roots.reserve(4);
+    complex_roots.reserve(4);
 
-    const double u0_num = out.r31 * (r0 - out.r4);
-    const double u0_den = out.r41 * (r0 - out.r3);
-    if (std::abs(u0_den) < 1e-14) return false;
-    const double u0_raw = u0_num / u0_den;
-    if (!std::isfinite(u0_raw)) return false;
-    if (u0_raw < -1e-6 || u0_raw > 1.0 + 1e-6) return false;
-    const double u0 = clamp(u0_raw, 0.0, 1.0);
-    out.X0 = ellint_F_incomplete(std::asin(std::sqrt(u0)), out.m);
-    if (!std::isfinite(out.X0)) return false;
+    for (const auto& zi : z) {
+        if (!std::isfinite(zi.real()) || !std::isfinite(zi.imag())) return false;
+        const double tol_im = 1e-7 * std::max(1.0, std::abs(zi.real()));
+        if (std::abs(zi.imag()) <= tol_im) real_roots.push_back(zi.real());
+        else                               complex_roots.push_back(zi);
+    }
 
-    out.omega = 0.5 * std::sqrt(den);
-    if (!(out.omega > 0.0) || !std::isfinite(out.omega)) return false;
+    auto align_initial_radial_sign = [&](EllipticRadialMap& mp_local, bool flip_phase, bool flip_tau) {
+        if (std::abs(dr0) < 1e-14) return;
+        const double probe_tau = 1e-6;
+        const double Xp = double(mp_local.phase_sign) * mp_local.X0
+                        + double(mp_local.tau_sign) * mp_local.omega * probe_tau;
+        const double Xm = double(mp_local.phase_sign) * mp_local.X0
+                        - double(mp_local.tau_sign) * mp_local.omega * probe_tau;
+        const double rp = elliptic_radial_r_from_phase(mp_local, Xp);
+        const double rm = elliptic_radial_r_from_phase(mp_local, Xm);
+        if (!std::isfinite(rp) || !std::isfinite(rm)) return;
 
-    const double probe_tau = 1e-6;
-    const double r_plus = elliptic_radial_r_from_phase(out, out.X0 + out.omega * probe_tau);
-    const double r_minus = elliptic_radial_r_from_phase(out, out.X0 - out.omega * probe_tau);
-    if (!std::isfinite(r_plus) || !std::isfinite(r_minus)) return false;
+        const bool want_out = (dr0 >= 0.0);
+        const bool is_out = (rp >= rm);
+        if (want_out == is_out) return;
 
-    const double d_plus = r_plus - r0;
-    const double d_minus = r_minus - r0;
-    if (dr0 >= 0.0) out.x_sign = (d_plus >= d_minus) ? +1 : -1;
-    else            out.x_sign = (d_plus <= d_minus) ? +1 : -1;
-    return true;
+        if (flip_phase) mp_local.phase_sign *= -1;
+        if (flip_tau)   mp_local.tau_sign *= -1;
+    };
+
+    // Region I/II: four real roots.
+    if (real_roots.size() == 4) {
+        std::sort(real_roots.begin(), real_roots.end(), std::greater<double>());
+
+        out = EllipticRadialMap{};
+        out.radial_case = EllipticRadialCase::REGION_I_II_REAL4;
+        out.r1 = real_roots[0];
+        out.r2 = real_roots[1];
+        out.r3 = real_roots[2];
+        out.r4 = real_roots[3];
+
+        const double den_omega = (out.r1 - out.r3) * (out.r2 - out.r4);
+        if (!(den_omega > 0.0)) return false;
+        out.omega = 0.5 * std::sqrt(den_omega);
+
+        // Step 2 fix: GL-consistent modulus (complement of old expression).
+        const double k_num = (out.r2 - out.r3) * (out.r1 - out.r4);
+        const double k_den = (out.r2 - out.r4) * (out.r1 - out.r3);
+        if (!(k_den > 0.0)) return false;
+        out.m = k_num / k_den;
+        if (!(out.m >= 0.0 && out.m < 1.0)) return false;
+        out.Kc = ellint_K_complete(out.m);
+        if (!std::isfinite(out.Kc) || !(out.Kc > 0.0)) return false;
+
+        // Step 2 fix: finite-r_obs source phase uses r2 (not r3).
+        const double den_obs = (r0 - out.r2);
+        const double den_root = (out.r1 - out.r4);
+        if (std::abs(den_obs) < 1e-14 || std::abs(den_root) < 1e-14) return false;
+        const double u0_raw = ((r0 - out.r1) / den_obs) * ((out.r2 - out.r4) / den_root);
+        if (!std::isfinite(u0_raw)) return false;
+        if (u0_raw < -1e-6 || u0_raw > 1.0 + 1e-6) return false;
+        const double u0 = clamp(u0_raw, 0.0, 1.0);
+
+        out.X0 = ellint_F_incomplete(std::asin(std::sqrt(u0)), out.m);
+        if (!std::isfinite(out.X0)) return false;
+
+        // Step 4 (GL B119): alpha = -1 in case (1), +1 otherwise.
+        const bool case1 = (r0 >= out.r3 && r0 <= out.r2);
+        const int alpha = case1 ? -1 : +1;
+        const int nu_r = (dr0 >= 0.0) ? +1 : -1;
+        out.phase_sign = alpha * nu_r;
+        out.tau_sign = +1;
+
+        align_initial_radial_sign(out, /*flip_phase=*/true, /*flip_tau=*/false);
+        return true;
+    }
+
+    // Region III: two real roots + one complex-conjugate pair.
+    if (real_roots.size() == 2 && complex_roots.size() == 2) {
+        std::sort(real_roots.begin(), real_roots.end()); // ascending GL notation
+        const double r1 = real_roots[0];
+        const double r2 = real_roots[1];
+
+        const double b1 = 0.5 * (complex_roots[0].real() + complex_roots[1].real());
+        const double a1 = 0.5 * (std::abs(complex_roots[0].imag()) + std::abs(complex_roots[1].imag()));
+        if (!(a1 > 0.0) || !std::isfinite(a1) || !std::isfinite(b1)) return false;
+
+        const double A = std::sqrt(a1*a1 + (b1 - r2)*(b1 - r2));
+        const double B = std::sqrt(a1*a1 + (b1 - r1)*(b1 - r1));
+        if (!(A > 0.0 && B > 0.0 && B > A)) return false;
+
+        const double r21 = r2 - r1;
+        const double k3 = (((A + B) * (A + B)) - r21 * r21) / (4.0 * A * B);
+        if (!(k3 > 0.0 && k3 < 1.0)) return false;
+        const double K3 = ellint_K_complete(k3);
+        if (!std::isfinite(K3) || !(K3 > 0.0)) return false;
+
+        const double x3 = (A*(r0 - r1) - B*(r0 - r2))
+                        / (A*(r0 - r1) + B*(r0 - r2));
+        if (!std::isfinite(x3)) return false;
+        const double phi0 = std::acos(clamp(x3, -1.0, 1.0));
+        const double F0 = ellint_F_incomplete(phi0, k3);
+        if (!std::isfinite(F0)) return false;
+
+        out = EllipticRadialMap{};
+        out.radial_case = EllipticRadialCase::REGION_III_REAL2_COMPLEX2;
+        out.r1 = r2; // outer real root (descending-like convenience)
+        out.r2 = r1;
+        out.r_lo = r1;
+        out.r_hi = r2;
+        out.A = A;
+        out.B = B;
+        out.m = k3;
+        out.Kc = K3;
+        out.omega = std::sqrt(A * B);
+        out.X0 = F0;
+        out.phase_sign = (dr0 >= 0.0) ? +1 : -1; // X3 = nu_r*F0 + omega*tau
+        out.tau_sign = +1;
+
+        align_initial_radial_sign(out, /*flip_phase=*/true, /*flip_tau=*/false);
+        return true;
+    }
+
+    // Region IV: two complex-conjugate pairs.
+    if (real_roots.empty() && complex_roots.size() == 4) {
+        std::vector<std::complex<double>> pos_im, neg_im;
+        for (const auto& zi : complex_roots) {
+            if (zi.imag() >= 0.0) pos_im.push_back(zi);
+            else                  neg_im.push_back(zi);
+        }
+        if (pos_im.size() != 2 || neg_im.size() != 2) return false;
+
+        auto conj_dist = [](const std::complex<double>& a, const std::complex<double>& b) {
+            return std::abs(a - std::conj(b));
+        };
+        const int j0 = (conj_dist(pos_im[0], neg_im[0]) <= conj_dist(pos_im[0], neg_im[1])) ? 0 : 1;
+
+        auto pair_params = [](const std::complex<double>& zp, const std::complex<double>& zn) {
+            const double b = 0.5 * (zp.real() + zn.real());
+            const double a = 0.5 * (std::abs(zp.imag()) + std::abs(zn.imag()));
+            return std::pair<double,double>{b, a};
+        };
+
+        auto [bA, aA] = pair_params(pos_im[0], neg_im[j0]);
+        auto [bB, aB] = pair_params(pos_im[1], neg_im[1 - j0]);
+        if (!(aA > 0.0 && aB > 0.0)) return false;
+
+        // GL notation: b1 > 0 > b2 and a1 > a2 > 0.
+        double b1 = bA, a1 = aA, b2 = bB, a2 = aB;
+        if (bB > bA) {
+            b1 = bB; a1 = aB;
+            b2 = bA; a2 = aA;
+        }
+        if (!(b1 > b2)) return false;
+
+        const double C = std::sqrt((a1 - a2)*(a1 - a2) + (b1 - b2)*(b1 - b2));
+        const double D = std::sqrt((a1 + a2)*(a1 + a2) + (b1 - b2)*(b1 - b2));
+        if (!(C > 0.0 && D > 0.0)) return false;
+
+        const double k4 = (4.0 * C * D) / ((C + D) * (C + D));
+        if (!(k4 > 0.0 && k4 < 1.0)) return false;
+        const double K4 = ellint_K_complete(k4);
+        if (!std::isfinite(K4) || !(K4 > 0.0)) return false;
+
+        const double g_num = 4.0 * a2 * a2 - (C - D) * (C - D);
+        const double g_den = (C + D) * (C + D) - 4.0 * a2 * a2;
+        if (!(g_num > 0.0 && g_den > 0.0)) return false;
+        const double g0 = std::sqrt(g_num / g_den);
+        if (!(g0 > 0.0) || !std::isfinite(g0)) return false;
+
+        const double x4 = (r0 - b2) / std::max(a2, 1e-15);
+        const double phi0 = std::atan(x4) + std::atan(g0);
+        const double F0 = ellint_F_incomplete(phi0, k4);
+        if (!std::isfinite(F0)) return false;
+
+        out = EllipticRadialMap{};
+        out.radial_case = EllipticRadialCase::REGION_IV_COMPLEX4;
+        out.m = k4;
+        out.Kc = K4;
+        out.omega = 0.5 * (C + D);
+        out.X0 = F0;
+        out.phase_sign = +1;
+        out.tau_sign = (dr0 >= 0.0) ? +1 : -1; // X4 = F0 + nu_r*omega*tau
+        out.a2 = a2;
+        out.b1 = b1;
+        out.g0 = g0;
+
+        align_initial_radial_sign(out, /*flip_phase=*/false, /*flip_tau=*/true);
+        return true;
+    }
+
+    return false;
 }
 
 static double separable_radial_potential(const SeparableKerrConsts& c, double r) {
@@ -961,7 +1226,8 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
         return fallback_trace(EllipticFallbackReason::RADIAL_MAP_INIT);
 
     const double rh_cut = g.r_horizon() * 1.03;
-    const double X = mp.X0 + double(mp.x_sign) * mp.omega * tau_first;
+    const double X = double(mp.phase_sign) * mp.X0
+                   + double(mp.tau_sign) * mp.omega * tau_first;
     const double r_now = elliptic_radial_r_from_phase(mp, X);
     if (!std::isfinite(r_now))
         return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
@@ -971,11 +1237,25 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
     if (R < -1e-8 * R_scale)
         return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
 
+    // For Region I/II and III, enforce the observer-accessible outer branch.
+    // Region IV has no real turning points.
+    if (mp.radial_case != EllipticRadialCase::REGION_IV_COMPLEX4 && r_now < mp.r1)
+        return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
     if (r_now < rh_cut)
-        return {Outcome::HORIZON, r_now, 0.0};
+        return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
     if (r_now > r_escape)
         return fallback_trace(EllipticFallbackReason::DIRECT_OUTSIDE_DISK);
     if (r_now >= r_disk_in && r_now <= r_disk_out) {
+        // Horizon-precedence safety check:
+        // if chart-native standard tracing says this ray falls into horizon
+        // before any disk intersection, prefer horizon to avoid leakage
+        // inside the black-hole silhouette.
+        const TraceResult verify = (fallback_chart == CoordinateChart::KS)
+            ? trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg)
+            : trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg);
+        if (verify.out == Outcome::HORIZON)
+            return verify;
+
         return {Outcome::DISK_HIT, r_now,
                 clamp(disk_redshift(r_now, s_bl.pt, s_bl.pphi, g), 0.0, 20.0)};
     }
@@ -1386,9 +1666,30 @@ static std::vector<RGB> colorize_buffer(
     const std::vector<GeoPixel>& geo, int W, int H,
     const ColorParams& cp,
     const BackgroundImage& bg,
-    double M_bh, double r_isco)
+    double M_bh, double r_isco,
+    bool debug_elliptic = false)
 {
     std::vector<RGB> image(W*H, {0,0,0});
+
+    if (debug_elliptic) {
+        // Color by elliptic solver tag stored in _pad[0]:
+        //   NONE(0)=green   INIT_SEPARABLE_CONSTS(1)=white   THETA_CROSSING_SOLVE(2)=cyan
+        //   RADIAL_MAP_INIT(3)=red   DIRECT_RADIAL_INVALID(4)=yellow   DIRECT_OUTSIDE_DISK(5)=blue
+        static const RGB debug_colors[] = {
+            {  0, 220,   0},  // 0 NONE           = elliptic success  → green
+            {255, 255, 255},  // 1 INIT_SEP_CONSTS                    → white
+            {  0, 220, 220},  // 2 THETA_CROSSING                     → cyan
+            {220,   0,   0},  // 3 RADIAL_MAP_INIT                    → red  (dominant)
+            {220, 220,   0},  // 4 DIRECT_RADIAL_INVALID              → yellow
+            { 60,  60, 220},  // 5 DIRECT_OUTSIDE_DISK                → blue
+        };
+        for (int i = 0; i < W*H; ++i) {
+            const uint8_t tag = geo[i]._pad[0];
+            image[i] = (tag < 6) ? debug_colors[tag] : RGB{128, 0, 128};
+        }
+        return image;
+    }
+
     for (int i = 0; i < W*H; ++i) {
         const GeoPixel& p = geo[i];
         if (p.outcome == 1)
@@ -1418,7 +1719,7 @@ static void print_progress(int done, int total, double elapsed) {
 
 // ── Per-frame camera/physics parameters ───────────────────────
 struct FrameParams {
-    double a=0.998, theta=80.0, phi=0.0, r_obs=30.0, disk_out=12.0, fov=30.0;
+    double a=0.998, theta=80.0, phi=0.0, r_obs=40.0, disk_out=12.0, fov=30.0;
 };
 
 // ── Phase 1: trace all geodesics → GeoPixel buffer ───────────
@@ -1430,7 +1731,8 @@ static std::vector<GeoPixel> trace_geodesics(
     CoordinateChart chart,
     Integrator intg,
     double M_bh, double Q_bh, double Lam,
-    KGeoMeta* meta_out = nullptr)
+    KGeoMeta* meta_out = nullptr,
+    bool debug_elliptic = false)
 {
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
     CoordinateChart eff_chart = chart;
@@ -1517,6 +1819,8 @@ static std::vector<GeoPixel> trace_geodesics(
                     res = trace_single_elliptic_closed(
                         s, g, r_disk_in, r_disk_out, r_escape,
                         &fb_reason, eff_chart, intg);
+                    if (debug_elliptic)
+                        pix._pad[0] = static_cast<uint8_t>(fb_reason);
                     if (track_elliptic_fallbacks) {
                         elliptic_total_rays.fetch_add(1, std::memory_order_relaxed);
                         if (fb_reason != EllipticFallbackReason::NONE) {
@@ -1541,7 +1845,8 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
             }
-            pix._pad[0]=pix._pad[1]=pix._pad[2]=0;
+            if (!debug_elliptic) pix._pad[0]=0;
+            pix._pad[1]=pix._pad[2]=0;
         }
         int done = ++rows_done;
         if (done%4==0 || done==H) {
@@ -1613,12 +1918,15 @@ static std::vector<RGB> render_image(
     IntersectionMode intersection_mode = IntersectionMode::HERMITE,
     int metal_kernel_mode = 0,
     bool elliptic_fallback_black = false,
+    bool anti_fireflies = false,
     const ColorParams& cp = ColorParams{},
-    std::vector<GeoPixel>* geo_out = nullptr)
+    std::vector<GeoPixel>* geo_out = nullptr,
+    bool debug_elliptic = false)
 {
     (void)metal_kernel_mode;
     (void)intersection_mode;
     (void)elliptic_fallback_black;
+    (void)anti_fireflies;
 #if defined(USE_METAL)
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
@@ -1645,10 +1953,12 @@ static std::vector<RGB> render_image(
                          (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
         CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,
                            W,H,(chart==CoordinateChart::KS)?1:0,metal_solver_mode_code(gpu_solver_mode),
+                           (intg==Integrator::DOPRI5)?1:0,
                            use_bundles ? 1 : 0,
                            metal_kernel_mode_code(static_cast<MetalKernelMode>(metal_kernel_mode)),
                            intersection_mode_code(intersection_mode),
-                           elliptic_fallback_black ? 1 : 0};
+                           elliptic_fallback_black ? 1 : 0,
+                           anti_fireflies ? 1 : 0};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -1680,9 +1990,9 @@ static std::vector<RGB> render_image(
         warned_metal_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco, debug_elliptic);
 
 #elif defined(USE_CUDA)
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
@@ -1719,16 +2029,16 @@ static std::vector<RGB> render_image(
         warned_cuda_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco, debug_elliptic);
 
 #else
     // CPU: two-phase
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco);
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco, debug_elliptic);
 #endif
 }
 
@@ -1754,6 +2064,8 @@ int main(int argc, char** argv) {
     bool use_bundles=false, preview=false, hd_preview=false;
     bool res_720p=false, res_2k=false, res_4k=false;
     bool elliptic_fallback_black=false;
+    bool anti_fireflies=false;
+    bool debug_elliptic=false;
     int  custom_w=0, custom_h=0;
     Integrator intg=Integrator::RK4_DOUBLING;
     CoordinateChart chart=CoordinateChart::KS;
@@ -1798,6 +2110,12 @@ int main(int argc, char** argv) {
         if (arg=="--elliptic-closed") solver_mode=RaySolverMode::ELLIPTIC_CLOSED;
         if (arg=="--elliptic-fallback-black" || arg=="--elliptic-strict-black")
             elliptic_fallback_black = true;
+        if (arg=="--debug-elliptic")
+            debug_elliptic = true;
+        if (arg=="--anti-fireflies" || arg=="--anti_fireflies")
+            anti_fireflies = true;
+        if (arg=="--no-anti-fireflies" || arg=="--no-anti_fireflies")
+            anti_fireflies = false;
         if (arg=="--intersection-linear" || arg=="--linear-intersection")
             intersection_mode=IntersectionMode::LINEAR;
         if (arg=="--intersection-hermite" || arg=="--hermite-intersection")
@@ -1912,7 +2230,7 @@ int main(int argc, char** argv) {
     const int H = custom_h ? custom_h : res_4k ? 2160 : res_2k ? 1440
                 : res_720p ? 720  : hd_preview ? 480 : preview ? 270 : 1080;
 
-    const double default_r_obs = 30.0;
+    const double default_r_obs = 40.0;
     const double base_r_obs    = (arg_r_obs>0) ? arg_r_obs : default_r_obs;
 
     const char* res_tag = res_4k ? "4k" : res_2k ? "2k" : custom_w ? "custom"
@@ -1983,8 +2301,24 @@ int main(int argc, char** argv) {
             return tag;
         }
 
-        // Standard solver: in KS the current implementation always uses RK4.
-        const bool ks_uses_rk4 = (eff_chart == CoordinateChart::KS);
+        // Standard solver: CPU KS is RK4-only; GPU KS can expose DOPRI5.
+        bool ks_uses_rk4 = (eff_chart == CoordinateChart::KS);
+#if defined(USE_METAL)
+        const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
+        const bool gpu_chart_ok = (eff_chart == CoordinateChart::BL) ||
+                                  (eff_chart == CoordinateChart::KS && ks_chart_supported);
+        const bool solver_gpu_supported = metal_solver_supported(sel.effective, eff_chart, Q_bh, Lam);
+        const bool bundle_gpu_supported =
+            use_bundles &&
+            gpu_chart_ok &&
+            sel.effective == RaySolverMode::STANDARD;
+        const bool single_ray_gpu_supported =
+            !use_bundles &&
+            gpu_chart_ok &&
+            solver_gpu_supported;
+        const bool can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
+        if (can_use_gpu) ks_uses_rk4 = false;
+#endif
         const char* intg_tag = (ks_uses_rk4 || intg == Integrator::RK4_DOUBLING)
             ? "rk4"
             : "dopri5";
@@ -2044,6 +2378,7 @@ int main(int argc, char** argv) {
                   << "  backend=" << backend_tag
                   << "  intersection=" << intersection_mode_name(intersection_mode)
                   << "  elliptic-fallback-black=" << (elliptic_fallback_black ? "on" : "off")
+                  << "  anti-fireflies=" << (anti_fireflies ? "on" : "off")
 #if defined(USE_METAL)
                   << "  metal-kernel="
                   << metal_kernel_mode_name(static_cast<MetalKernelMode>(metal_kernel_mode))
@@ -2078,8 +2413,8 @@ int main(int argc, char** argv) {
             std::vector<GeoPixel> geo;
             auto image = render_image(W, H, fp, bg, use_bundles, solver_mode, chart, intg,
                                       M_bh, Q_bh, Lam, intersection_mode, metal_kernel_mode,
-                                      elliptic_fallback_black, cp,
-                                      geo_file.empty() ? nullptr : &geo);
+                                      elliptic_fallback_black, anti_fireflies, cp,
+                                      geo_file.empty() ? nullptr : &geo, debug_elliptic);
             double elapsed=get_time()-t0;
             std::cout << "Time: " << elapsed << "s  ("
                       << std::fixed << std::setprecision(1)
@@ -2182,7 +2517,7 @@ int main(int argc, char** argv) {
 
         auto image=render_image(W,H,fp,bg,use_bundles,solver_mode,chart,intg,
                                 M_bh,Q_bh,Lam,intersection_mode,metal_kernel_mode,
-                                elliptic_fallback_black,cp);
+                                elliptic_fallback_black,anti_fireflies,cp,nullptr,debug_elliptic);
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;

@@ -48,7 +48,7 @@ const RESOLUTIONS = {
   '4K':    { w: 3840, h: 2160 },
 };
 
-const DEFAULT_R_OBS = 30;
+const DEFAULT_R_OBS = 40;
 const DEFAULT_DISK_OUT = 12;
 
 app.use(cors());
@@ -187,6 +187,7 @@ app.post('/api/render', (req, res) => {
   else if (res_key === '4K')    args.push('--4k');
 
   if (p.bundles)  args.push('--bundles');
+  if (p.anti_fireflies) args.push('--anti-fireflies');
   if (p.dopri5)   args.push('--dopri5');
   let solverMode = 'standard';
   if (typeof p.solver_mode === 'string') {

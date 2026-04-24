@@ -31,10 +31,12 @@ struct CameraParams {
     int   height;
     int   chart;       // 0 = BL, 1 = KS
     int   solver_mode; // 0 = standard, 1 = semi-analytic, 2 = elliptic-closed
+    int   integrator_mode; // 0 = RK4-doubling, 1 = DOPRI5
     int   use_bundles; // 0 = single ray, 1 = ray-bundle (finite-difference proxy)
     int   metal_kernel_mode; // 0 = auto, 1 = unified(legacy), 2 = single, 3 = bundle
     int   intersection_mode; // 0 = linear, 1 = hermite
     int   elliptic_fallback_black; // 0 = normal fallback, 1 = force black on fallback rays
+    int   anti_fireflies; // 0 = off, 1 = robust anti-fireflies filter (ray-bundle path)
 };
 
 struct RenderParams {
@@ -155,6 +157,145 @@ static void rk4(thread float& r, thread float& theta, thread float& phi,
     phi   += dlam/6.0f*(dph1  +2.0f*dph2  +2.0f*dph3  +dph4);
     pr    += dlam/6.0f*(dpr1  +2.0f*dpr2  +2.0f*dpr3  +dpr4);
     pth   += dlam/6.0f*(dpth1 +2.0f*dpth2 +2.0f*dpth3 +dpth4);
+}
+
+struct BLState {
+    float r, theta, phi, pr, pth;
+};
+
+struct BLDeriv {
+    float dr, dth, dphi, dpr, dpth;
+};
+
+static BLDeriv eval_bl_rhs_state(thread const BLState& s,
+                                 float pt, float pphi,
+                                 float M, float a, float Q, float L) {
+    BLDeriv k{};
+    geodesic_rhs(s.r, s.theta, s.pr, s.pth, pt, pphi, M, a, Q, L,
+                 k.dr, k.dth, k.dphi, k.dpr, k.dpth);
+    return k;
+}
+
+static bool dopri5_adaptive_bl(thread float& r, thread float& theta, thread float& phi,
+                               thread float& pr, thread float& pth,
+                               thread float& h,
+                               float pt, float pphi,
+                               float M, float a, float Q, float L,
+                               float tol = 2e-5f) {
+    const BLState s0{r, theta, phi, pr, pth};
+    const BLDeriv k1 = eval_bl_rhs_state(s0, pt, pphi, M, a, Q, L);
+
+    BLState s2 = s0;
+    s2.r     += h * (1.0f/5.0f) * k1.dr;
+    s2.theta += h * (1.0f/5.0f) * k1.dth;
+    s2.phi   += h * (1.0f/5.0f) * k1.dphi;
+    s2.pr    += h * (1.0f/5.0f) * k1.dpr;
+    s2.pth   += h * (1.0f/5.0f) * k1.dpth;
+    const BLDeriv k2 = eval_bl_rhs_state(s2, pt, pphi, M, a, Q, L);
+
+    BLState s3 = s0;
+    s3.r     += h * (3.0f/40.0f*k1.dr   + 9.0f/40.0f*k2.dr);
+    s3.theta += h * (3.0f/40.0f*k1.dth  + 9.0f/40.0f*k2.dth);
+    s3.phi   += h * (3.0f/40.0f*k1.dphi + 9.0f/40.0f*k2.dphi);
+    s3.pr    += h * (3.0f/40.0f*k1.dpr  + 9.0f/40.0f*k2.dpr);
+    s3.pth   += h * (3.0f/40.0f*k1.dpth + 9.0f/40.0f*k2.dpth);
+    const BLDeriv k3 = eval_bl_rhs_state(s3, pt, pphi, M, a, Q, L);
+
+    BLState s4 = s0;
+    s4.r     += h * (44.0f/45.0f*k1.dr   - 56.0f/15.0f*k2.dr   + 32.0f/9.0f*k3.dr);
+    s4.theta += h * (44.0f/45.0f*k1.dth  - 56.0f/15.0f*k2.dth  + 32.0f/9.0f*k3.dth);
+    s4.phi   += h * (44.0f/45.0f*k1.dphi - 56.0f/15.0f*k2.dphi + 32.0f/9.0f*k3.dphi);
+    s4.pr    += h * (44.0f/45.0f*k1.dpr  - 56.0f/15.0f*k2.dpr  + 32.0f/9.0f*k3.dpr);
+    s4.pth   += h * (44.0f/45.0f*k1.dpth - 56.0f/15.0f*k2.dpth + 32.0f/9.0f*k3.dpth);
+    const BLDeriv k4 = eval_bl_rhs_state(s4, pt, pphi, M, a, Q, L);
+
+    BLState s5 = s0;
+    s5.r     += h * (19372.0f/6561.0f*k1.dr   - 25360.0f/2187.0f*k2.dr   + 64448.0f/6561.0f*k3.dr   - 212.0f/729.0f*k4.dr);
+    s5.theta += h * (19372.0f/6561.0f*k1.dth  - 25360.0f/2187.0f*k2.dth  + 64448.0f/6561.0f*k3.dth  - 212.0f/729.0f*k4.dth);
+    s5.phi   += h * (19372.0f/6561.0f*k1.dphi - 25360.0f/2187.0f*k2.dphi + 64448.0f/6561.0f*k3.dphi - 212.0f/729.0f*k4.dphi);
+    s5.pr    += h * (19372.0f/6561.0f*k1.dpr  - 25360.0f/2187.0f*k2.dpr  + 64448.0f/6561.0f*k3.dpr  - 212.0f/729.0f*k4.dpr);
+    s5.pth   += h * (19372.0f/6561.0f*k1.dpth - 25360.0f/2187.0f*k2.dpth + 64448.0f/6561.0f*k3.dpth - 212.0f/729.0f*k4.dpth);
+    const BLDeriv k5 = eval_bl_rhs_state(s5, pt, pphi, M, a, Q, L);
+
+    BLState s6 = s0;
+    s6.r     += h * (9017.0f/3168.0f*k1.dr   - 355.0f/33.0f*k2.dr   + 46732.0f/5247.0f*k3.dr   + 49.0f/176.0f*k4.dr   - 5103.0f/18656.0f*k5.dr);
+    s6.theta += h * (9017.0f/3168.0f*k1.dth  - 355.0f/33.0f*k2.dth  + 46732.0f/5247.0f*k3.dth  + 49.0f/176.0f*k4.dth  - 5103.0f/18656.0f*k5.dth);
+    s6.phi   += h * (9017.0f/3168.0f*k1.dphi - 355.0f/33.0f*k2.dphi + 46732.0f/5247.0f*k3.dphi + 49.0f/176.0f*k4.dphi - 5103.0f/18656.0f*k5.dphi);
+    s6.pr    += h * (9017.0f/3168.0f*k1.dpr  - 355.0f/33.0f*k2.dpr  + 46732.0f/5247.0f*k3.dpr  + 49.0f/176.0f*k4.dpr  - 5103.0f/18656.0f*k5.dpr);
+    s6.pth   += h * (9017.0f/3168.0f*k1.dpth - 355.0f/33.0f*k2.dpth + 46732.0f/5247.0f*k3.dpth + 49.0f/176.0f*k4.dpth - 5103.0f/18656.0f*k5.dpth);
+    const BLDeriv k6 = eval_bl_rhs_state(s6, pt, pphi, M, a, Q, L);
+
+    BLState y5 = s0;
+    y5.r     += h * (35.0f/384.0f*k1.dr   + 500.0f/1113.0f*k3.dr   + 125.0f/192.0f*k4.dr   - 2187.0f/6784.0f*k5.dr   + 11.0f/84.0f*k6.dr);
+    y5.theta += h * (35.0f/384.0f*k1.dth  + 500.0f/1113.0f*k3.dth  + 125.0f/192.0f*k4.dth  - 2187.0f/6784.0f*k5.dth  + 11.0f/84.0f*k6.dth);
+    y5.phi   += h * (35.0f/384.0f*k1.dphi + 500.0f/1113.0f*k3.dphi + 125.0f/192.0f*k4.dphi - 2187.0f/6784.0f*k5.dphi + 11.0f/84.0f*k6.dphi);
+    y5.pr    += h * (35.0f/384.0f*k1.dpr  + 500.0f/1113.0f*k3.dpr  + 125.0f/192.0f*k4.dpr  - 2187.0f/6784.0f*k5.dpr  + 11.0f/84.0f*k6.dpr);
+    y5.pth   += h * (35.0f/384.0f*k1.dpth + 500.0f/1113.0f*k3.dpth + 125.0f/192.0f*k4.dpth - 2187.0f/6784.0f*k5.dpth + 11.0f/84.0f*k6.dpth);
+
+    const BLDeriv k7 = eval_bl_rhs_state(y5, pt, pphi, M, a, Q, L);
+
+    BLState y4 = s0;
+    y4.r     += h * (5179.0f/57600.0f*k1.dr   + 7571.0f/16695.0f*k3.dr   + 393.0f/640.0f*k4.dr   - 92097.0f/339200.0f*k5.dr   + 187.0f/2100.0f*k6.dr   + 1.0f/40.0f*k7.dr);
+    y4.theta += h * (5179.0f/57600.0f*k1.dth  + 7571.0f/16695.0f*k3.dth  + 393.0f/640.0f*k4.dth  - 92097.0f/339200.0f*k5.dth  + 187.0f/2100.0f*k6.dth  + 1.0f/40.0f*k7.dth);
+    y4.phi   += h * (5179.0f/57600.0f*k1.dphi + 7571.0f/16695.0f*k3.dphi + 393.0f/640.0f*k4.dphi - 92097.0f/339200.0f*k5.dphi + 187.0f/2100.0f*k6.dphi + 1.0f/40.0f*k7.dphi);
+    y4.pr    += h * (5179.0f/57600.0f*k1.dpr  + 7571.0f/16695.0f*k3.dpr  + 393.0f/640.0f*k4.dpr  - 92097.0f/339200.0f*k5.dpr  + 187.0f/2100.0f*k6.dpr  + 1.0f/40.0f*k7.dpr);
+    y4.pth   += h * (5179.0f/57600.0f*k1.dpth + 7571.0f/16695.0f*k3.dpth + 393.0f/640.0f*k4.dpth - 92097.0f/339200.0f*k5.dpth + 187.0f/2100.0f*k6.dpth + 1.0f/40.0f*k7.dpth);
+
+    const float sr = tol * (1.0f + abs(s0.r));
+    const float stheta = tol * (1.0f + abs(s0.theta));
+    const float spr = tol * (1.0f + abs(s0.pr));
+    const float spth = tol * (1.0f + abs(s0.pth));
+    const float er0 = (y5.r - y4.r) / max(sr, 1e-12f);
+    const float er1 = (y5.theta - y4.theta) / max(stheta, 1e-12f);
+    const float er2 = (y5.pr - y4.pr) / max(spr, 1e-12f);
+    const float er3 = (y5.pth - y4.pth) / max(spth, 1e-12f);
+    const float err = sqrt((er0*er0 + er1*er1 + er2*er2 + er3*er3) * 0.25f);
+
+    if (!isfinite(err)) {
+        h = max(h * 0.5f, 1e-6f);
+        return false;
+    }
+
+    if (err <= 1.0f || h < 1e-6f) {
+        r = y5.r; theta = y5.theta; phi = y5.phi; pr = y5.pr; pth = y5.pth;
+        const float fac = (err > 1e-12f) ? 0.9f * pow(1.0f/err, 0.2f) : 2.0f;
+        h = clamp(h * fac, 1e-6f, 50.0f);
+        return true;
+    }
+
+    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), 1e-6f, h * 0.5f);
+    return false;
+}
+
+static bool adaptive_step_bl(thread float& r, thread float& theta, thread float& phi,
+                             thread float& pr, thread float& pth,
+                             thread float& h,
+                             float pt, float pphi,
+                             float M, float a, float Q, float L,
+                             int integrator_mode) {
+    if (integrator_mode == 1) {
+        return dopri5_adaptive_bl(r, theta, phi, pr, pth, h, pt, pphi, M, a, Q, L);
+    }
+
+    const float step_used = h;
+    float r_h = r, th_h = theta, ph_h = phi, pr_h = pr, pth_h = pth;
+    rk4(r_h, th_h, ph_h, pr_h, pth_h, pt, pphi, M, a, Q, L, step_used);
+
+    float r_f = r, th_f = theta, ph_f = phi, pr_f = pr, pth_f = pth;
+    rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, step_used*0.5f);
+    rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, step_used*0.5f);
+
+    const float err = length(float4(r_h-r_f, th_h-th_f, pr_h-pr_f, pth_h-pth_f)) / 15.0f;
+    const float tol = 2e-5f;
+    if (err < tol || h < 1e-6f) {
+        r = r_f; theta = th_f; phi = ph_f; pr = pr_f; pth = pth_f;
+        const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
+        h = clamp(h*sc, 1e-6f, 50.0f);
+        return true;
+    }
+
+    h = clamp(h*0.9f*pow(tol/err, 0.25f), 1e-6f, h*0.5f);
+    return false;
 }
 
 // Event localization helpers (cubic Hermite + bisection).
@@ -506,6 +647,152 @@ static void rk4_KS(thread float& X, thread float& Y, thread float& Z,
     pZ += dlam/6.0f*(dpZ1 +2.0f*dpZ2 +2.0f*dpZ3 +dpZ4);
 }
 
+struct KSState {
+    float X, Y, Z, pX, pY, pZ;
+};
+
+struct KSDeriv {
+    float dX, dY, dZ, dpX, dpY, dpZ;
+};
+
+static KSDeriv eval_ks_rhs_state(thread const KSState& s,
+                                 float pT, float M, float a, float Q) {
+    KSDeriv k{};
+    geodesic_rhs_KS(s.X, s.Y, s.Z, pT, s.pX, s.pY, s.pZ, M, a, Q,
+                    k.dX, k.dY, k.dZ, k.dpX, k.dpY, k.dpZ);
+    return k;
+}
+
+static bool dopri5_adaptive_ks(thread float& X, thread float& Y, thread float& Z,
+                               thread float& pX, thread float& pY, thread float& pZ,
+                               thread float& h,
+                               float pT, float M, float a, float Q,
+                               float tol = 2e-5f) {
+    const KSState s0{X, Y, Z, pX, pY, pZ};
+    const KSDeriv k1 = eval_ks_rhs_state(s0, pT, M, a, Q);
+
+    KSState s2 = s0;
+    s2.X  += h * (1.0f/5.0f) * k1.dX;  s2.Y  += h * (1.0f/5.0f) * k1.dY;  s2.Z  += h * (1.0f/5.0f) * k1.dZ;
+    s2.pX += h * (1.0f/5.0f) * k1.dpX; s2.pY += h * (1.0f/5.0f) * k1.dpY; s2.pZ += h * (1.0f/5.0f) * k1.dpZ;
+    const KSDeriv k2 = eval_ks_rhs_state(s2, pT, M, a, Q);
+
+    KSState s3 = s0;
+    s3.X  += h * (3.0f/40.0f*k1.dX  + 9.0f/40.0f*k2.dX);
+    s3.Y  += h * (3.0f/40.0f*k1.dY  + 9.0f/40.0f*k2.dY);
+    s3.Z  += h * (3.0f/40.0f*k1.dZ  + 9.0f/40.0f*k2.dZ);
+    s3.pX += h * (3.0f/40.0f*k1.dpX + 9.0f/40.0f*k2.dpX);
+    s3.pY += h * (3.0f/40.0f*k1.dpY + 9.0f/40.0f*k2.dpY);
+    s3.pZ += h * (3.0f/40.0f*k1.dpZ + 9.0f/40.0f*k2.dpZ);
+    const KSDeriv k3 = eval_ks_rhs_state(s3, pT, M, a, Q);
+
+    KSState s4 = s0;
+    s4.X  += h * (44.0f/45.0f*k1.dX  - 56.0f/15.0f*k2.dX  + 32.0f/9.0f*k3.dX);
+    s4.Y  += h * (44.0f/45.0f*k1.dY  - 56.0f/15.0f*k2.dY  + 32.0f/9.0f*k3.dY);
+    s4.Z  += h * (44.0f/45.0f*k1.dZ  - 56.0f/15.0f*k2.dZ  + 32.0f/9.0f*k3.dZ);
+    s4.pX += h * (44.0f/45.0f*k1.dpX - 56.0f/15.0f*k2.dpX + 32.0f/9.0f*k3.dpX);
+    s4.pY += h * (44.0f/45.0f*k1.dpY - 56.0f/15.0f*k2.dpY + 32.0f/9.0f*k3.dpY);
+    s4.pZ += h * (44.0f/45.0f*k1.dpZ - 56.0f/15.0f*k2.dpZ + 32.0f/9.0f*k3.dpZ);
+    const KSDeriv k4 = eval_ks_rhs_state(s4, pT, M, a, Q);
+
+    KSState s5 = s0;
+    s5.X  += h * (19372.0f/6561.0f*k1.dX  - 25360.0f/2187.0f*k2.dX  + 64448.0f/6561.0f*k3.dX  - 212.0f/729.0f*k4.dX);
+    s5.Y  += h * (19372.0f/6561.0f*k1.dY  - 25360.0f/2187.0f*k2.dY  + 64448.0f/6561.0f*k3.dY  - 212.0f/729.0f*k4.dY);
+    s5.Z  += h * (19372.0f/6561.0f*k1.dZ  - 25360.0f/2187.0f*k2.dZ  + 64448.0f/6561.0f*k3.dZ  - 212.0f/729.0f*k4.dZ);
+    s5.pX += h * (19372.0f/6561.0f*k1.dpX - 25360.0f/2187.0f*k2.dpX + 64448.0f/6561.0f*k3.dpX - 212.0f/729.0f*k4.dpX);
+    s5.pY += h * (19372.0f/6561.0f*k1.dpY - 25360.0f/2187.0f*k2.dpY + 64448.0f/6561.0f*k3.dpY - 212.0f/729.0f*k4.dpY);
+    s5.pZ += h * (19372.0f/6561.0f*k1.dpZ - 25360.0f/2187.0f*k2.dpZ + 64448.0f/6561.0f*k3.dpZ - 212.0f/729.0f*k4.dpZ);
+    const KSDeriv k5 = eval_ks_rhs_state(s5, pT, M, a, Q);
+
+    KSState s6 = s0;
+    s6.X  += h * (9017.0f/3168.0f*k1.dX  - 355.0f/33.0f*k2.dX  + 46732.0f/5247.0f*k3.dX  + 49.0f/176.0f*k4.dX  - 5103.0f/18656.0f*k5.dX);
+    s6.Y  += h * (9017.0f/3168.0f*k1.dY  - 355.0f/33.0f*k2.dY  + 46732.0f/5247.0f*k3.dY  + 49.0f/176.0f*k4.dY  - 5103.0f/18656.0f*k5.dY);
+    s6.Z  += h * (9017.0f/3168.0f*k1.dZ  - 355.0f/33.0f*k2.dZ  + 46732.0f/5247.0f*k3.dZ  + 49.0f/176.0f*k4.dZ  - 5103.0f/18656.0f*k5.dZ);
+    s6.pX += h * (9017.0f/3168.0f*k1.dpX - 355.0f/33.0f*k2.dpX + 46732.0f/5247.0f*k3.dpX + 49.0f/176.0f*k4.dpX - 5103.0f/18656.0f*k5.dpX);
+    s6.pY += h * (9017.0f/3168.0f*k1.dpY - 355.0f/33.0f*k2.dpY + 46732.0f/5247.0f*k3.dpY + 49.0f/176.0f*k4.dpY - 5103.0f/18656.0f*k5.dpY);
+    s6.pZ += h * (9017.0f/3168.0f*k1.dpZ - 355.0f/33.0f*k2.dpZ + 46732.0f/5247.0f*k3.dpZ + 49.0f/176.0f*k4.dpZ - 5103.0f/18656.0f*k5.dpZ);
+    const KSDeriv k6 = eval_ks_rhs_state(s6, pT, M, a, Q);
+
+    KSState y5 = s0;
+    y5.X  += h * (35.0f/384.0f*k1.dX  + 500.0f/1113.0f*k3.dX  + 125.0f/192.0f*k4.dX  - 2187.0f/6784.0f*k5.dX  + 11.0f/84.0f*k6.dX);
+    y5.Y  += h * (35.0f/384.0f*k1.dY  + 500.0f/1113.0f*k3.dY  + 125.0f/192.0f*k4.dY  - 2187.0f/6784.0f*k5.dY  + 11.0f/84.0f*k6.dY);
+    y5.Z  += h * (35.0f/384.0f*k1.dZ  + 500.0f/1113.0f*k3.dZ  + 125.0f/192.0f*k4.dZ  - 2187.0f/6784.0f*k5.dZ  + 11.0f/84.0f*k6.dZ);
+    y5.pX += h * (35.0f/384.0f*k1.dpX + 500.0f/1113.0f*k3.dpX + 125.0f/192.0f*k4.dpX - 2187.0f/6784.0f*k5.dpX + 11.0f/84.0f*k6.dpX);
+    y5.pY += h * (35.0f/384.0f*k1.dpY + 500.0f/1113.0f*k3.dpY + 125.0f/192.0f*k4.dpY - 2187.0f/6784.0f*k5.dpY + 11.0f/84.0f*k6.dpY);
+    y5.pZ += h * (35.0f/384.0f*k1.dpZ + 500.0f/1113.0f*k3.dpZ + 125.0f/192.0f*k4.dpZ - 2187.0f/6784.0f*k5.dpZ + 11.0f/84.0f*k6.dpZ);
+
+    const KSDeriv k7 = eval_ks_rhs_state(y5, pT, M, a, Q);
+
+    KSState y4 = s0;
+    y4.X  += h * (5179.0f/57600.0f*k1.dX  + 7571.0f/16695.0f*k3.dX  + 393.0f/640.0f*k4.dX  - 92097.0f/339200.0f*k5.dX  + 187.0f/2100.0f*k6.dX  + 1.0f/40.0f*k7.dX);
+    y4.Y  += h * (5179.0f/57600.0f*k1.dY  + 7571.0f/16695.0f*k3.dY  + 393.0f/640.0f*k4.dY  - 92097.0f/339200.0f*k5.dY  + 187.0f/2100.0f*k6.dY  + 1.0f/40.0f*k7.dY);
+    y4.Z  += h * (5179.0f/57600.0f*k1.dZ  + 7571.0f/16695.0f*k3.dZ  + 393.0f/640.0f*k4.dZ  - 92097.0f/339200.0f*k5.dZ  + 187.0f/2100.0f*k6.dZ  + 1.0f/40.0f*k7.dZ);
+    y4.pX += h * (5179.0f/57600.0f*k1.dpX + 7571.0f/16695.0f*k3.dpX + 393.0f/640.0f*k4.dpX - 92097.0f/339200.0f*k5.dpX + 187.0f/2100.0f*k6.dpX + 1.0f/40.0f*k7.dpX);
+    y4.pY += h * (5179.0f/57600.0f*k1.dpY + 7571.0f/16695.0f*k3.dpY + 393.0f/640.0f*k4.dpY - 92097.0f/339200.0f*k5.dpY + 187.0f/2100.0f*k6.dpY + 1.0f/40.0f*k7.dpY);
+    y4.pZ += h * (5179.0f/57600.0f*k1.dpZ + 7571.0f/16695.0f*k3.dpZ + 393.0f/640.0f*k4.dpZ - 92097.0f/339200.0f*k5.dpZ + 187.0f/2100.0f*k6.dpZ + 1.0f/40.0f*k7.dpZ);
+
+    const float sX = tol * (1.0f + abs(s0.X));
+    const float sY = tol * (1.0f + abs(s0.Y));
+    const float sZ = tol * (1.0f + abs(s0.Z));
+    const float spX = tol * (1.0f + abs(s0.pX));
+    const float spY = tol * (1.0f + abs(s0.pY));
+    const float spZ = tol * (1.0f + abs(s0.pZ));
+    const float er0 = (y5.X - y4.X) / max(sX, 1e-12f);
+    const float er1 = (y5.Y - y4.Y) / max(sY, 1e-12f);
+    const float er2 = (y5.Z - y4.Z) / max(sZ, 1e-12f);
+    const float er3 = (y5.pX - y4.pX) / max(spX, 1e-12f);
+    const float er4 = (y5.pY - y4.pY) / max(spY, 1e-12f);
+    const float er5 = (y5.pZ - y4.pZ) / max(spZ, 1e-12f);
+    const float err = sqrt((er0*er0 + er1*er1 + er2*er2 + er3*er3 + er4*er4 + er5*er5) / 6.0f);
+
+    if (!isfinite(err)) {
+        h = max(h * 0.5f, 1e-6f);
+        return false;
+    }
+
+    if (err <= 1.0f || h < 1e-6f) {
+        X = y5.X; Y = y5.Y; Z = y5.Z; pX = y5.pX; pY = y5.pY; pZ = y5.pZ;
+        const float fac = (err > 1e-12f) ? 0.9f * pow(1.0f/err, 0.2f) : 2.0f;
+        h = clamp(h * fac, 1e-6f, 50.0f);
+        return true;
+    }
+
+    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), 1e-6f, h * 0.5f);
+    return false;
+}
+
+static bool adaptive_step_ks(thread float& X, thread float& Y, thread float& Z,
+                             thread float& pX, thread float& pY, thread float& pZ,
+                             thread float& h,
+                             float pT, float M, float a, float Q,
+                             int integrator_mode) {
+    if (integrator_mode == 1) {
+        return dopri5_adaptive_ks(X, Y, Z, pX, pY, pZ, h, pT, M, a, Q);
+    }
+
+    const float step_used = h;
+    float X_h = X, Y_h = Y, Z_h = Z, pX_h = pX, pY_h = pY, pZ_h = pZ;
+    rk4_KS(X_h, Y_h, Z_h, pX_h, pY_h, pZ_h, pT, M, a, Q, step_used);
+
+    float X_f = X, Y_f = Y, Z_f = Z, pX_f = pX, pY_f = pY, pZ_f = pZ;
+    rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used*0.5f);
+    rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used*0.5f);
+
+    const float err = sqrt(
+        (X_h-X_f)*(X_h-X_f) + (Y_h-Y_f)*(Y_h-Y_f) + (Z_h-Z_f)*(Z_h-Z_f) +
+        (pX_h-pX_f)*(pX_h-pX_f) + (pY_h-pY_f)*(pY_h-pY_f) + (pZ_h-pZ_f)*(pZ_h-pZ_f)
+    ) / 15.0f;
+    const float tol = 2e-5f;
+    if (err < tol || h < 1e-6f) {
+        X = X_f; Y = Y_f; Z = Z_f; pX = pX_f; pY = pY_f; pZ = pZ_f;
+        const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
+        h = clamp(h*sc, 1e-6f, 50.0f);
+        return true;
+    }
+
+    h = clamp(h*0.9f*pow(tol/err, 0.25f), 1e-6f, h*0.5f);
+    return false;
+}
+
 // ── Separable Kerr semi-analytic path (BL, Q=0, Lambda=0) ───
 struct SeparableConsts {
     float M, a;
@@ -721,8 +1008,8 @@ static Cx eval_monic_quartic(float b0, float b1, float b2, float b3, Cx z) {
     return v;
 }
 
-static bool quartic_real_roots_monic(float b0, float b1, float b2, float b3,
-                                     thread float roots_out[4]) {
+static void quartic_roots_monic_complex(float b0, float b1, float b2, float b3,
+                                        thread Cx roots_out[4]) {
     const float radius = 1.0f + max(max(abs(b0), abs(b1)), max(abs(b2), abs(b3)));
     Cx z[4] = {
         cx_make( radius, 0.0f),
@@ -750,42 +1037,146 @@ static bool quartic_real_roots_monic(float b0, float b1, float b2, float b3,
         if (max_delta < 1e-6f) break;
     }
 
-    int nreal = 0;
-    for (int i = 0; i < 4; ++i) {
-        const float tol = 1e-3f * max(1.0f, abs(z[i].re));
-        if (abs(z[i].im) <= tol && isfinite(z[i].re))
-            roots_out[nreal++] = z[i].re;
-    }
-    if (nreal != 4) return false;
+    for (int i = 0; i < 4; ++i) roots_out[i] = z[i];
+}
 
-    for (int i = 0; i < 4; ++i) {
-        for (int j = i + 1; j < 4; ++j) {
-            if (roots_out[j] > roots_out[i]) {
-                const float t = roots_out[i];
-                roots_out[i] = roots_out[j];
-                roots_out[j] = t;
-            }
-        }
+static bool jacobi_sn_cn_from_u(float u, float m, float Kc,
+                                thread float& sn_out,
+                                thread float& cn_out) {
+    if (!(m >= 0.0f && m < 1.0f) || !(Kc > 0.0f) || !isfinite(u)) return false;
+
+    const float fourK = 4.0f * Kc;
+    float ur = fmod(u, fourK);
+    if (ur < 0.0f) ur += fourK;
+
+    int quadrant = 0;
+    if (ur > 2.0f * Kc) {
+        ur -= 2.0f * Kc;
+        quadrant = 2;
     }
+    if (ur > Kc) {
+        ur = 2.0f * Kc - ur;
+        quadrant ^= 1;
+    }
+
+    float lo = 0.0f;
+    float hi = 0.5f * M_PI_F;
+    for (int it = 0; it < 42; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        const float Fm = ellint_F_incomplete(mid, m);
+        if (!isfinite(Fm)) return false;
+        if (Fm < ur) lo = mid; else hi = mid;
+    }
+
+    const float phi = 0.5f * (lo + hi);
+    float sn = sin(phi);
+    float cn = cos(phi);
+
+    if ((quadrant & 1) != 0) cn = -cn;
+    if ((quadrant & 2) != 0) sn = -sn;
+
+    sn_out = sn;
+    cn_out = cn;
     return true;
 }
 
+static bool jacobi_sc_from_u(float u, float m, float Kc,
+                             thread float& sc_out) {
+    float sn = 0.0f, cn = 0.0f;
+    if (!jacobi_sn_cn_from_u(u, m, Kc, sn, cn)) return false;
+    if (abs(cn) < 1e-8f) return false;
+    sc_out = sn / cn;
+    return true;
+}
+
+enum {
+    ELLIPTIC_REGION_I_II_REAL4 = 0,
+    ELLIPTIC_REGION_III_REAL2_COMPLEX2 = 1,
+    ELLIPTIC_REGION_IV_COMPLEX4 = 2
+};
+
 struct EllipticRadialMap {
-    float r1, r2, r3, r4;
-    float r31, r41;
-    float m;
-    float Kc;
-    float omega;
-    float X0;
-    int x_sign;
+    int   radial_case = ELLIPTIC_REGION_I_II_REAL4;
+
+    float r1 = 0.0f, r2 = 0.0f, r3 = 0.0f, r4 = 0.0f;
+    float m = 0.0f;
+    float Kc = 0.0f;
+    float omega = 0.0f;
+    float X0 = 0.0f;
+
+    int phase_sign = 1;
+    int tau_sign = 1;
+
+    float A = 0.0f, B = 0.0f;
+    float r_lo = 0.0f, r_hi = 0.0f;
+
+    float a2 = 0.0f;
+    float b1 = 0.0f;
+    float g0 = 0.0f;
 };
 
 static float elliptic_radial_r_from_phase(thread const EllipticRadialMap& mp, float X) {
-    const float sn2 = jacobi_sn2_from_u(X, mp.m, mp.Kc);
-    if (!isfinite(sn2)) return NAN;
-    const float den = mp.r31 - mp.r41 * sn2;
+    if (mp.radial_case == ELLIPTIC_REGION_I_II_REAL4) {
+        const float sn2 = jacobi_sn2_from_u(X, mp.m, mp.Kc);
+        if (!isfinite(sn2)) return NAN;
+
+        const float r24 = (mp.r2 - mp.r4);
+        const float r14 = (mp.r1 - mp.r4);
+        const float den = r24 - r14 * sn2;
+        if (abs(den) < 1e-8f) return NAN;
+        return (mp.r1 * r24 - mp.r2 * r14 * sn2) / den;
+    }
+
+    if (mp.radial_case == ELLIPTIC_REGION_III_REAL2_COMPLEX2) {
+        float sn = 0.0f, cn = 0.0f;
+        if (!jacobi_sn_cn_from_u(X, mp.m, mp.Kc, sn, cn)) return NAN;
+
+        const float num = (mp.B * mp.r_hi - mp.A * mp.r_lo)
+                        + (mp.B * mp.r_hi + mp.A * mp.r_lo) * cn;
+        const float den = (mp.B - mp.A) + (mp.B + mp.A) * cn;
+        if (abs(den) < 1e-8f) return NAN;
+        return num / den;
+    }
+
+    float sc = 0.0f;
+    if (!jacobi_sc_from_u(X, mp.m, mp.Kc, sc)) return NAN;
+    const float den = 1.0f + mp.g0 * sc;
     if (abs(den) < 1e-8f) return NAN;
-    return (mp.r4 * mp.r31 - mp.r3 * mp.r41 * sn2) / den;
+    return -mp.a2 * ((mp.g0 - sc) / den) - mp.b1;
+}
+
+static float conj_dist_cx(Cx a, Cx b) {
+    return sqrt((a.re - b.re)*(a.re - b.re) + (a.im + b.im)*(a.im + b.im));
+}
+
+static void pair_params_cx(Cx zp, Cx zn,
+                           thread float& b,
+                           thread float& a) {
+    b = 0.5f * (zp.re + zn.re);
+    a = 0.5f * (abs(zp.im) + abs(zn.im));
+}
+
+static void align_initial_radial_sign(thread EllipticRadialMap& mp,
+                                      float dr0,
+                                      bool flip_phase,
+                                      bool flip_tau) {
+    if (abs(dr0) < 1e-10f) return;
+
+    const float probe_tau = 1e-4f;
+    const float Xp = float(mp.phase_sign) * mp.X0
+                   + float(mp.tau_sign) * mp.omega * probe_tau;
+    const float Xm = float(mp.phase_sign) * mp.X0
+                   - float(mp.tau_sign) * mp.omega * probe_tau;
+    const float rp = elliptic_radial_r_from_phase(mp, Xp);
+    const float rm = elliptic_radial_r_from_phase(mp, Xm);
+    if (!isfinite(rp) || !isfinite(rm)) return;
+
+    const bool want_out = (dr0 >= 0.0f);
+    const bool is_out = (rp >= rm);
+    if (want_out == is_out) return;
+
+    if (flip_phase) mp.phase_sign *= -1;
+    if (flip_tau)   mp.tau_sign *= -1;
 }
 
 static bool init_elliptic_radial_map(thread const SeparableConsts& c,
@@ -799,44 +1190,195 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
     const float c1 = 2.0f*c.M*Kpot;
     const float c0 = A0*A0 - c.a*c.a*Kpot;
 
-    float rr[4];
-    if (!quartic_real_roots_monic(0.0f, c2/c4, c1/c4, c0/c4, rr)) return false;
+    Cx roots[4];
+    quartic_roots_monic_complex(0.0f, c2/c4, c1/c4, c0/c4, roots);
 
-    out.r1 = rr[0]; out.r2 = rr[1]; out.r3 = rr[2]; out.r4 = rr[3];
-    out.r31 = out.r3 - out.r1;
-    out.r41 = out.r4 - out.r1;
-    if (abs(out.r31) < 1e-8f || abs(out.r41) < 1e-8f) return false;
+    float real_roots[4];
+    Cx complex_roots[4];
+    int nreal = 0;
+    int ncomplex = 0;
 
-    const float den = (out.r1 - out.r3) * (out.r2 - out.r4);
-    if (!(den > 0.0f)) return false;
-    out.m = ((out.r1 - out.r2) * (out.r3 - out.r4)) / den;
-    if (!(out.m >= 0.0f && out.m < 1.0f)) return false;
-    out.Kc = ellint_K_complete(out.m);
-    if (!isfinite(out.Kc) || !(out.Kc > 0.0f)) return false;
+    for (int i = 0; i < 4; ++i) {
+        if (!isfinite(roots[i].re) || !isfinite(roots[i].im)) return false;
+        const float tol_im = 1e-4f * max(1.0f, abs(roots[i].re));
+        if (abs(roots[i].im) <= tol_im) {
+            if (nreal >= 4) return false;
+            real_roots[nreal++] = roots[i].re;
+        } else {
+            if (ncomplex >= 4) return false;
+            complex_roots[ncomplex++] = roots[i];
+        }
+    }
 
-    const float u0_num = out.r31 * (r0 - out.r4);
-    const float u0_den = out.r41 * (r0 - out.r3);
-    if (abs(u0_den) < 1e-8f) return false;
-    const float u0_raw = u0_num / u0_den;
-    if (!isfinite(u0_raw)) return false;
-    if (u0_raw < -1e-4f || u0_raw > 1.0f + 1e-4f) return false;
-    const float u0 = clamp(u0_raw, 0.0f, 1.0f);
-    out.X0 = ellint_F_incomplete(asin(sqrt(u0)), out.m);
-    if (!isfinite(out.X0)) return false;
+    if (nreal == 4) {
+        for (int i = 0; i < 4; ++i) {
+            for (int j = i + 1; j < 4; ++j) {
+                if (real_roots[j] > real_roots[i]) {
+                    const float t = real_roots[i];
+                    real_roots[i] = real_roots[j];
+                    real_roots[j] = t;
+                }
+            }
+        }
 
-    out.omega = 0.5f * sqrt(den);
-    if (!(out.omega > 0.0f) || !isfinite(out.omega)) return false;
+        out = EllipticRadialMap{};
+        out.radial_case = ELLIPTIC_REGION_I_II_REAL4;
+        out.r1 = real_roots[0];
+        out.r2 = real_roots[1];
+        out.r3 = real_roots[2];
+        out.r4 = real_roots[3];
 
-    const float probe_tau = 1e-4f;
-    const float r_plus = elliptic_radial_r_from_phase(out, out.X0 + out.omega * probe_tau);
-    const float r_minus = elliptic_radial_r_from_phase(out, out.X0 - out.omega * probe_tau);
-    if (!(isfinite(r_plus) && isfinite(r_minus))) return false;
+        const float den_omega = (out.r1 - out.r3) * (out.r2 - out.r4);
+        if (!(den_omega > 0.0f)) return false;
+        out.omega = 0.5f * sqrt(den_omega);
 
-    const float d_plus = r_plus - r0;
-    const float d_minus = r_minus - r0;
-    if (dr0 >= 0.0f) out.x_sign = (d_plus >= d_minus) ? +1 : -1;
-    else             out.x_sign = (d_plus <= d_minus) ? +1 : -1;
-    return true;
+        const float k_den = (out.r2 - out.r4) * (out.r1 - out.r3);
+        if (!(k_den > 0.0f)) return false;
+        out.m = ((out.r2 - out.r3) * (out.r1 - out.r4)) / k_den;
+        if (!(out.m >= 0.0f && out.m < 1.0f)) return false;
+        out.Kc = ellint_K_complete(out.m);
+        if (!isfinite(out.Kc) || !(out.Kc > 0.0f)) return false;
+
+        const float den_obs = (r0 - out.r2);
+        const float den_root = (out.r1 - out.r4);
+        if (abs(den_obs) < 1e-8f || abs(den_root) < 1e-8f) return false;
+        const float u0_raw = ((r0 - out.r1) / den_obs) * ((out.r2 - out.r4) / den_root);
+        if (!isfinite(u0_raw)) return false;
+        if (u0_raw < -1e-4f || u0_raw > 1.0f + 1e-4f) return false;
+        const float u0 = clamp(u0_raw, 0.0f, 1.0f);
+
+        out.X0 = ellint_F_incomplete(asin(sqrt(u0)), out.m);
+        if (!isfinite(out.X0)) return false;
+
+        const bool case1 = (r0 >= out.r3 && r0 <= out.r2);
+        const int alpha = case1 ? -1 : +1;
+        const int nu_r = (dr0 >= 0.0f) ? +1 : -1;
+        out.phase_sign = alpha * nu_r;
+        out.tau_sign = +1;
+        align_initial_radial_sign(out, dr0, /*flip_phase=*/true, /*flip_tau=*/false);
+        return true;
+    }
+
+    if (nreal == 2 && ncomplex == 2) {
+        if (real_roots[0] > real_roots[1]) {
+            const float t = real_roots[0];
+            real_roots[0] = real_roots[1];
+            real_roots[1] = t;
+        }
+        const float r_lo = real_roots[0];
+        const float r_hi = real_roots[1];
+
+        const float b1 = 0.5f * (complex_roots[0].re + complex_roots[1].re);
+        const float a1 = 0.5f * (abs(complex_roots[0].im) + abs(complex_roots[1].im));
+        if (!(a1 > 0.0f) || !isfinite(a1) || !isfinite(b1)) return false;
+
+        const float A = sqrt(a1*a1 + (b1 - r_hi)*(b1 - r_hi));
+        const float B = sqrt(a1*a1 + (b1 - r_lo)*(b1 - r_lo));
+        if (!(A > 0.0f && B > 0.0f && B > A)) return false;
+
+        const float r21 = r_hi - r_lo;
+        const float k3 = (((A + B) * (A + B)) - r21 * r21) / (4.0f * A * B);
+        if (!(k3 > 0.0f && k3 < 1.0f)) return false;
+        const float K3 = ellint_K_complete(k3);
+        if (!isfinite(K3) || !(K3 > 0.0f)) return false;
+
+        const float x3_den = A*(r0 - r_lo) + B*(r0 - r_hi);
+        if (abs(x3_den) < 1e-8f) return false;
+        const float x3 = (A*(r0 - r_lo) - B*(r0 - r_hi)) / x3_den;
+        if (!isfinite(x3)) return false;
+        const float phi0 = acos(clamp(x3, -1.0f, 1.0f));
+        const float F0 = ellint_F_incomplete(phi0, k3);
+        if (!isfinite(F0)) return false;
+
+        out = EllipticRadialMap{};
+        out.radial_case = ELLIPTIC_REGION_III_REAL2_COMPLEX2;
+        out.r1 = r_hi;
+        out.r2 = r_lo;
+        out.r_lo = r_lo;
+        out.r_hi = r_hi;
+        out.A = A;
+        out.B = B;
+        out.m = k3;
+        out.Kc = K3;
+        out.omega = sqrt(A * B);
+        out.X0 = F0;
+        out.phase_sign = (dr0 >= 0.0f) ? +1 : -1;
+        out.tau_sign = +1;
+
+        align_initial_radial_sign(out, dr0, /*flip_phase=*/true, /*flip_tau=*/false);
+        return true;
+    }
+
+    if (nreal == 0 && ncomplex == 4) {
+        Cx pos_im[2];
+        Cx neg_im[2];
+        int npos = 0;
+        int nneg = 0;
+
+        for (int i = 0; i < 4; ++i) {
+            if (complex_roots[i].im >= 0.0f) {
+                if (npos >= 2) return false;
+                pos_im[npos++] = complex_roots[i];
+            } else {
+                if (nneg >= 2) return false;
+                neg_im[nneg++] = complex_roots[i];
+            }
+        }
+        if (npos != 2 || nneg != 2) return false;
+
+        const int j0 = (conj_dist_cx(pos_im[0], neg_im[0]) <= conj_dist_cx(pos_im[0], neg_im[1])) ? 0 : 1;
+
+        float bA = 0.0f, aA = 0.0f;
+        float bB = 0.0f, aB = 0.0f;
+        pair_params_cx(pos_im[0], neg_im[j0], bA, aA);
+        pair_params_cx(pos_im[1], neg_im[1 - j0], bB, aB);
+        if (!(aA > 0.0f && aB > 0.0f)) return false;
+
+        float b1 = bA, a1 = aA;
+        float b2 = bB, a2 = aB;
+        if (bB > bA) {
+            b1 = bB; a1 = aB;
+            b2 = bA; a2 = aA;
+        }
+        if (!(b1 > b2)) return false;
+
+        const float C = sqrt((a1 - a2)*(a1 - a2) + (b1 - b2)*(b1 - b2));
+        const float D = sqrt((a1 + a2)*(a1 + a2) + (b1 - b2)*(b1 - b2));
+        if (!(C > 0.0f && D > 0.0f)) return false;
+
+        const float k4 = (4.0f * C * D) / ((C + D) * (C + D));
+        if (!(k4 > 0.0f && k4 < 1.0f)) return false;
+        const float K4 = ellint_K_complete(k4);
+        if (!isfinite(K4) || !(K4 > 0.0f)) return false;
+
+        const float g_num = 4.0f * a2 * a2 - (C - D) * (C - D);
+        const float g_den = (C + D) * (C + D) - 4.0f * a2 * a2;
+        if (!(g_num > 0.0f && g_den > 0.0f)) return false;
+        const float g0 = sqrt(g_num / g_den);
+        if (!(g0 > 0.0f) || !isfinite(g0)) return false;
+
+        const float x4 = (r0 - b2) / max(a2, 1e-8f);
+        const float phi0 = atan(x4) + atan(g0);
+        const float F0 = ellint_F_incomplete(phi0, k4);
+        if (!isfinite(F0)) return false;
+
+        out = EllipticRadialMap{};
+        out.radial_case = ELLIPTIC_REGION_IV_COMPLEX4;
+        out.m = k4;
+        out.Kc = K4;
+        out.omega = 0.5f * (C + D);
+        out.X0 = F0;
+        out.phase_sign = +1;
+        out.tau_sign = (dr0 >= 0.0f) ? +1 : -1;
+        out.a2 = a2;
+        out.b1 = b1;
+        out.g0 = g0;
+
+        align_initial_radial_sign(out, dr0, /*flip_phase=*/false, /*flip_tau=*/true);
+        return true;
+    }
+
+    return false;
 }
 
 static float separable_radial_potential(thread const SeparableConsts& c, float r) {
@@ -904,13 +1446,17 @@ static int elliptic_closed_first_hit(thread const SeparableConsts& c,
 
     // Keep GPU behaviour aligned with CPU elliptic-closed:
     // evaluate the radial map only at the first equatorial crossing.
-    const float X = mp.X0 + float(mp.x_sign) * mp.omega * tau_first;
+    const float X = float(mp.phase_sign) * mp.X0
+                  + float(mp.tau_sign) * mp.omega * tau_first;
     const float r_now = elliptic_radial_r_from_phase(mp, X);
     if (!isfinite(r_now)) return 0;
     const float R = separable_radial_potential(c, r_now);
     const float R_scale = max(1.0f, abs(c.E*c.E*r_now*r_now*r_now*r_now));
     if (R < -1e-6f * R_scale) return 0;
-    if (r_now < r_horizon * 1.03f) return 1;
+    // For Region I/II and III, require the crossing radius to stay in the
+    // observer-accessible outer branch. Region IV has no real turning points.
+    if (mp.radial_case != ELLIPTIC_REGION_IV_COMPLEX4 && r_now < mp.r1) return 0;
+    if (r_now < r_horizon * 1.03f) return 0;
     if (r_now > r_escape) return 0;
     if (r_now >= r_isco && r_now <= r_disk_out) {
         r_hit_out = r_now;
@@ -1008,6 +1554,24 @@ static float wrap_delta_phi(float dphi) {
     return dphi - PI_F;
 }
 
+static float median3v(float a, float b, float c) {
+    return a + b + c - min(a, min(b, c)) - max(a, max(b, c));
+}
+
+static float median5v(float a, float b, float c, float d, float e) {
+    float v[5] = {a, b, c, d, e};
+    for (int i = 1; i < 5; ++i) {
+        const float key = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > key) {
+            v[j + 1] = v[j];
+            --j;
+        }
+        v[j + 1] = key;
+    }
+    return v[2];
+}
+
 static uint32_t pack_abgr(float r, float g, float b) {
     const uint32_t rr = uint32_t(clamp(r, 0.0f, 1.0f) * 255.0f);
     const uint32_t gg = uint32_t(clamp(g, 0.0f, 1.0f) * 255.0f);
@@ -1033,7 +1597,8 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
                                                       float M, float a, float Q, float L,
                                                       float r_obs, float theta_obs, float phi_obs,
                                                       float r_horizon, float r_isco, float r_disk_out,
-                                                      int intersection_mode) {
+                                                      int intersection_mode,
+                                                      int integrator_mode) {
     RayTraceResultBL res{};
     res.outcome = 2;
     res.r_hit = 0.0f;
@@ -1112,21 +1677,7 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
 
     for (int iter = 0; iter < 60000; ++iter) {
         const float step_used = dlam;
-        float r_h = r, th_h = theta, ph_h = phi, pr_h = pr, pth_h = pth;
-        rk4(r_h, th_h, ph_h, pr_h, pth_h, pt, pphi, M, a, Q, L, step_used);
-
-        float r_f = r, th_f = theta, ph_f = phi, pr_f = pr, pth_f = pth;
-        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, step_used*0.5f);
-        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, step_used*0.5f);
-
-        const float err = length(float4(r_h-r_f, th_h-th_f, pr_h-pr_f, pth_h-pth_f)) / 15.0f;
-        const float tol = 2e-5f;
-        if (err < tol || dlam < 1e-6f) {
-            r = r_f; theta = th_f; phi = ph_f; pr = pr_f; pth = pth_f;
-            const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-            dlam = clamp(dlam*sc, 1e-6f, 50.0f);
-        } else {
-            dlam = clamp(dlam*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam*0.5f);
+        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L, integrator_mode)) {
             continue;
         }
 
@@ -1220,7 +1771,8 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                                                       float M, float a, float Q, float L,
                                                       float r_obs, float theta_obs, float phi_obs,
                                                       float r_horizon, float r_isco, float r_disk_out,
-                                                      int intersection_mode) {
+                                                      int intersection_mode,
+                                                      int integrator_mode) {
     RayTraceResultBL res{};
     res.outcome = 2;
     res.r_hit = 0.0f;
@@ -1324,24 +1876,7 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
 
     for (int iter = 0; iter < 60000; ++iter) {
         const float step_used_ks = dlam_ks;
-        float X_h = X, Y_h = Y, Z_h = Z, pX_h = pX, pY_h = pY, pZ_h = pZ;
-        rk4_KS(X_h, Y_h, Z_h, pX_h, pY_h, pZ_h, pT, M, a, Q, step_used_ks);
-
-        float X_f = X, Y_f = Y, Z_f = Z, pX_f = pX, pY_f = pY, pZ_f = pZ;
-        rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used_ks*0.5f);
-        rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used_ks*0.5f);
-
-        const float err = sqrt(
-            (X_h-X_f)*(X_h-X_f) + (Y_h-Y_f)*(Y_h-Y_f) + (Z_h-Z_f)*(Z_h-Z_f) +
-            (pX_h-pX_f)*(pX_h-pX_f) + (pY_h-pY_f)*(pY_h-pY_f) + (pZ_h-pZ_f)*(pZ_h-pZ_f)
-        ) / 15.0f;
-        const float tol = 2e-5f;
-        if (err < tol || dlam_ks < 1e-6f) {
-            X = X_f; Y = Y_f; Z = Z_f; pX = pX_f; pY = pY_f; pZ = pZ_f;
-            const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-            dlam_ks = clamp(dlam_ks*sc, 1e-6f, 50.0f);
-        } else {
-            dlam_ks = clamp(dlam_ks*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam_ks*0.5f);
+        if (!adaptive_step_ks(X, Y, Z, pX, pY, pZ, dlam_ks, pT, M, a, Q, integrator_mode)) {
             continue;
         }
 
@@ -1450,17 +1985,18 @@ static RayTraceResultBL trace_standard_chart_from_angles(float alpha, float beta
                                                          float M, float a, float Q, float L,
                                                          float r_obs, float theta_obs, float phi_obs,
                                                          float r_horizon, float r_isco, float r_disk_out,
-                                                         int chart, int intersection_mode) {
+                                                         int chart, int intersection_mode,
+                                                         int integrator_mode) {
     if (chart == 1 && abs(L) <= 1e-8f) {
         return trace_standard_ks_from_angles(alpha, beta, M, a, Q, L,
                                              r_obs, theta_obs, phi_obs,
                                              r_horizon, r_isco, r_disk_out,
-                                             intersection_mode);
+                                             intersection_mode, integrator_mode);
     }
     return trace_standard_bl_from_angles(alpha, beta, M, a, Q, L,
                                          r_obs, theta_obs, phi_obs,
                                          r_horizon, r_isco, r_disk_out,
-                                         intersection_mode);
+                                         intersection_mode, integrator_mode);
 }
 
 // ── Main compute implementation (shared by all entry kernels) ─
@@ -1497,7 +2033,7 @@ static inline void trace_pixel_impl(
             alpha, beta, M, a, Q, L,
             cp.r_obs, cp.theta_obs, cp.phi_obs,
             kp.r_horizon, kp.r_isco, kp.r_disk_out,
-            cp.chart, cp.intersection_mode);
+            cp.chart, cp.intersection_mode, cp.integrator_mode);
 
         if (c.outcome == 0) {
             const float4 bgc = clamp(sample_background(bg_tex, bg_samp, c.theta_esc, c.phi_esc), 0.0f, 1.0f);
@@ -1507,6 +2043,9 @@ static inline void trace_pixel_impl(
         }
 
         if (c.outcome == 1) {
+            const bool anti_fireflies = (cp.anti_fireflies != 0);
+            float shade_r_hit = c.r_hit;
+            float shade_redshift = c.redshift;
             float magnif = 1.0f;
             const float eps = cp.fov_h / float(max(cp.width, 1)) * 0.5f;
             if (eps > 1e-8f) {
@@ -1514,34 +2053,80 @@ static inline void trace_pixel_impl(
                     alpha + eps, beta, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode);
                 const RayTraceResultBL am = trace_standard_chart_from_angles(
                     alpha - eps, beta, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode);
                 const RayTraceResultBL bp = trace_standard_chart_from_angles(
                     alpha, beta + eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode);
                 const RayTraceResultBL bm = trace_standard_chart_from_angles(
                     alpha, beta - eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode);
 
                 if (ap.outcome == 1 && am.outcome == 1 && bp.outcome == 1 && bm.outcome == 1) {
                     const float dr_da = (ap.r_hit - am.r_hit) / (2.0f * eps);
                     const float dr_db = (bp.r_hit - bm.r_hit) / (2.0f * eps);
                     const float dphi_da = wrap_delta_phi(ap.phi_hit - am.phi_hit) / (2.0f * eps);
                     const float dphi_db = wrap_delta_phi(bp.phi_hit - bm.phi_hit) / (2.0f * eps);
-                    magnif = abs(dr_da * dphi_db - dr_db * dphi_da);
-                    magnif = max(magnif, 1e-12f);
+                    const float jac_center = abs(dr_da * dphi_db - dr_db * dphi_da);
+
+                    if (!anti_fireflies) {
+                        magnif = max(jac_center, 1e-12f);
+                    } else {
+                        const float dr_da_pp = (ap.r_hit - c.r_hit) / eps;
+                        const float dr_db_pp = (bp.r_hit - c.r_hit) / eps;
+                        const float dphi_da_pp = wrap_delta_phi(ap.phi_hit - c.phi_hit) / eps;
+                        const float dphi_db_pp = wrap_delta_phi(bp.phi_hit - c.phi_hit) / eps;
+                        const float jac_pp = abs(dr_da_pp * dphi_db_pp - dr_db_pp * dphi_da_pp);
+
+                        const float dr_da_mm = (c.r_hit - am.r_hit) / eps;
+                        const float dr_db_mm = (c.r_hit - bm.r_hit) / eps;
+                        const float dphi_da_mm = wrap_delta_phi(c.phi_hit - am.phi_hit) / eps;
+                        const float dphi_db_mm = wrap_delta_phi(c.phi_hit - bm.phi_hit) / eps;
+                        const float jac_mm = abs(dr_da_mm * dphi_db_mm - dr_db_mm * dphi_da_mm);
+
+                        const float jac_robust = median3v(jac_center, jac_pp, jac_mm);
+                        const float r_med = median5v(c.r_hit, ap.r_hit, am.r_hit, bp.r_hit, bm.r_hit);
+                        const float red_med = median5v(c.redshift, ap.redshift, am.redshift,
+                                                       bp.redshift, bm.redshift);
+                        const float r_dev = max(max(abs(ap.r_hit - c.r_hit), abs(am.r_hit - c.r_hit)),
+                                                max(abs(bp.r_hit - c.r_hit), abs(bm.r_hit - c.r_hit)));
+                        const float red_dev = max(max(abs(ap.redshift - c.redshift), abs(am.redshift - c.redshift)),
+                                                  max(abs(bp.redshift - c.redshift), abs(bm.redshift - c.redshift)));
+                        const float phi_dev = max(max(abs(wrap_delta_phi(ap.phi_hit - c.phi_hit)),
+                                                      abs(wrap_delta_phi(am.phi_hit - c.phi_hit))),
+                                                  max(abs(wrap_delta_phi(bp.phi_hit - c.phi_hit)),
+                                                      abs(wrap_delta_phi(bm.phi_hit - c.phi_hit))));
+                        const float r_tol = max(0.35f, 0.06f * max(c.r_hit, 1.0f));
+                        const float red_tol = max(0.35f, 0.35f * max(abs(red_med), 1.0f));
+                        const bool unstable =
+                            !isfinite(jac_robust) || !isfinite(r_med) || !isfinite(red_med) ||
+                            (jac_robust <= 1e-12f) ||
+                            (r_dev > r_tol) ||
+                            (red_dev > red_tol) ||
+                            (phi_dev > 1.20f);
+
+                        magnif = max(jac_robust, 1e-12f);
+                        if (unstable) {
+                            // At branch discontinuities we damp spikes instead of replacing hit data.
+                            magnif = max(magnif, 2.0f);
+                        }
+                        if (isfinite(red_med)) {
+                            const float red_cap = red_med + red_tol;
+                            shade_redshift = min(shade_redshift, red_cap);
+                        }
+                    }
                 }
             }
 
-            colour = disk_color_abgr(c.r_hit, c.redshift, magnif, M, kp.r_isco);
+            colour = disk_color_abgr(shade_r_hit, shade_redshift, magnif, M, kp.r_isco);
             output[py * width + px] = colour;
             return;
         }
@@ -1655,6 +2240,17 @@ static inline void trace_pixel_impl(
             return;
         }
         if (eout == 2) {
+            // Horizon-precedence safety check against chart-native standard tracer.
+            const RayTraceResultBL verify = trace_standard_chart_from_angles(
+                alpha, beta, M, a, Q, L,
+                cp.r_obs, cp.theta_obs, cp.phi_obs,
+                kp.r_horizon, kp.r_isco, kp.r_disk_out,
+                cp.chart, cp.intersection_mode, cp.integrator_mode);
+            if (verify.outcome == 2) {
+                output[py * width + px] = colour;
+                return;
+            }
+
             const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L);
 
             const float T = 6500.0f * sqrt(6.0f*M/r_hit_ell) * clamp(red, 0.2f, 5.0f);
@@ -1857,24 +2453,7 @@ static inline void trace_pixel_impl(
 
             for (int iter = 0; iter < 60000; ++iter) {
                 const float step_used_ks = dlam_ks;
-                float X_h = X, Y_h = Y, Z_h = Z, pX_h = pX, pY_h = pY, pZ_h = pZ;
-                rk4_KS(X_h, Y_h, Z_h, pX_h, pY_h, pZ_h, pT, M, a, Q, step_used_ks);
-
-                float X_f = X, Y_f = Y, Z_f = Z, pX_f = pX, pY_f = pY, pZ_f = pZ;
-                rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used_ks*0.5f);
-                rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used_ks*0.5f);
-
-                const float err = sqrt(
-                    (X_h-X_f)*(X_h-X_f) + (Y_h-Y_f)*(Y_h-Y_f) + (Z_h-Z_f)*(Z_h-Z_f) +
-                    (pX_h-pX_f)*(pX_h-pX_f) + (pY_h-pY_f)*(pY_h-pY_f) + (pZ_h-pZ_f)*(pZ_h-pZ_f)
-                ) / 15.0f;
-                const float tol = 2e-5f;
-                if (err < tol || dlam_ks < 1e-6f) {
-                    X = X_f; Y = Y_f; Z = Z_f; pX = pX_f; pY = pY_f; pZ = pZ_f;
-                    const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-                    dlam_ks = clamp(dlam_ks*sc, 1e-6f, 50.0f);
-                } else {
-                    dlam_ks = clamp(dlam_ks*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam_ks*0.5f);
+                if (!adaptive_step_ks(X, Y, Z, pX, pY, pZ, dlam_ks, pT, M, a, Q, cp.integrator_mode)) {
                     continue;
                 }
 
@@ -1989,23 +2568,7 @@ static inline void trace_pixel_impl(
     }
 
     for (int iter = 0; iter < 60000; ++iter) {
-        // Adaptive step (simple: fixed tolerance)
-        float r_h = r, th_h = theta, ph_h = phi, pr_h = pr, pth_h = pth;
-        rk4(r_h, th_h, ph_h, pr_h, pth_h, pt, pphi, M, a, Q, L, dlam);
-
-        float r_f = r, th_f = theta, ph_f = phi, pr_f = pr, pth_f = pth;
-        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
-        rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, dlam*0.5f);
-
-        const float err = length(float4(r_h-r_f, th_h-th_f,
-                                        pr_h-pr_f, pth_h-pth_f)) / 15.0f;
-        const float tol = 2e-5f;
-        if (err < tol || dlam < 1e-6f) {
-            r = r_f; theta = th_f; phi = ph_f; pr = pr_f; pth = pth_f;
-            float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-            dlam = clamp(dlam*sc, 1e-6f, 50.0f);
-        } else {
-            dlam = clamp(dlam*0.9f*pow(tol/err, 0.25f), 1e-6f, dlam*0.5f);
+        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L, cp.integrator_mode)) {
             continue;
         }
 

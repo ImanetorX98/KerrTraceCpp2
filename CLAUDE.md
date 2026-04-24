@@ -142,3 +142,53 @@ where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
 - Headers are self-contained; no `.cpp` files for metric/geodesic.
 - GPU code mirrors CPU math exactly (same formulas, different types).
 - Never use `std::clamp` for C++14 compatibility in GPU ports.
+
+---
+
+## Known Issues & Ongoing Work
+
+### elliptic-closed solver — BUG (under investigation, 2026-04-24)
+
+**Status**: Root cause identified, partial fix applied, not yet resolved.
+
+**Symptom**: `--elliptic-closed` renders show enlarged black shadow — the secondary image
+(bright arc above the BH) is missing or wrong in both CPU (BL chart) and GPU (Metal).
+
+**Root cause (identified)**:
+The radial map in `init_elliptic_radial_map` / `elliptic_closed_first_hit` uses the
+**inner pair** of roots (r3, r4 in descending order = smallest two roots of the radial
+potential R(r)). For an observer at r_obs >> all roots, the accessible region is
+r > r1 (outermost root). The formula `r = (r4*r31 - r3*r41*sn²)/(r31 - r41*sn²)`
+has a singularity at sn²* = r31/r41 ∈ (0,1) which maps sn² ∈ (sn²*, 1] to the
+observer's region r ∈ (r1, +∞). This produces physically valid r_now for some rays.
+
+**Secondary image issue**:
+The elliptic solver evaluates **only the first equatorial crossing** (τ_first from
+`first_equator_crossing_mino_time`). For some rays that should form the secondary image,
+the elliptic solver may classify them as DISK_HIT at the wrong r_now (not the actual
+disk crossing), producing incorrect color (typically very dark due to wrong emissivity),
+while the fallback numerical path gives the correct result.
+
+**Partial fix applied (2026-04-24)**:
+- Added guard `if (r_now < mp.r1) return fallback` in both `main.cpp` and `tracer.metal`
+  to reject disk hits in the inner inaccessible region.
+- Changed `return 1 (HORIZON)` to `return 0 (fallback)` for sub-horizon r_now values.
+- These partially reduce false classifications but do NOT fully fix the solver.
+
+**Correct fix needed**:
+Implement the Gralla & Lupsasca (2019) Type-I orbit radial map using the **outer pair**
+of turning points (r1, r2 in descending notation = the two largest roots). The correct
+formula (GL Eq. A10 inversion) uses r ∈ [r2_GL, r4_GL] (GL ascending) = [r2, r1] (code
+descending). Until this is implemented, use `--standard` (default) for correct images.
+
+**Standard render (Metal GPU, ray-bundles) confirmed working correctly**:
+- 720p and 1080p frames rendered on 2026-04-24, bump/diagonal artifact resolved.
+- Correct physics: secondary image visible, bright left side (a=0.5 approaching material).
+
+### Build notes (2026-04-24)
+- CPU binary: `cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu`
+- Metal binary: `cmake -B build -DUSE_METAL=ON && cmake --build build`
+- tracer.metal is loaded at runtime from `build/tracer.metal` (copied from source).
+  Changes to `gpu/metal/tracer.metal` require rebuild to copy to build dir.
+- Metal elliptic-closed: `can_separable_kerr` in shader checks Q≈0, Λ≈0 (NOT chart),
+  so elliptic solver runs even in KS chart mode on GPU.
