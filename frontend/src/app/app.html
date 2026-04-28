@@ -48,49 +48,56 @@
         </mat-select>
       </div>
 
-      <!-- Black hole -->
+      <!-- Scene mode -->
       <div class="panel" style="margin-bottom:14px">
-        <h2>Black Hole</h2>
-
-        <div class="param-row">
-          <label>Spin <i>a/M</i></label>
-          <num-input [(value)]="params.a"
-                     [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3">
-          </num-input>
+        <h2>Scene</h2>
+        <div style="display:flex;gap:6px;margin-bottom:14px">
+          <button class="backend-btn"
+                  [class.active]="params.scene_mode === 'black_hole'"
+                  (click)="setSceneMode('black_hole')">
+            <mat-icon style="font-size:14px;width:14px;height:14px;margin-right:4px">blur_on</mat-icon>
+            Black Hole
+          </button>
+          <button class="backend-btn"
+                  [class.active]="params.scene_mode === 'wormhole'"
+                  (click)="setSceneMode('wormhole')">
+            <mat-icon style="font-size:14px;width:14px;height:14px;margin-right:4px">lens_blur</mat-icon>
+            Wormhole
+          </button>
         </div>
 
-        <div class="param-row">
-          <label>Charge <i>Q/M</i></label>
-          <num-input [value]="params.q"
-                     (valueChange)="setCharge($event)"
-                     [min]="-1" [max]="1" [step]="0.01" [decimals]="3">
-          </num-input>
+        <!-- Black hole params -->
+        <div *ngIf="params.scene_mode === 'black_hole'">
+          <div class="param-row">
+            <label>Spin <i>a/M</i></label>
+            <num-input [(value)]="params.a"
+                       [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3">
+            </num-input>
+          </div>
+          <div class="param-row">
+            <label>Charge <i>Q/M</i></label>
+            <num-input [value]="params.q"
+                       (valueChange)="setCharge($event)"
+                       [min]="-1" [max]="1" [step]="0.01" [decimals]="3">
+            </num-input>
+          </div>
+          <div class="param-row">
+            <label>Λ <span style="font-size:10px;color:#555">(×10⁻³)</span></label>
+            <num-input [value]="params.lambda"
+                       (valueChange)="setLambda($event)"
+                       [min]="-5" [max]="5" [step]="0.1" [decimals]="3">
+            </num-input>
+          </div>
+          <div class="param-row">
+            <label>Disk r<sub>out</sub></label>
+            <num-input [(value)]="params.disk_out"
+                       [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
+            </num-input>
+          </div>
         </div>
 
-        <div class="param-row">
-          <label>Λ <span style="font-size:10px;color:#555">(×10⁻³)</span></label>
-          <num-input [value]="params.lambda"
-                     (valueChange)="setLambda($event)"
-                     [min]="-5" [max]="5" [step]="0.1" [decimals]="3">
-          </num-input>
-        </div>
-
-        <div class="param-row">
-          <label>Disk r<sub>out</sub></label>
-          <num-input [(value)]="params.disk_out"
-                     [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
-          </num-input>
-        </div>
-      </div>
-
-      <!-- Wormhole -->
-      <div class="panel" style="margin-bottom:14px">
-        <h2>Wormhole (DNEG)</h2>
-        <div class="switch-row" (click)="params.wormhole = !params.wormhole">
-          <label>Enable wormhole mode</label>
-          <button class="switch" [class.on]="params.wormhole"></button>
-        </div>
-        <div *ngIf="params.wormhole" style="margin-top:8px">
+        <!-- Wormhole params -->
+        <div *ngIf="params.scene_mode === 'wormhole'">
           <div class="param-row">
             <label>Throat ρ</label>
             <num-input [(value)]="params.wh_rho"
@@ -118,7 +125,7 @@
             </mat-select>
           </div>
           <div style="margin-top:6px;color:#555;font-size:11px;line-height:1.4">
-            ℓ &gt; 0 → Universe A (observer) · ℓ &lt; 0 → Universe B (through throat)
+            ℓ &gt; 0 → Universe A · ℓ &lt; 0 → Universe B (through throat)
           </div>
         </div>
       </div>

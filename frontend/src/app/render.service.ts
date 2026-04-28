@@ -33,6 +33,8 @@ export interface RenderParams {
   disk_rings: number;
   disk_sectors: number;
   disk_sigma: number;
+  // Scene mode
+  scene_mode: 'black_hole' | 'wormhole';
   // Wormhole (DNEG metric)
   wormhole: boolean;
   wh_rho: number;

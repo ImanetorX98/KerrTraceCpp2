@@ -54,6 +54,7 @@ export class App implements OnInit, OnDestroy {
     integrator_tol: 2e-5,
     camera_spp: 2,
     background: 'sfondo5.jpg',
+    scene_mode: 'black_hole',
     disk_palette: 'blackbody',
     disk_rings: 7,
     disk_sectors: 14,
@@ -162,6 +163,11 @@ export class App implements OnInit, OnDestroy {
 
   ngOnDestroy() {
     this.sub?.unsubscribe();
+  }
+
+  setSceneMode(mode: 'black_hole' | 'wormhole') {
+    this.params.scene_mode = mode;
+    this.params.wormhole = (mode === 'wormhole');
   }
 
   toggleBundles() {
