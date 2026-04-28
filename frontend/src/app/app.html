@@ -9,7 +9,7 @@
     <div style="display:flex;align-items:center;gap:16px">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> Phase 2 — GPU &amp; Quality</div>
+        <div><strong>Version</strong> v0.2.3 — Wormhole</div>
       </div>
       <span class="status-chip" [class]="status()">
         <span *ngIf="status()==='idle'">Idle</span>
@@ -61,14 +61,16 @@
 
         <div class="param-row">
           <label>Charge <i>Q/M</i></label>
-          <num-input [(value)]="params.q"
+          <num-input [value]="params.q"
+                     (valueChange)="setCharge($event)"
                      [min]="-1" [max]="1" [step]="0.01" [decimals]="3">
           </num-input>
         </div>
 
         <div class="param-row">
           <label>Λ <span style="font-size:10px;color:#555">(×10⁻³)</span></label>
-          <num-input [(value)]="params.lambda"
+          <num-input [value]="params.lambda"
+                     (valueChange)="setLambda($event)"
                      [min]="-5" [max]="5" [step]="0.1" [decimals]="3">
           </num-input>
         </div>
@@ -78,6 +80,46 @@
           <num-input [(value)]="params.disk_out"
                      [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M">
           </num-input>
+        </div>
+      </div>
+
+      <!-- Wormhole -->
+      <div class="panel" style="margin-bottom:14px">
+        <h2>Wormhole (DNEG)</h2>
+        <div class="switch-row" (click)="params.wormhole = !params.wormhole">
+          <label>Enable wormhole mode</label>
+          <button class="switch" [class.on]="params.wormhole"></button>
+        </div>
+        <div *ngIf="params.wormhole" style="margin-top:8px">
+          <div class="param-row">
+            <label>Throat ρ</label>
+            <num-input [(value)]="params.wh_rho"
+                       [min]="0.1" [max]="10" [step]="0.1" [decimals]="2" unit="M">
+            </num-input>
+          </div>
+          <div class="param-row">
+            <label>Lensing M</label>
+            <num-input [(value)]="params.wh_M_lens"
+                       [min]="0.1" [max]="10" [step]="0.1" [decimals]="2" unit="M">
+            </num-input>
+          </div>
+          <div class="param-row">
+            <label>Tunnel <i>a</i></label>
+            <num-input [(value)]="params.wh_a_tunnel"
+                       [min]="0" [max]="5" [step]="0.01" [decimals]="3" unit="M">
+            </num-input>
+          </div>
+          <div style="margin-top:8px">
+            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:6px">Universe B background</div>
+            <mat-select [(ngModel)]="params.bg_b" placeholder="Same as A"
+                        style="width:100%;font-size:13px">
+              <mat-option value="">Same as Universe A</mat-option>
+              <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg">{{bg}}</mat-option>
+            </mat-select>
+          </div>
+          <div style="margin-top:6px;color:#555;font-size:11px;line-height:1.4">
+            ℓ &gt; 0 → Universe A (observer) · ℓ &lt; 0 → Universe B (through throat)
+          </div>
         </div>
       </div>
 
@@ -150,17 +192,65 @@
           </div>
         </div>
 
-        <div class="switch-row" (click)="params.bundles = !params.bundles">
+        <div class="switch-row" (click)="toggleBundles()">
           <label>Ray bundles</label>
           <button class="switch" [class.on]="params.bundles"></button>
         </div>
-        <div class="switch-row" (click)="params.anti_fireflies = !params.anti_fireflies">
+        <div class="switch-row"
+             [class.disabled]="!params.bundles"
+             (click)="toggleAntiFireflies()">
           <label>Anti-fireflies (bundle)</label>
-          <button class="switch" [class.on]="params.anti_fireflies"></button>
+          <button class="switch"
+                  [class.on]="params.anti_fireflies"
+                  [disabled]="!params.bundles"></button>
+        </div>
+        <div class="switch-row"
+             [class.disabled]="params.backend === 'cpu'"
+             [matTooltip]="params.backend === 'cpu' ? 'Disponibile solo con backend GPU' : ''"
+             (click)="toggleGpuFp64()">
+          <label>GPU FP64 (experimental)</label>
+          <button class="switch"
+                  [class.on]="params.gpu_fp64"
+                  [disabled]="params.backend === 'cpu'"></button>
         </div>
         <div class="switch-row" (click)="params.dopri5 = !params.dopri5">
           <label>DOPRI5 integrator</label>
           <button class="switch" [class.on]="params.dopri5"></button>
+        </div>
+        <div class="param-row">
+          <label>Max steps</label>
+          <num-input [(value)]="params.max_steps"
+                     [min]="1000" [max]="1000000" [step]="1000" [decimals]="0">
+          </num-input>
+        </div>
+        <div class="param-row">
+          <label>Step init</label>
+          <num-input [(value)]="params.step_init"
+                     [min]="0.0001" [max]="10" [step]="0.05" [decimals]="4">
+          </num-input>
+        </div>
+        <div class="param-row">
+          <label>Integrator tol</label>
+          <num-input [(value)]="params.integrator_tol"
+                     [min]="0.00000001" [max]="0.01" [step]="0.0000001" [decimals]="8">
+          </num-input>
+        </div>
+        <div class="param-row">
+          <label>Supersampling</label>
+          <mat-select [(ngModel)]="params.camera_spp"
+                      style="width:170px;font-size:13px;color:#f0f0f0">
+            <mat-option *ngFor="let spp of supersamplingLevels" [value]="spp">
+              {{ spp }} raggi/pixel
+            </mat-option>
+          </mat-select>
+        </div>
+        <div style="margin:-4px 0 8px;color:#787c84;font-size:12px;line-height:1.35">
+          Multi-pass subpixel AA (stile KerrTrace Python). Più alto = meno sgranatura, ma render più lento.
+          <span *ngIf="raysPerFrame() !== null" style="display:block;margin-top:3px">
+            Raggi/frame stimati:
+            {{ fmtInt(raysPerFrame()!) }}
+            ({{ fmtInt(currentResolutionSize()!.w) }}×{{ fmtInt(currentResolutionSize()!.h) }} × {{ params.camera_spp }})
+          </span>
         </div>
         <div style="margin:12px 0 6px">
           <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:8px">Solver mode</div>
@@ -177,6 +267,8 @@
             </button>
             <button class="backend-btn"
                     [class.active]="params.solver_mode === 'elliptic_closed'"
+                    [disabled]="!isEllipticClosedAvailable()"
+                    [matTooltip]="!isEllipticClosedAvailable() ? 'Elliptic-closed richiede Q=0 e Λ=0' : ''"
                     (click)="params.solver_mode = 'elliptic_closed'">
               Elliptic-closed
             </button>
@@ -197,6 +289,38 @@
             {{bg}}
           </mat-option>
         </mat-select>
+
+        <hr class="divider">
+
+        <h2>Disk palette</h2>
+        <div style="display:flex;gap:6px;margin-bottom:10px">
+          <button class="backend-btn"
+                  [class.active]="params.disk_palette === 'blackbody'"
+                  (click)="params.disk_palette = 'blackbody'">Blackbody</button>
+          <button class="backend-btn"
+                  [class.active]="params.disk_palette === 'interstellar'"
+                  (click)="params.disk_palette = 'interstellar'">Interstellar</button>
+        </div>
+        <div *ngIf="params.disk_palette === 'interstellar'">
+          <div class="param-row">
+            <label>Rings</label>
+            <num-input [(value)]="params.disk_rings"
+                       [min]="1" [max]="20" [step]="1" [decimals]="0">
+            </num-input>
+          </div>
+          <div class="param-row">
+            <label>Sectors</label>
+            <num-input [(value)]="params.disk_sectors"
+                       [min]="1" [max]="40" [step]="1" [decimals]="0">
+            </num-input>
+          </div>
+          <div class="param-row">
+            <label>Blend σ</label>
+            <num-input [(value)]="params.disk_sigma"
+                       [min]="0.1" [max]="2.0" [step]="0.05" [decimals]="2">
+            </num-input>
+          </div>
+        </div>
       </div>
 
       <!-- Animation panel -->
@@ -297,10 +421,17 @@
       <!-- Progress -->
       <div class="progress-wrap" *ngIf="status()==='running'">
         <div class="progress-info">
-          <span>{{progress()}}%</span>
-          <span *ngIf="eta() > 0">{{fmt(elapsed(), 0)}}s elapsed · ETA {{fmt(eta(), 0)}}s</span>
+          <span *ngIf="hasDeterminateProgress(); else renderProgressPending">{{progress()}}%</span>
+          <ng-template #renderProgressPending>
+            <span>In corso...</span>
+          </ng-template>
+          <span *ngIf="eta() > 0">{{fmtClock(elapsed())}} elapsed · ETA {{fmtClock(eta())}}</span>
+          <span *ngIf="eta() <= 0">{{fmtClock(elapsed())}} elapsed</span>
         </div>
-        <mat-progress-bar mode="determinate" [value]="progress()"></mat-progress-bar>
+        <mat-progress-bar
+          [mode]="hasDeterminateProgress() ? 'determinate' : 'indeterminate'"
+          [value]="hasDeterminateProgress() ? progress() : 0">
+        </mat-progress-bar>
       </div>
 
       <!-- Log -->
@@ -375,10 +506,17 @@
       <!-- Progress -->
       <div class="progress-wrap" *ngIf="status()==='running'">
         <div class="progress-info">
-          <span>{{progress()}}%</span>
-          <span *ngIf="eta() > 0">{{fmt(elapsed(), 0)}}s elapsed · ETA {{fmt(eta(), 0)}}s</span>
+          <span *ngIf="hasDeterminateProgress(); else recolorProgressPending">{{progress()}}%</span>
+          <ng-template #recolorProgressPending>
+            <span>In corso...</span>
+          </ng-template>
+          <span *ngIf="eta() > 0">{{fmtClock(elapsed())}} elapsed · ETA {{fmtClock(eta())}}</span>
+          <span *ngIf="eta() <= 0">{{fmtClock(elapsed())}} elapsed</span>
         </div>
-        <mat-progress-bar mode="determinate" [value]="progress()"></mat-progress-bar>
+        <mat-progress-bar
+          [mode]="hasDeterminateProgress() ? 'determinate' : 'indeterminate'"
+          [value]="hasDeterminateProgress() ? progress() : 0">
+        </mat-progress-bar>
       </div>
 
       <!-- Log -->

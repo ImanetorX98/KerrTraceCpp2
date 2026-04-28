@@ -15,6 +15,7 @@
 #include "geodesic.hpp"
 #include "knds_metric.hpp"
 #include "ray_bundle.hpp"
+#include "wormhole_metric.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -66,10 +67,17 @@ template<class T> static T clamp(T v, T lo, T hi) {
 struct RGB { uint8_t r, g, b; };
 
 // ── Colorization parameters (Phase 2 controls) ───────────────
+enum class DiskPalette { BLACKBODY, INTERSTELLAR };
+
 struct ColorParams {
     double exposure    = 1.0;   // intensity multiplier before tonemapping
     double gamma       = 2.2;   // gamma correction exponent
     double temp_scale  = 1.0;   // disk blackbody temperature scale
+    DiskPalette palette    = DiskPalette::BLACKBODY;
+    int    disk_rings      = 7;    // number of radial rings in segmented mode
+    int    disk_sectors    = 14;   // number of azimuthal sectors
+    double disk_sigma      = 0.5;  // Gaussian blend width (in cell units)
+    double disk_hue_offset = 0.0;  // hue offset added to each cell [0,1)
 };
 
 // ── Per-pixel geodesic result (Phase 1 output) ───────────────
@@ -79,10 +87,11 @@ struct GeoPixel {
     float   r;          // BL radius at disk crossing (or final r)
     float   redshift;   // g = ν_obs/ν_em
     float   magnif;     // flux magnification (bundle mode; 1 in single-ray)
+    float   phi_disk;   // BL azimuthal angle at disk crossing (0 if not disk hit)
     float   theta_esc;  // direction at escape (background lookup)
     float   phi_esc;
 };
-static_assert(sizeof(GeoPixel) == 24, "GeoPixel size mismatch");
+static_assert(sizeof(GeoPixel) == 28, "GeoPixel size mismatch");
 
 // ── .kgeo file format ─────────────────────────────────────────
 static const char   KGEO_MAGIC[4]  = {'K','G','E','O'};
@@ -147,7 +156,7 @@ struct BackgroundImage {
         if (pw < 0) pw += 2.0*M_PI;
         double uf = pw  / (2.0*M_PI) * (w-1);
         double vf = theta / M_PI     * (h-1);
-        int u0=(int)uf, u1=std::min(u0+1,w-1);
+        int u0=(int)uf, u1=(w > 1) ? ((u0 + 1) % w) : 0;
         int v0=(int)vf, v1=std::min(v0+1,h-1);
         double fu=uf-u0, fv=vf-v0;
         auto at=[&](int u,int v)->const uint8_t*{
@@ -162,7 +171,7 @@ struct BackgroundImage {
 };
 
 // ── Geodesic trace helpers ────────────────────────────────────
-enum class Outcome { ESCAPED, DISK_HIT, HORIZON };
+enum class Outcome { ESCAPED, DISK_HIT, HORIZON, ESCAPED_B };
 enum class CoordinateChart { KS, BL };
 enum class RaySolverMode { STANDARD, SEMI_ANALYTIC, ELLIPTIC_CLOSED };
 enum class IntersectionMode { LINEAR, HERMITE };
@@ -177,7 +186,14 @@ enum class EllipticFallbackReason : uint8_t {
 };
 struct TraceResult {
     Outcome out; double r, redshift;
+    double phi_disk=0.0;   // BL azimuthal angle at disk crossing (0 if not a disk hit)
     double theta_esc=0.0, phi_esc=0.0;
+};
+
+struct IntegratorControls {
+    int    max_steps = 500000;
+    double step_init = 1.0;
+    double tol       = 1e-7;
 };
 
 static const char* solver_mode_name(RaySolverMode mode) {
@@ -327,17 +343,19 @@ static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& 
 static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                                 double r_disk_in, double r_disk_out,
                                 double r_escape,
-                                Integrator intg=Integrator::RK4_DOUBLING) {
-    double rh=g.r_horizon(), dlam=1.0;
+                                Integrator intg=Integrator::RK4_DOUBLING,
+                                const IntegratorControls& ctl = IntegratorControls{}) {
+    double rh=g.r_horizon(), dlam=std::max(ctl.step_init, 1e-10);
     const double rh_cut = rh * 1.03;
     Vec4d fsal=Vec4d::nan_init();
-    for (int it=0; it<500000; ++it) {
+    const int max_steps = std::max(1, ctl.max_steps);
+    for (int it=0; it<max_steps; ++it) {
         const GeodesicState s_prev = s;
         double step_used = dlam;
         int rejects = 0;
         while (true) {
             step_used = dlam;
-            if (adaptive_step(g, s, dlam, intg, fsal)) break;
+            if (adaptive_step(g, s, dlam, intg, fsal, ctl.tol)) break;
             if (!std::isfinite(dlam) || ++rejects > 64)
                 return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
         }
@@ -348,6 +366,7 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
 
         double disk_r_hit = 0.0;
         double disk_redshift_hit = 1.0;
+        double disk_phi_hit = 0.0;
 
         const double q0 = s_prev.theta - M_PI/2.0;
         const double q1 = s.theta      - M_PI/2.0;
@@ -369,6 +388,7 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                 if (r_hit>=r_disk_in && r_hit<=r_disk_out) {
                     disk_r_hit = r_hit;
                     disk_redshift_hit = clamp(disk_redshift(r_hit, s.pt, s.pphi, g), 0.0, 20.0);
+                    disk_phi_hit = s_prev.phi + alpha * (s.phi - s_prev.phi);
                     best_alpha = alpha;
                     best_event = StepEvent::DISK;
                 }
@@ -398,7 +418,7 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
         }
 
         if (best_event == StepEvent::DISK) {
-            return {Outcome::DISK_HIT, disk_r_hit, disk_redshift_hit};
+            return {Outcome::DISK_HIT, disk_r_hit, disk_redshift_hit, disk_phi_hit};
         }
         if (best_event == StepEvent::HORIZON) {
             const double r_h = s_prev.r + best_alpha * (s.r - s_prev.r);
@@ -556,10 +576,11 @@ static bool rk4_adaptive_separable_kerr(const SeparableKerrConsts& c, SeparableS
 
 static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMetric& g,
                                                double r_disk_in, double r_disk_out,
-                                               double r_escape) {
+                                               double r_escape,
+                                               const IntegratorControls& ctl = IntegratorControls{}) {
     SeparableKerrConsts c{};
     if (!init_separable_consts(s_bl, g, c))
-        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl);
 
     // Initial signs from BL canonical velocity directions.
     double dr0=0.0, dth0=0.0, dpr0=0.0, dpth0=0.0;
@@ -571,13 +592,14 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
 
     const double rh = g.r_horizon();
     const double rh_cut = rh * 1.03;
-    double h = 1.0;
+    double h = std::max(ctl.step_init, 1e-10);
     double prev_Rpot = kerr_sep_R(c, s.r);
     double prev_Thpot = kerr_sep_Theta(c, s.theta);
     const double R_turn_eps = 1e-9;
     const double Th_turn_eps = 1e-11;
 
-    for (int it = 0; it < 500000; ++it) {
+    const int max_steps = std::max(1, ctl.max_steps);
+    for (int it = 0; it < max_steps; ++it) {
         const SeparableState s_prev = s;
         const double prev_Rpot_step = prev_Rpot;
         const double prev_Thpot_step = prev_Thpot;
@@ -585,9 +607,9 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
         int rejects = 0;
         while (true) {
             step_used = h;
-            if (rk4_adaptive_separable_kerr(c, s, h)) break;
+            if (rk4_adaptive_separable_kerr(c, s, h, ctl.tol)) break;
             if (!std::isfinite(h) || ++rejects > 64)
-                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
+                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl);
         }
 
         // Keep theta in [0, pi].
@@ -610,6 +632,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
         StepEvent best_event = StepEvent::NONE;
         double disk_r_hit = 0.0;
         double disk_red_hit = 1.0;
+        double disk_phi_hit = 0.0;
 
         const double q0 = s_prev.theta - M_PI/2.0;
         const double q1 = s.theta      - M_PI/2.0;
@@ -620,7 +643,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
             double dr1=0.0, dth1=0.0, dphi1=0.0;
             if (!kerr_sep_rhs(c, s_prev, dr0, dth0, dphi0) ||
                 !kerr_sep_rhs(c, s,      dr1, dth1, dphi1)) {
-                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING);
+                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl);
             }
 
             double alpha = 0.0;
@@ -632,6 +655,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
                 if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
                     disk_r_hit = r_hit;
                     disk_red_hit = clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g), 0.0, 20.0);
+                    disk_phi_hit = s_prev.phi + alpha * (s.phi - s_prev.phi);
                     best_alpha = alpha;
                     best_event = StepEvent::DISK;
                 }
@@ -661,7 +685,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
         }
 
         if (best_event == StepEvent::DISK)
-            return {Outcome::DISK_HIT, disk_r_hit, disk_red_hit};
+            return {Outcome::DISK_HIT, disk_r_hit, disk_red_hit, disk_phi_hit};
         if (best_event == StepEvent::HORIZON) {
             const double r_h = s_prev.r + best_alpha * (s.r - s_prev.r);
             return {Outcome::HORIZON, r_h, 0.0};
@@ -894,7 +918,8 @@ static double elliptic_radial_r_from_phase(const EllipticRadialMap& mp, double X
         const double sn2 = jacobi_sn2_from_u(X, mp.m, mp.Kc);
         if (!std::isfinite(sn2)) return std::numeric_limits<double>::quiet_NaN();
 
-        // GL Eq. (B46) mapped to code-descending roots (NotebookLM mapping).
+        // GL Eq. (B46) alternative form using GL_r1 (code_r4) in denominator factors.
+        // This form has a larger valid sn^2 range before the Möbius singularity.
         const double r24 = mp.r2 - mp.r4;
         const double r14 = mp.r1 - mp.r4;
         const double den = r24 - r14 * sn2;
@@ -988,7 +1013,10 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
         if (!(den_omega > 0.0)) return false;
         out.omega = 0.5 * std::sqrt(den_omega);
 
-        // Step 2 fix: GL-consistent modulus (complement of old expression).
+        // Alternative-form modulus consistent with the GL_r1 (code_r4) Möbius parametrization.
+        // k'^2 = (r3_GL-r2_GL)*(r4_GL-r1_GL) / ((r3_GL-r1_GL)*(r4_GL-r2_GL))
+        // In code-descending (r3_GL=r2, r2_GL=r3, r4_GL=r1, r1_GL=r4):
+        // k'^2 = (r2-r3)*(r1-r4) / ((r2-r4)*(r1-r3))
         const double k_num = (out.r2 - out.r3) * (out.r1 - out.r4);
         const double k_den = (out.r2 - out.r4) * (out.r1 - out.r3);
         if (!(k_den > 0.0)) return false;
@@ -997,7 +1025,9 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
         out.Kc = ellint_K_complete(out.m);
         if (!std::isfinite(out.Kc) || !(out.Kc > 0.0)) return false;
 
-        // Step 2 fix: finite-r_obs source phase uses r2 (not r3).
+        // Source phase consistent with the alternative (r4/code) Möbius form:
+        // sn^2(F0,k') = (r0-r4_GL)*(r3_GL-r1_GL) / ((r0-r3_GL)*(r4_GL-r1_GL))
+        // In code-descending: (r0-r1)*(r2-r4) / ((r0-r2)*(r1-r4))
         const double den_obs = (r0 - out.r2);
         const double den_root = (out.r1 - out.r4);
         if (std::abs(den_obs) < 1e-14 || std::abs(den_root) < 1e-14) return false;
@@ -1192,20 +1222,22 @@ static bool first_equator_crossing_mino_time(const SeparableKerrConsts& c,
 static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                                    double r_disk_in, double r_disk_out,
                                    double r_escape,
-                                   Integrator intg);
+                                   Integrator intg,
+                                   const IntegratorControls& ctl = IntegratorControls{});
 
 static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMetric& g,
                                                 double r_disk_in, double r_disk_out,
                                                 double r_escape,
                                                 EllipticFallbackReason* fallback_reason = nullptr,
                                                 CoordinateChart fallback_chart = CoordinateChart::BL,
-                                                Integrator intg = Integrator::RK4_DOUBLING) {
+                                                Integrator intg = Integrator::RK4_DOUBLING,
+                                                const IntegratorControls& ctl = IntegratorControls{}) {
     if (fallback_reason) *fallback_reason = EllipticFallbackReason::NONE;
     auto fallback_trace = [&](EllipticFallbackReason reason) -> TraceResult {
         if (fallback_reason) *fallback_reason = reason;
         if (fallback_chart == CoordinateChart::KS)
-            return trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg);
-        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg);
+            return trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
     };
 
     SeparableKerrConsts c{};
@@ -1241,6 +1273,12 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
     // Region IV has no real turning points.
     if (mp.radial_case != EllipticRadialCase::REGION_IV_COMPLEX4 && r_now < mp.r1)
         return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
+
+    // For Region III, the GL B75 radial formula evaluates r on the hypothetical
+    // post-bounce leg (after the inner turning point r_hi, which lies inside the
+    // outer horizon for near-extremal Kerr).  In reality those photons cross
+    // theta=pi/2 *before* the horizon and hit the disk — the formula gives the
+    // wrong r.  Fall back to numerical for any sub-horizon r_now to be safe.
     if (r_now < rh_cut)
         return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
     if (r_now > r_escape)
@@ -1251,8 +1289,8 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
         // before any disk intersection, prefer horizon to avoid leakage
         // inside the black-hole silhouette.
         const TraceResult verify = (fallback_chart == CoordinateChart::KS)
-            ? trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg)
-            : trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg);
+            ? trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl)
+            : trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
         if (verify.out == Outcome::HORIZON)
             return verify;
 
@@ -1492,10 +1530,11 @@ static bool rk4_adaptive_ks(const KNdSMetric& g, KSState& s, double& dlam, doubl
 static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                                    double r_disk_in, double r_disk_out,
                                    double r_escape,
-                                   Integrator intg=Integrator::RK4_DOUBLING) {
+                                   Integrator intg,
+                                   const IntegratorControls& ctl) {
     KSState s{};
     if (!init_ks_state(s_bl, g, s))
-        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg);
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
 
     if (intg == Integrator::DOPRI5) {
         static bool warned_dopri5_ks = false;
@@ -1507,16 +1546,17 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
 
     const double rh = g.r_horizon();
     const double rh_cut = rh * 1.03;
-    double dlam = 1.0;
+    double dlam = std::max(ctl.step_init, 1e-10);
     double prev_r_ks = KNdSMetric::r_KS(s.X, s.Y, s.Z, g.a);
 
-    for (int it = 0; it < 500000; ++it) {
+    const int max_steps = std::max(1, ctl.max_steps);
+    for (int it = 0; it < max_steps; ++it) {
         const KSState s_prev = s;
         double step_used = dlam;
         int rejects = 0;
         while (true) {
             step_used = dlam;
-            if (rk4_adaptive_ks(g, s, dlam)) break;
+            if (rk4_adaptive_ks(g, s, dlam, ctl.tol)) break;
             if (!std::isfinite(dlam) || ++rejects > 64) {
                 double r_tmp, th_tmp, ph_tmp;
                 KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_tmp, th_tmp, ph_tmp);
@@ -1530,6 +1570,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
         StepEvent best_event = StepEvent::NONE;
         double disk_r_hit = 0.0;
         double disk_red_hit = 1.0;
+        double disk_phi_hit = 0.0;
 
         const bool maybe_equator = sign_change(s_prev.Z, s.Z) ||
                                    (std::min(std::abs(s_prev.Z), std::abs(s.Z)) < 0.35);
@@ -1563,10 +1604,11 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                 KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
                 if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
                     const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
-                    disk_r_hit = r_hit;
+                    disk_r_hit  = r_hit;
                     disk_red_hit = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
-                    best_alpha = alpha;
-                    best_event = StepEvent::DISK;
+                    disk_phi_hit = ph_hit;
+                    best_alpha  = alpha;
+                    best_event  = StepEvent::DISK;
                 }
             }
         }
@@ -1594,7 +1636,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
         }
 
         if (best_event == StepEvent::DISK) {
-            return {Outcome::DISK_HIT, disk_r_hit, disk_red_hit};
+            return {Outcome::DISK_HIT, disk_r_hit, disk_red_hit, disk_phi_hit};
         }
         if (best_event == StepEvent::HORIZON) {
             const double r_h = prev_r_ks + best_alpha * (r_now - prev_r_ks);
@@ -1644,6 +1686,116 @@ static double tonemap(double x, double exposure, double gamma) {
     return std::pow(clamp(x, 0.0, 1.0), 1.0/gamma);
 }
 
+// HSV → RGB (all values in [0,1])
+static RGB hsv_to_rgb(double h, double s, double v) {
+    h = h - std::floor(h);  // wrap to [0,1)
+    const double hh = h * 6.0;
+    const int    hi = (int)hh;
+    const double f  = hh - hi;
+    const double p  = v * (1.0 - s);
+    const double q  = v * (1.0 - s * f);
+    const double t  = v * (1.0 - s * (1.0 - f));
+    double rr, gg, bb;
+    switch (hi % 6) {
+        case 0: rr=v; gg=t; bb=p; break;
+        case 1: rr=q; gg=v; bb=p; break;
+        case 2: rr=p; gg=v; bb=t; break;
+        case 3: rr=p; gg=q; bb=v; break;
+        case 4: rr=t; gg=p; bb=v; break;
+        default:rr=v; gg=p; bb=q; break;
+    }
+    return {(uint8_t)(rr*255+0.5), (uint8_t)(gg*255+0.5), (uint8_t)(bb*255+0.5)};
+}
+
+// Deterministic per-cell hash in [0,1) using a sin-based scramble
+static double cell_hash(int cell_id, double salt_a, double salt_b) {
+    double v = std::sin((double)cell_id * salt_a + salt_b) * 43758.5453;
+    return v - std::floor(v);
+}
+
+// Interstellar / accretion_warm disk coloring:
+// n_rings concentric bands × n_sectors azimuthal slices, each assigned
+// a deterministic warm color (red/orange/yellow, some transparent).
+// Colors are Gaussian-blended across cell boundaries so there are no hard edges.
+// Physical modulation (redshift, Page-Thorne emissivity, magnification) applied on top.
+static RGB disk_colour_interstellar(double r, double phi,
+                                    double red, double magnif,
+                                    double r_in, double r_out,
+                                    double M, double r_isco,
+                                    const ColorParams& cp) {
+    const int    NR    = cp.disk_rings   > 0 ? cp.disk_rings   : 1;
+    const int    NS    = cp.disk_sectors > 0 ? cp.disk_sectors : 1;
+    const double sigma = cp.disk_sigma   > 0 ? cp.disk_sigma   : 0.5;
+
+    // Normalize position to cell-index space
+    const double r_norm   = clamp((r - r_in) / (r_out - r_in), 0.0, 1.0);
+    const double phi_norm = (phi - std::floor(phi / (2.0*M_PI)) * (2.0*M_PI)) / (2.0*M_PI); // [0,1)
+    const double ring_pos = r_norm * NR;
+    const double sec_pos  = phi_norm * NS;
+
+    // Gaussian accumulation over nearby cells
+    double acc_r = 0.0, acc_g = 0.0, acc_b = 0.0, w_total = 0.0;
+    const double inv2sig2 = 1.0 / (2.0 * sigma * sigma);
+    const int    SEARCH   = (int)std::ceil(3.0 * sigma) + 1;
+
+    for (int ri = -SEARCH; ri <= NR + SEARCH; ++ri) {
+        const double dr = ring_pos - (double)ri;
+        if (dr * dr * inv2sig2 > 16.0) continue;  // early cull
+        const int ri_clamped = ri < 0 ? 0 : ri >= NR ? NR-1 : ri;
+
+        for (int si_raw = -SEARCH; si_raw <= NS + SEARCH; ++si_raw) {
+            // Sector distance with wrap-around
+            double ds = sec_pos - (double)si_raw;
+            // Wrap ds to [-NS/2, NS/2]
+            ds = ds - std::floor((ds + NS * 0.5) / NS) * NS;
+            const double dist2 = dr * dr + ds * ds;
+            const double w = std::exp(-dist2 * inv2sig2);
+            if (w < 1e-4) continue;
+
+            const int si_clamped = ((si_raw % NS) + NS) % NS;
+            const int cell_id = ri_clamped * NS + si_clamped;
+
+            // Three independent hashes per cell
+            const double h1 = cell_hash(cell_id, 127.1, 311.7);
+            const double h2 = cell_hash(cell_id, 269.5, 183.3);
+            const double h3 = cell_hash(cell_id, 419.2, 371.9);
+
+            // ~30% of cells are transparent (gaps in the disk)
+            if (h3 < 0.30) continue;
+
+            // Warm accretion palette: hue in [0, 0.14] → deep red through yellow
+            const double hue = std::fmod(h1 * 0.14 + cp.disk_hue_offset, 1.0);
+            const double sat = 0.70 + h2 * 0.30;
+            const double val = 0.50 + h1 * 0.50;
+
+            const RGB c = hsv_to_rgb(hue, sat, val);
+            acc_r += w * c.r;
+            acc_g += w * c.g;
+            acc_b += w * c.b;
+            w_total += w;
+        }
+    }
+
+    if (w_total < 1e-6) return {0, 0, 0};  // transparent region
+
+    // Physical intensity modulation (same as blackbody path)
+    const double pt_norm = page_thorne(r, r_isco);
+    const double r_peak  = 3.0 * r_isco;
+    const double pt_peak = page_thorne(r_peak, r_isco);
+    double I = (pt_peak > 0.0) ? pt_norm / pt_peak : 0.0;
+    const double red_c = clamp(red, 0.1, 10.0);
+    const double receding_lift = 1.0 + 0.85 * clamp(1.0 - red_c, 0.0, 1.0);
+    I *= std::pow(red_c, 4.0) * receding_lift;
+    I *= clamp(1.0 / magnif, 0.05, 5.0);
+
+    const double norm = w_total * 255.0;
+    return {
+        (uint8_t)(tonemap(acc_r / norm * I, cp.exposure, cp.gamma) * 255),
+        (uint8_t)(tonemap(acc_g / norm * I, cp.exposure, cp.gamma) * 255),
+        (uint8_t)(tonemap(acc_b / norm * I, cp.exposure, cp.gamma) * 255)
+    };
+}
+
 static RGB disk_colour(double r, double red, double magnif,
                        double M, double r_isco, const ColorParams& cp) {
     double T = 6500.0 * cp.temp_scale * std::sqrt(6.0*M/r) * clamp(red, 0.2, 5.0);
@@ -1667,7 +1819,9 @@ static std::vector<RGB> colorize_buffer(
     const ColorParams& cp,
     const BackgroundImage& bg,
     double M_bh, double r_isco,
-    bool debug_elliptic = false)
+    double r_disk_in, double r_disk_out,
+    bool debug_elliptic = false,
+    const BackgroundImage* bg_b = nullptr)  // Universe B background (wormhole)
 {
     std::vector<RGB> image(W*H, {0,0,0});
 
@@ -1692,9 +1846,20 @@ static std::vector<RGB> colorize_buffer(
 
     for (int i = 0; i < W*H; ++i) {
         const GeoPixel& p = geo[i];
-        if (p.outcome == 1)
-            image[i] = disk_colour(p.r, p.redshift, p.magnif, M_bh, r_isco, cp);
-        else if (p.outcome == 0 && !bg.px.empty())
+        if (p.outcome == 1) {
+            if (cp.palette == DiskPalette::INTERSTELLAR)
+                image[i] = disk_colour_interstellar(p.r, p.phi_disk,
+                                                    p.redshift, p.magnif,
+                                                    r_disk_in, r_disk_out,
+                                                    M_bh, r_isco, cp);
+            else
+                image[i] = disk_colour(p.r, p.redshift, p.magnif, M_bh, r_isco, cp);
+        } else if (p.outcome == 3) {
+            // Universe B — use secondary background if provided, else bg
+            const BackgroundImage& bgB = (bg_b && !bg_b->px.empty()) ? *bg_b : bg;
+            if (!bgB.px.empty())
+                image[i] = bgB.sample(p.theta_esc, p.phi_esc);
+        } else if (p.outcome == 0 && !bg.px.empty())
             image[i] = bg.sample(p.theta_esc, p.phi_esc);
     }
     return image;
@@ -1720,7 +1885,130 @@ static void print_progress(int done, int total, double elapsed) {
 // ── Per-frame camera/physics parameters ───────────────────────
 struct FrameParams {
     double a=0.998, theta=80.0, phi=0.0, r_obs=40.0, disk_out=12.0, fov=30.0;
+    // Wormhole mode (DNEG metric)
+    bool   wormhole      = false;
+    double wh_rho        = 1.0;   ///< throat areal radius ρ  [geometric units]
+    double wh_a_tunnel   = 0.01;  ///< half-length of cylindrical tunnel a  (Interstellar default)
+    double wh_M_lens     = 1.0;   ///< lensing parameter M
 };
+
+// ── Wormhole (DNEG) single-ray tracer ────────────────────────
+// Returns outcome ESCAPED (Universe A, ℓ>0), ESCAPED_B (Universe B, ℓ<0).
+// No disk and no horizon for the minimal first pass; disk can be layered later.
+static TraceResult trace_single_wormhole(
+    WormholeState s, const DnegParams& dp,
+    double escape_radius,
+    const IntegratorControls& ctl = IntegratorControls{})
+{
+    double h = ctl.step_init > 1e-10 ? ctl.step_init : 1e-10;
+    const int max_steps = ctl.max_steps > 0 ? ctl.max_steps : 500000;
+    for (int it = 0; it < max_steps; ++it) {
+        const WormholeState s_prev = s;
+        rk4_adaptive_wormhole(dp, s, h, ctl.tol);
+
+        if (!std::isfinite(s.l) || !std::isfinite(s.theta))
+            return {Outcome::ESCAPED, escape_radius, 1.0, 0.0, M_PI/2.0, 0.0};
+
+        const double abs_prev = s_prev.l >= 0 ? s_prev.l : -s_prev.l;
+        const double abs_now  = s.l      >= 0 ? s.l      : -s.l;
+        if (abs_prev < escape_radius && abs_now >= escape_radius) {
+            // interpolate crossing point
+            const double denom = abs_now - abs_prev;
+            const double alpha = (denom > 1e-12) ? (escape_radius - abs_prev) / denom : 1.0;
+            const double th_esc = s_prev.theta + alpha * (s.theta - s_prev.theta);
+            double ph_esc = s_prev.phi + alpha * (s.phi - s_prev.phi);
+            // wrap phi to [0, 2π)
+            ph_esc = std::fmod(ph_esc, 2.0*M_PI);
+            if (ph_esc < 0.0) ph_esc += 2.0*M_PI;
+            Outcome out = (s.l >= 0.0) ? Outcome::ESCAPED : Outcome::ESCAPED_B;
+            return {out, abs_now, 1.0, 0.0, th_esc, ph_esc};
+        }
+    }
+    // Timeout — treat as escaped in current universe
+    double ph_esc = std::fmod(s.phi, 2.0*M_PI);
+    if (ph_esc < 0.0) ph_esc += 2.0*M_PI;
+    Outcome out = (s.l >= 0.0) ? Outcome::ESCAPED : Outcome::ESCAPED_B;
+    return {out, std::abs(s.l), 1.0, 0.0, s.theta, ph_esc};
+}
+
+// ── Wormhole Phase 1 tracer (replaces trace_geodesics when fp.wormhole) ──
+static std::vector<GeoPixel> trace_geodesics_wormhole(
+    int W, int H,
+    const FrameParams& fp,
+    const IntegratorControls& ctl,
+    double pixel_offset_x, double pixel_offset_y,
+    KGeoMeta* meta_out)
+{
+    DnegParams dp{fp.wh_rho, fp.wh_a_tunnel, fp.wh_M_lens};
+    WormholeCamera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
+    const double escape_radius = fp.r_obs * 1.05;
+
+    if (meta_out) {
+        // Store wormhole geometry in KGeoMeta — reuse existing fields:
+        //   M_bh    = M_lens,   a_bh = wh_rho,   Q_bh = wh_a_tunnel
+        //   r_isco  = wh_rho  (throat = inner boundary)
+        *meta_out = KGeoMeta{
+            (uint32_t)W, (uint32_t)H,
+            fp.wh_M_lens, fp.wh_rho, fp.wh_a_tunnel, 0.0,
+            fp.wh_rho, fp.wh_rho, fp.disk_out,
+            fp.theta, fp.phi, fp.r_obs
+        };
+    }
+
+    std::vector<GeoPixel> geo(W*H);
+    std::atomic<int> rows_done{0};
+    const double t0_wh = get_time();
+    std::mutex progress_mu;
+
+    auto trace_row = [&](int py) {
+        for (int px_ = 0; px_ < W; ++px_) {
+            GeoPixel& pix = geo[py*W+px_];
+            WormholeState s = cam.pixel_ray(px_, py, dp, pixel_offset_x, pixel_offset_y);
+            TraceResult res = trace_single_wormhole(s, dp, escape_radius, ctl);
+
+            pix.outcome   = (res.out == Outcome::ESCAPED_B) ? 3 : 0;
+            pix.r         = (float)res.r;
+            pix.redshift  = 1.0f;
+            pix.magnif    = 1.0f;
+            pix.phi_disk  = 0.0f;
+            pix.theta_esc = (float)res.theta_esc;
+            pix.phi_esc   = (float)res.phi_esc;
+            pix._pad[0]   = pix._pad[1] = pix._pad[2] = 0;
+        }
+        int done = ++rows_done;
+        if (done%4==0 || done==H) {
+            std::lock_guard<std::mutex> lk(progress_mu);
+            print_progress(done, H, get_time()-t0_wh);
+        }
+    };
+
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int py = 0; py < H; ++py) trace_row(py);
+#else
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned workers = (hw > 1u) ? hw : 1u;
+    if (workers == 1 || H < 4) {
+        for (int py = 0; py < H; ++py) trace_row(py);
+    } else {
+        std::atomic<int> next_row{0};
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+        for (unsigned t = 0; t < workers; ++t) {
+            pool.emplace_back([&]() {
+                while (true) {
+                    const int py = next_row.fetch_add(1);
+                    if (py >= H) break;
+                    trace_row(py);
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+    }
+#endif
+    std::cerr << "\n";
+    return geo;
+}
 
 // ── Phase 1: trace all geodesics → GeoPixel buffer ───────────
 static std::vector<GeoPixel> trace_geodesics(
@@ -1730,10 +2018,17 @@ static std::vector<GeoPixel> trace_geodesics(
     RaySolverMode solver_mode,
     CoordinateChart chart,
     Integrator intg,
+    const IntegratorControls& ctl,
+    double pixel_offset_x,
+    double pixel_offset_y,
     double M_bh, double Q_bh, double Lam,
     KGeoMeta* meta_out = nullptr,
     bool debug_elliptic = false)
 {
+    // Wormhole: delegate entirely to the DNEG integrator
+    if (fp.wormhole)
+        return trace_geodesics_wormhole(W, H, fp, ctl, pixel_offset_x, pixel_offset_y, meta_out);
+
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
     CoordinateChart eff_chart = chart;
     if (eff_chart == CoordinateChart::KS && std::abs(Lam) > 1e-15) {
@@ -1804,21 +2099,24 @@ static std::vector<GeoPixel> trace_geodesics(
         for (int px_=0; px_<W; ++px_) {
             GeoPixel& pix = geo[py*W+px_];
             if (use_bundles) {
-                auto res = trace_bundle(px_, py, cam, g, r_disk_in, r_disk_out, r_escape);
+                auto res = trace_bundle(px_, py, cam, g, r_disk_in, r_disk_out, r_escape,
+                                        ctl.max_steps, ctl.step_init, ctl.tol,
+                                        pixel_offset_x, pixel_offset_y);
                 pix.outcome   = res.disk_hit ? 1 : 0;
                 pix.r         = res.disk_hit ? (float)res.r_hit : 0.0f;
                 pix.redshift  = (float)res.redshift;
                 pix.magnif    = (float)res.magnif;
+                pix.phi_disk  = (float)res.phi_disk;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
             } else {
-                auto s   = cam.pixel_ray(px_, py, g);
+                auto s   = cam.pixel_ray(px_, py, g, pixel_offset_x, pixel_offset_y);
                 TraceResult res{};
                 if (solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED) {
                     EllipticFallbackReason fb_reason = EllipticFallbackReason::NONE;
                     res = trace_single_elliptic_closed(
                         s, g, r_disk_in, r_disk_out, r_escape,
-                        &fb_reason, eff_chart, intg);
+                        &fb_reason, eff_chart, intg, ctl);
                     if (debug_elliptic)
                         pix._pad[0] = static_cast<uint8_t>(fb_reason);
                     if (track_elliptic_fallbacks) {
@@ -1831,17 +2129,19 @@ static std::vector<GeoPixel> trace_geodesics(
                         }
                     }
                 } else if (eff_chart == CoordinateChart::KS) {
-                    res = trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg);
+                    res = trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
                 } else if (solver_sel.effective == RaySolverMode::SEMI_ANALYTIC) {
-                    res = trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape);
+                    res = trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape, ctl);
                 } else {
-                    res = trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg);
+                    res = trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
                 }
-                pix.outcome   = (res.out==Outcome::DISK_HIT) ? 1
-                              : (res.out==Outcome::HORIZON)   ? 2 : 0;
+                pix.outcome   = (res.out==Outcome::DISK_HIT)  ? 1
+                              : (res.out==Outcome::HORIZON)    ? 2
+                              : (res.out==Outcome::ESCAPED_B)  ? 3 : 0;
                 pix.r         = (float)res.r;
                 pix.redshift  = (float)res.redshift;
                 pix.magnif    = 1.0f;
+                pix.phi_disk  = (float)res.phi_disk;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
             }
@@ -1914,17 +2214,116 @@ static std::vector<RGB> render_image(
     RaySolverMode solver_mode,
     CoordinateChart chart,
     Integrator intg,
+    const IntegratorControls& ctl,
+    int camera_spp,
     double M_bh, double Q_bh, double Lam,
     IntersectionMode intersection_mode = IntersectionMode::HERMITE,
     int metal_kernel_mode = 0,
+    bool gpu_fp64 = false,
     bool elliptic_fallback_black = false,
     bool anti_fireflies = false,
     const ColorParams& cp = ColorParams{},
     std::vector<GeoPixel>* geo_out = nullptr,
-    bool debug_elliptic = false)
+    bool debug_elliptic = false,
+    double pixel_offset_x = 0.0,
+    double pixel_offset_y = 0.0,
+    const BackgroundImage* bg_b = nullptr)  // Universe B background (wormhole)
 {
+    if (camera_spp > 1) {
+        static bool warned_geo_with_multisample = false;
+        if (geo_out && !warned_geo_with_multisample) {
+            std::cerr << "Info: camera-spp>1 uses jittered multi-pass sampling and disables .kgeo export for this frame.\n";
+            warned_geo_with_multisample = true;
+        }
+
+        const auto build_offsets = [](int spp) {
+            std::vector<std::pair<double, double>> offsets;
+            if (spp <= 1) {
+                offsets.emplace_back(0.0, 0.0);
+                return offsets;
+            }
+            if (spp == 2) {
+                // Python KerrTrace "meridian_supersample"-style horizontal offsets.
+                offsets.emplace_back(-0.35, 0.0);
+                offsets.emplace_back(+0.35, 0.0);
+                return offsets;
+            }
+            if ((spp % 2) == 1) offsets.emplace_back(0.0, 0.0);
+            const std::pair<double, double> pair_seed[] = {
+                {0.35, 0.00},
+                {0.00, 0.35},
+                {0.25, 0.25},
+                {0.45, 0.20},
+                {0.20, 0.45},
+                {0.40, 0.00},
+                {0.00, 0.40}
+            };
+            for (const auto& p : pair_seed) {
+                if ((int)offsets.size() + 2 > spp) break;
+                offsets.emplace_back(+p.first, +p.second);
+                offsets.emplace_back(-p.first, -p.second);
+            }
+            if ((int)offsets.size() < spp) {
+                constexpr double golden = 2.39996322972865332; // golden angle
+                int n = 0;
+                while ((int)offsets.size() < spp) {
+                    const double r = 0.49 * std::sqrt((double)(n + 1) / (double)(spp + 1));
+                    const double a = golden * (double)(n + 1);
+                    const double x = r * std::cos(a);
+                    const double y = r * std::sin(a);
+                    offsets.emplace_back(x, y);
+                    if ((int)offsets.size() < spp) offsets.emplace_back(-x, -y);
+                    ++n;
+                }
+            }
+            offsets.resize((size_t)spp);
+            return offsets;
+        };
+
+        const auto to_linear = [](double c, double gamma) {
+            const double x = clamp(c, 0.0, 1.0);
+            return std::pow(x, gamma);
+        };
+        const auto to_display = [](double l, double gamma) {
+            const double x = clamp(l, 0.0, 1.0);
+            return std::pow(x, 1.0 / gamma);
+        };
+
+        const auto offsets = build_offsets(camera_spp);
+        const double gamma_eff = std::max(cp.gamma, 1e-6);
+        std::vector<double> accum((size_t)W * (size_t)H * 3ull, 0.0);
+        for (size_t sidx = 0; sidx < offsets.size(); ++sidx) {
+            const auto& off = offsets[sidx];
+            auto pass = render_image(
+                W, H, fp, bg, use_bundles, solver_mode, chart, intg,
+                ctl, 1, M_bh, Q_bh, Lam,
+                intersection_mode, metal_kernel_mode, gpu_fp64,
+                elliptic_fallback_black, anti_fireflies, cp,
+                nullptr, debug_elliptic,
+                pixel_offset_x + off.first,
+                pixel_offset_y + off.second,
+                bg_b);
+            for (int i = 0; i < W * H; ++i) {
+                const size_t j = (size_t)i * 3ull;
+                accum[j + 0] += to_linear((double)pass[i].r / 255.0, gamma_eff);
+                accum[j + 1] += to_linear((double)pass[i].g / 255.0, gamma_eff);
+                accum[j + 2] += to_linear((double)pass[i].b / 255.0, gamma_eff);
+            }
+        }
+        const double inv_n = 1.0 / (double)offsets.size();
+        std::vector<RGB> out(W * H, {0, 0, 0});
+        for (int i = 0; i < W * H; ++i) {
+            const size_t j = (size_t)i * 3ull;
+            out[i].r = (uint8_t)std::lround(255.0 * to_display(accum[j + 0] * inv_n, gamma_eff));
+            out[i].g = (uint8_t)std::lround(255.0 * to_display(accum[j + 1] * inv_n, gamma_eff));
+            out[i].b = (uint8_t)std::lround(255.0 * to_display(accum[j + 2] * inv_n, gamma_eff));
+        }
+        return out;
+    }
+
     (void)metal_kernel_mode;
     (void)intersection_mode;
+    (void)gpu_fp64;
     (void)elliptic_fallback_black;
     (void)anti_fireflies;
 #if defined(USE_METAL)
@@ -1943,7 +2342,9 @@ static std::vector<RGB> render_image(
         !use_bundles &&
         gpu_chart_ok &&
         solver_gpu_supported;
-    const bool can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
+    const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
+    const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
+    const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported) && !fp.wormhole;
 
     if (can_use_gpu) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
@@ -1958,7 +2359,12 @@ static std::vector<RGB> render_image(
                            metal_kernel_mode_code(static_cast<MetalKernelMode>(metal_kernel_mode)),
                            intersection_mode_code(intersection_mode),
                            elliptic_fallback_black ? 1 : 0,
-                           anti_fireflies ? 1 : 0};
+                           anti_fireflies ? 1 : 0,
+                           std::max(1, ctl.max_steps),
+                           (float)std::max(ctl.step_init, 1e-6),
+                           (float)std::max(ctl.tol, 1e-9),
+                           (float)pixel_offset_x,
+                           (float)pixel_offset_y};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -1973,8 +2379,15 @@ static std::vector<RGB> render_image(
     }
 
     static bool warned_metal_fallback = false;
+    static bool warned_metal_fp64_fallback = false;
     if (!warned_metal_fallback) {
-        if (use_bundles && !gpu_chart_ok && chart == CoordinateChart::KS)
+        if (gpu_fp64 && base_can_use_gpu && !metal_fp64_supported) {
+            if (!warned_metal_fp64_fallback) {
+                std::cerr << "Info: --gpu-fp64 requested, but Metal GPU integration currently runs in FP32;"
+                          << " using CPU fallback (double precision).\n";
+                warned_metal_fp64_fallback = true;
+            }
+        } else if (use_bundles && !gpu_chart_ok && chart == CoordinateChart::KS)
             std::cerr << "Info: Metal ray bundles on KS currently support Lambda=0 only; using CPU fallback for --bundles.\n";
         else if (use_bundles && gpu_solver_mode != RaySolverMode::STANDARD)
             std::cerr << "Info: Metal ray bundles currently support standard solver only; using CPU fallback for --bundles.\n";
@@ -1990,22 +2403,38 @@ static std::vector<RGB> render_image(
         warned_metal_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta, debug_elliptic);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, ctl,
+                               pixel_offset_x, pixel_offset_y,
+                               M_bh, Q_bh, Lam, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco, debug_elliptic);
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
+                           meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
 
 #elif defined(USE_CUDA)
+    static bool warned_cuda_fp64_default = false;
+    static bool warned_cuda_fp64_strict = false;
+    if (gpu_fp64) {
+        if (!warned_cuda_fp64_strict) {
+            std::cerr << "Info: CUDA FP64 strict mode enabled (--gpu-fp64): "
+                         "native double kernel + capability check.\n";
+            warned_cuda_fp64_strict = true;
+        }
+    } else if (!warned_cuda_fp64_default) {
+        std::cerr << "Info: CUDA backend uses native double precision by default. "
+                     "Use --gpu-fp64 for strict capability checking/reporting.\n";
+        warned_cuda_fp64_default = true;
+    }
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
                               (chart == CoordinateChart::KS && ks_chart_supported);
-    if (!use_bundles && solver_mode == RaySolverMode::STANDARD && gpu_chart_ok) {
+    if (!use_bundles && solver_mode == RaySolverMode::STANDARD && gpu_chart_ok && !fp.wormhole) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
         KNdSParams_CUDA kpcuda{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,fp.disk_out};
         CameraParams_CUDA cpcuda{cam.r_obs,cam.theta_obs,cam.phi_obs,cam.fov_h,
                                  W,H,(chart==CoordinateChart::KS)?1:0};
-        auto px32 = cuda_render(kpcuda, cpcuda);
+        auto px32 = cuda_render(kpcuda, cpcuda, gpu_fp64);
         std::vector<RGB> image(W*H);
         for (int i=0;i<W*H;++i) {
             image[i].r=(px32[i])    &0xFF;
@@ -2029,16 +2458,22 @@ static std::vector<RGB> render_image(
         warned_cuda_fallback = true;
     }
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta, debug_elliptic);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, ctl,
+                               pixel_offset_x, pixel_offset_y,
+                               M_bh, Q_bh, Lam, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco, debug_elliptic);
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
+                           meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
 
 #else
     // CPU: two-phase
     KGeoMeta meta;
-    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, M_bh, Q_bh, Lam, &meta, debug_elliptic);
+    auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, ctl,
+                               pixel_offset_x, pixel_offset_y,
+                               M_bh, Q_bh, Lam, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco, debug_elliptic);
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
+                           meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
 #endif
 }
 
@@ -2068,15 +2503,25 @@ int main(int argc, char** argv) {
     bool debug_elliptic=false;
     int  custom_w=0, custom_h=0;
     Integrator intg=Integrator::RK4_DOUBLING;
+    IntegratorControls int_ctl{};
+    int camera_spp = 1;
+    bool gpu_fp64 = false;
     CoordinateChart chart=CoordinateChart::KS;
     RaySolverMode solver_mode=RaySolverMode::STANDARD;
     IntersectionMode intersection_mode=IntersectionMode::HERMITE;
     int metal_kernel_mode=0; // 0=auto, 1=unified, 2=single, 3=bundle (Metal only)
-    std::string bg_path;
+    std::string bg_path = "assets/backgrounds/sfondo5.jpg";
 
     // ── Single-frame / base params ───────────────────────────
     double arg_a=0.998, arg_disk_out=12.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
     double arg_Q=0.0, arg_Lam=0.0, arg_fov=30.0;
+
+    // ── Wormhole params ───────────────────────────────────────
+    bool   arg_wormhole  = false;
+    double arg_wh_rho    = 1.0;   // throat areal radius ρ
+    double arg_wh_a      = 0.01;  // half tunnel length a
+    double arg_wh_M      = 1.0;   // lensing parameter M
+    std::string bg_b_path;        // Universe B background path (--bg-b)
 
     // ── Colorization params ───────────────────────────────────
     ColorParams cp;  // defaults: exposure=1, gamma=2.2, temp_scale=1
@@ -2106,6 +2551,10 @@ int main(int argc, char** argv) {
         // Resolution
         if (arg=="--bundles")  use_bundles=true;
         if (arg=="--dopri5")   intg=Integrator::DOPRI5;
+        if (arg=="--max-steps" && i+1<argc) int_ctl.max_steps = std::max(1, std::stoi(argv[++i]));
+        if ((arg=="--step-init" || arg=="--step-size") && i+1<argc) int_ctl.step_init = std::stod(argv[++i]);
+        if ((arg=="--integrator-tol" || arg=="--tol") && i+1<argc) int_ctl.tol = std::stod(argv[++i]);
+        if ((arg=="--camera-spp" || arg=="--spp") && i+1<argc) camera_spp = std::max(1, std::stoi(argv[++i]));
         if (arg=="--semi-analytic" || arg=="--elliptic") solver_mode=RaySolverMode::SEMI_ANALYTIC;
         if (arg=="--elliptic-closed") solver_mode=RaySolverMode::ELLIPTIC_CLOSED;
         if (arg=="--elliptic-fallback-black" || arg=="--elliptic-strict-black")
@@ -2150,6 +2599,10 @@ int main(int argc, char** argv) {
                 metal_kernel_mode = 0;
             }
         }
+        if (arg=="--gpu-fp64" || arg=="--gpu-fp64-on" || arg=="--metal-fp64" || arg=="--cuda-fp64")
+            gpu_fp64 = true;
+        if (arg=="--no-gpu-fp64" || arg=="--no-cuda-fp64")
+            gpu_fp64 = false;
         if (arg=="--bl")       chart=CoordinateChart::BL;
         if (arg=="--ks")       chart=CoordinateChart::KS;
         if (arg=="--chart" && i+1<argc) {
@@ -2181,6 +2634,19 @@ int main(int argc, char** argv) {
         if (arg=="--exposure"   && i+1<argc) cp.exposure   = std::stod(argv[++i]);
         if (arg=="--gamma"      && i+1<argc) cp.gamma      = std::stod(argv[++i]);
         if (arg=="--temp-scale" && i+1<argc) cp.temp_scale = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar") cp.palette = DiskPalette::INTERSTELLAR;
+        if (arg=="--disk-blackbody")    cp.palette = DiskPalette::BLACKBODY;
+        if (arg=="--disk-rings"      && i+1<argc) cp.disk_rings      = std::stoi(argv[++i]);
+        if (arg=="--disk-sectors"    && i+1<argc) cp.disk_sectors    = std::stoi(argv[++i]);
+        if (arg=="--disk-sigma"      && i+1<argc) cp.disk_sigma      = std::stod(argv[++i]);
+        if (arg=="--disk-hue-offset" && i+1<argc) cp.disk_hue_offset = std::stod(argv[++i]);
+
+        // Wormhole
+        if (arg=="--wormhole")                   arg_wormhole = true;
+        if (arg=="--wh-throat" && i+1<argc)      arg_wh_rho   = std::stod(argv[++i]);
+        if (arg=="--wh-lensing"&& i+1<argc)      arg_wh_M     = std::stod(argv[++i]);
+        if (arg=="--wh-tunnel" && i+1<argc)      arg_wh_a     = std::stod(argv[++i]);
+        if (arg=="--bg-b"      && i+1<argc)      bg_b_path    = argv[++i];
 
         // Two-phase modes
         if (arg=="--geo-only")             geo_only  = true;
@@ -2212,6 +2678,11 @@ int main(int argc, char** argv) {
     }
 
     // ── Background ───────────────────────────────────────────
+    int_ctl.max_steps = std::max(1, int_ctl.max_steps);
+    int_ctl.step_init = std::max(1e-10, int_ctl.step_init);
+    int_ctl.tol = std::max(1e-10, int_ctl.tol);
+    camera_spp = std::max(1, camera_spp);
+
     BackgroundImage bg;
     if (!bg_path.empty()) {
         if (bg.load(bg_path.c_str()))
@@ -2220,6 +2691,16 @@ int main(int argc, char** argv) {
         else
             std::cerr << "Warning: cannot load background '" << bg_path << "'\n";
     }
+
+    BackgroundImage bg_b_img;
+    if (!bg_b_path.empty()) {
+        if (bg_b_img.load(bg_b_path.c_str()))
+            std::cout << "Background B (Universe B): " << bg_b_path
+                      << " (" << bg_b_img.w << "x" << bg_b_img.h << ")\n";
+        else
+            std::cerr << "Warning: cannot load --bg-b background '" << bg_b_path << "'\n";
+    }
+    const BackgroundImage* bg_b = bg_b_img.px.empty() ? nullptr : &bg_b_img;
 
     // ── Derived constants ────────────────────────────────────
     const double M_bh=1.0;
@@ -2255,7 +2736,8 @@ int main(int argc, char** argv) {
                   << " gamma=" << cp.gamma
                   << " temp_scale=" << cp.temp_scale << "\n";
 
-        auto image = colorize_buffer(geo, gW, gH, cp, bg, meta.M_bh, meta.r_isco);
+        auto image = colorize_buffer(geo, gW, gH, cp, bg, meta.M_bh, meta.r_isco,
+                                     meta.r_disk_in, meta.r_disk_out);
 
         std::time_t now=std::time(nullptr); char ts[32];
         std::strftime(ts,sizeof(ts),"%Y%m%d-%H%M%S",std::localtime(&now));
@@ -2341,7 +2823,10 @@ int main(int argc, char** argv) {
             !use_bundles &&
             gpu_chart_ok &&
             solver_gpu_supported;
-        return (bundle_gpu_supported || single_ray_gpu_supported) ? "gpu-metal" : "cpu";
+        const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
+        const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
+        const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported);
+        return can_use_gpu ? "gpu-metal" : "cpu";
 #elif defined(USE_CUDA)
         const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
         const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
@@ -2357,7 +2842,9 @@ int main(int argc, char** argv) {
     };
     const std::string mode_tag = integration_mode_tag();
     const std::string backend_tag = backend_mode_tag();
-    const std::string mode_backend_tag = mode_tag + "_" + backend_tag;
+    const std::string fp64_tag = gpu_fp64 ? "_gpufp64req" : "";
+    const std::string spp_tag = (camera_spp > 1) ? ("_spp" + std::to_string(camera_spp)) : "";
+    const std::string mode_backend_tag = mode_tag + "_" + backend_tag + fp64_tag + spp_tag;
 
     // ── SINGLE FRAME mode ────────────────────────────────────
     if (!anim_mode) {
@@ -2365,20 +2852,37 @@ int main(int argc, char** argv) {
         fp.a=arg_a; fp.theta=arg_theta; fp.phi=arg_phi;
         fp.r_obs=base_r_obs*M_bh; fp.disk_out=arg_disk_out*M_bh;
         fp.fov=arg_fov;
+        fp.wormhole    = arg_wormhole;
+        fp.wh_rho      = arg_wh_rho;
+        fp.wh_a_tunnel = arg_wh_a;
+        fp.wh_M_lens   = arg_wh_M;
 
-        KNdSMetric g_info(M_bh,fp.a,Q_bh,Lam);
-        std::cout << "KNdS  M=" << M_bh << " a=" << fp.a
-                  << " Q=" << Q_bh << " Λ=" << Lam << "\n"
-                  << "  r₊=" << g_info.r_horizon()
-                  << "  r_ISCO=" << g_info.r_isco() << "\n"
-                  << "Mode: " << (use_bundles?"ray bundles":"single ray")
-                  << "  chart=" << (chart==CoordinateChart::KS?"KS":"BL")
+        if (fp.wormhole) {
+            std::cout << "DNEG Wormhole  ρ=" << fp.wh_rho
+                      << " a=" << fp.wh_a_tunnel
+                      << " M_lens=" << fp.wh_M_lens << "\n"
+                      << "  throat_r=" << fp.wh_rho
+                      << "  l_obs=" << fp.r_obs << "\n";
+        } else {
+            KNdSMetric g_info(M_bh,fp.a,Q_bh,Lam);
+            std::cout << "KNdS  M=" << M_bh << " a=" << fp.a
+                      << " Q=" << Q_bh << " Λ=" << Lam << "\n"
+                      << "  r₊=" << g_info.r_horizon()
+                      << "  r_ISCO=" << g_info.r_isco() << "\n";
+        }
+        std::cout << "Mode: " << (fp.wormhole?"wormhole":use_bundles?"ray bundles":"single ray")
+                  << "  chart=" << (fp.wormhole?"wormhole":chart==CoordinateChart::KS?"KS":"BL")
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
-                  << "  " << solver_mode_name(solver_mode)
-                  << "  backend=" << backend_tag
+                  << "  " << (fp.wormhole?"rk4-adaptive":solver_mode_name(solver_mode))
+                  << "  backend=" << (fp.wormhole?"cpu":backend_tag.c_str())
                   << "  intersection=" << intersection_mode_name(intersection_mode)
                   << "  elliptic-fallback-black=" << (elliptic_fallback_black ? "on" : "off")
                   << "  anti-fireflies=" << (anti_fireflies ? "on" : "off")
+                  << "  max-steps=" << int_ctl.max_steps
+                  << "  step-init=" << int_ctl.step_init
+                  << "  tol=" << int_ctl.tol
+                  << "  camera-spp=" << camera_spp
+                  << "  gpu-fp64=" << (gpu_fp64 ? "on" : "off")
 #if defined(USE_METAL)
                   << "  metal-kernel="
                   << metal_kernel_mode_name(static_cast<MetalKernelMode>(metal_kernel_mode))
@@ -2394,7 +2898,7 @@ int main(int argc, char** argv) {
             // Phase 1 only: trace and save .kgeo
             KGeoMeta meta;
             auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg,
-                                       M_bh, Q_bh, Lam, &meta);
+                                       int_ctl, 0.0, 0.0, M_bh, Q_bh, Lam, &meta);
             double elapsed=get_time()-t0;
             std::cout << "Trace: " << elapsed << "s  ("
                       << std::fixed << std::setprecision(1)
@@ -2412,9 +2916,11 @@ int main(int argc, char** argv) {
             // Full render (Phase 1 + Phase 2, optionally save .kgeo)
             std::vector<GeoPixel> geo;
             auto image = render_image(W, H, fp, bg, use_bundles, solver_mode, chart, intg,
-                                      M_bh, Q_bh, Lam, intersection_mode, metal_kernel_mode,
+                                      int_ctl, camera_spp, M_bh, Q_bh, Lam,
+                                      intersection_mode, metal_kernel_mode, gpu_fp64,
                                       elliptic_fallback_black, anti_fireflies, cp,
-                                      geo_file.empty() ? nullptr : &geo, debug_elliptic);
+                                      geo_file.empty() ? nullptr : &geo, debug_elliptic,
+                                      0.0, 0.0, bg_b);
             double elapsed=get_time()-t0;
             std::cout << "Time: " << elapsed << "s  ("
                       << std::fixed << std::setprecision(1)
@@ -2507,6 +3013,10 @@ int main(int argc, char** argv) {
         fp.phi      = (anim_orbits!=0.0)
                     ? phi_start+360.0*anim_orbits*phase
                     : lerp_angle(phi_start,phi_end,t);
+        fp.wormhole    = arg_wormhole;
+        fp.wh_rho      = arg_wh_rho;
+        fp.wh_a_tunnel = arg_wh_a;
+        fp.wh_M_lens   = arg_wh_M;
 
         double t_frame=get_time();
         std::cout<<"Frame "<<(frame+1)<<"/"<<anim_frames
@@ -2516,8 +3026,10 @@ int main(int argc, char** argv) {
                  <<"  a="<<std::setprecision(4)<<fp.a<<" ...\n"<<std::flush;
 
         auto image=render_image(W,H,fp,bg,use_bundles,solver_mode,chart,intg,
-                                M_bh,Q_bh,Lam,intersection_mode,metal_kernel_mode,
-                                elliptic_fallback_black,anti_fireflies,cp,nullptr,debug_elliptic);
+                                int_ctl, camera_spp, M_bh,Q_bh,Lam,
+                                intersection_mode,metal_kernel_mode,gpu_fp64,
+                                elliptic_fallback_black,anti_fireflies,cp,nullptr,debug_elliptic,
+                                0.0, 0.0, bg_b);
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;

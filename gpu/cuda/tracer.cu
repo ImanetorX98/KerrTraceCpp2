@@ -4,13 +4,14 @@
 //  The metric / geodesic logic is ported from our C++ headers.
 //  We use double precision throughout (matching the CPU path).
 //
-//  Compile:  nvcc -O3 -arch=sm_86 -std=c++17 tracer.cu -o tracer_cuda.o
-//  (or let CMake handle it via enable_language(CUDA))
+//  Compile (manual): nvcc -O3 -std=c++17 tracer.cu -o tracer_cuda.o
+//  (recommended: let CMake handle CUDA architectures/toolchain)
 // ============================================================
 #include "tracer.cuh"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 #include <cstring>
 
@@ -550,10 +551,45 @@ __global__ void trace_kernel(uint32_t*              output,
 }
 
 // ── Host-side launcher ────────────────────────────────────────
+static bool cuda_device_supports_fp64(const cudaDeviceProp& prop) {
+    return (prop.major > 1) || (prop.major == 1 && prop.minor >= 3);
+}
+
 std::vector<uint32_t> cuda_render(
     const KNdSParams_CUDA&  kp,
-    const CameraParams_CUDA& cp)
+    const CameraParams_CUDA& cp,
+    bool require_fp64)
 {
+    int device_id = 0;
+    CUDA_CHECK(cudaGetDevice(&device_id));
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
+
+    const bool supports_fp64 = cuda_device_supports_fp64(prop);
+    if (require_fp64 && !supports_fp64) {
+        throw std::runtime_error(
+            "CUDA FP64 strict mode requested, but current device does not expose native FP64 support.");
+    }
+
+    static bool printed_cuda_info = false;
+    if (!printed_cuda_info) {
+        std::cerr << "Info: CUDA device " << device_id << " = " << prop.name
+                  << " (cc " << prop.major << "." << prop.minor << ")";
+        if (supports_fp64) {
+            std::cerr << ", FP64 native=yes";
+            if (prop.singleToDoublePrecisionPerfRatio > 0) {
+                std::cerr << ", SP:DP ratio ~" << prop.singleToDoublePrecisionPerfRatio << ":1";
+            }
+        } else {
+            std::cerr << ", FP64 native=no";
+        }
+        if (require_fp64) {
+            std::cerr << " [strict]";
+        }
+        std::cerr << "\n";
+        printed_cuda_info = true;
+    }
+
     const size_t npix = (size_t)cp.width * cp.height;
 
     uint32_t* d_out = nullptr;

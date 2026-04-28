@@ -75,6 +75,23 @@ cmake --build build --parallel
 ./build/kerr_tracer
 ```
 
+Windows/Linux notes for CUDA builds:
+
+- By default the project builds a fat binary for common architectures:
+  `60;61;70;75;80;86;89`.
+- You can override architectures explicitly:
+
+```bash
+cmake -S . -B build -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
+```
+
+- For maximum numerical fidelity (recommended for FP64-heavy runs), keep
+  fast-math disabled (default). For speed-focused experiments you can enable it:
+
+```bash
+cmake -S . -B build -DUSE_CUDA=ON -DCUDA_ENABLE_FAST_MATH=ON
+```
+
 ## CLI Quick Start
 
 ### Single frame (KS chart)
@@ -102,6 +119,9 @@ Useful flags:
 - `--ks` / `--bl` (or `--chart ks|bl`)
 - `--bundles`
 - `--dopri5`
+- `--gpu-fp64` / `--cuda-fp64` (strict FP64 mode on GPU: on CUDA this enforces
+  device FP64 capability checks; on Metal currently falls back to CPU)
+- `--no-gpu-fp64` / `--no-cuda-fp64`
 - `--solver-mode standard|semi-analytic|elliptic-closed`
 - `--metal-kernel auto|unified|single|bundle` (Metal only)
 - `--semi-analytic` / `--elliptic` (legacy alias for `--solver-mode semi-analytic`)
@@ -118,6 +138,7 @@ Experimental note:
 - Metal executes `elliptic-closed` with a dedicated elliptic GPU path and
   per-ray fallback to semi-analytic when needed for robustness.
 - CUDA currently routes `elliptic-closed` to CPU fallback.
+- CUDA single-ray kernel uses native `double` precision arithmetic.
 - Metal dispatch is adaptive-tiled for high resolutions (2K/4K). You can
   override tile rows with `KERR_METAL_TILE_ROWS=<n>` when tuning stability
   vs throughput.
@@ -130,6 +151,16 @@ Experimental note:
   - `bundle`: force ray-bundle kernel
 
 Rendered frames are written under `out/`.
+
+## Recommended Usage Cases
+
+| Scenario | Recommended backend/mode | Why |
+|---|---|---|
+| Fast local preview on macOS | Metal + `standard` + BL/KS | Lowest latency when kernel is stable |
+| Highest numerical robustness on macOS | CPU (`kerr_tracer`) | Full double precision path, stable fallback behavior |
+| Windows/Linux NVIDIA quality runs | CUDA + `--gpu-fp64` | Native CUDA double path + strict FP64 capability check |
+| Windows/Linux NVIDIA speed runs | CUDA (without `--gpu-fp64`) + optional `-DCUDA_ENABLE_FAST_MATH=ON` | Maximum throughput when minor precision loss is acceptable |
+| Non-standard solver (`elliptic-closed`) | CPU | Current CUDA path falls back for this mode |
 
 ## Tests
 

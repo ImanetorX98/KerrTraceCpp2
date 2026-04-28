@@ -28,17 +28,17 @@ std::vector<uint32_t> metal_render(
 
     // ── Compile the shader at runtime from source ─────────────
     NSError* err = nil;
-    // Locate tracer.metal relative to the executable
-    NSString* shaderPath = [[[NSBundle mainBundle] resourcePath]
-                             stringByAppendingPathComponent:@"tracer.metal"];
+    // Locate tracer.metal relative to the executable first (developer build),
+    // then fallback to bundle resources.
+    NSString* exeDir = [[[NSProcessInfo processInfo]
+                          arguments][0] stringByDeletingLastPathComponent];
+    NSString* shaderPath = [exeDir stringByAppendingPathComponent:@"../gpu/metal/tracer.metal"];
     NSString* src = [NSString stringWithContentsOfFile:shaderPath
                                               encoding:NSUTF8StringEncoding
                                                  error:&err];
     if (!src) {
-        // Fallback: look in the same directory as the binary
-        NSString* exeDir = [[[NSProcessInfo processInfo]
-                              arguments][0] stringByDeletingLastPathComponent];
-        shaderPath = [exeDir stringByAppendingPathComponent:@"../gpu/metal/tracer.metal"];
+        shaderPath = [[[NSBundle mainBundle] resourcePath]
+                        stringByAppendingPathComponent:@"tracer.metal"];
         src = [NSString stringWithContentsOfFile:shaderPath
                                         encoding:NSUTF8StringEncoding
                                            error:&err];
@@ -50,6 +50,18 @@ std::vector<uint32_t> metal_render(
 
     MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
     opts.languageVersion = MTLLanguageVersion2_4;
+    // Optional high-precision mode for near-horizon debugging/validation:
+    //   KERR_METAL_PRECISE_MATH=1  -> safer math (slower)
+    //   default                    -> fast math (faster)
+    bool precise_math = false;
+    if (const char* env = std::getenv("KERR_METAL_PRECISE_MATH")) {
+        precise_math = (std::atoi(env) != 0);
+    }
+    if (@available(macOS 15.0, *)) {
+        opts.mathMode = precise_math ? MTLMathModeSafe : MTLMathModeFast;
+    } else {
+        opts.fastMathEnabled = precise_math ? NO : YES;
+    }
     id<MTLLibrary> lib = [device newLibraryWithSource:src options:opts error:&err];
     if (!lib)
         throw std::runtime_error(

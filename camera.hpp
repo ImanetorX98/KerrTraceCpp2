@@ -35,10 +35,14 @@ public:
           fov_h(fov_deg * M_PI / 180.0), width(w), height(h) {}
 
     // ── pixel → initial geodesic state ───────────────────────
-    GeodesicState pixel_ray(int px, int py, const KNdSMetric& g) const {
+    GeodesicState pixel_ray(int px, int py, const KNdSMetric& g,
+                            double pixel_offset_x = 0.0,
+                            double pixel_offset_y = 0.0) const {
         const int span = (width > 1) ? (width - 1) : 1;
-        const double alpha = fov_h * (px - 0.5*(width-1))  / span;
-        const double beta  = fov_h * (0.5*(height-1) - py) / span;
+        const double x = (double)px + pixel_offset_x;
+        const double y = (double)py + pixel_offset_y;
+        const double alpha = fov_h * (x - 0.5*(width-1))  / span;
+        const double beta  = fov_h * (0.5*(height-1) - y) / span;
         return angle_ray(alpha, beta, g);
     }
 

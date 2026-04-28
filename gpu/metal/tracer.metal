@@ -10,6 +10,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Metal uses float arithmetic: keep a conservative adaptive-step floor to avoid
+// coarse near-horizon integration while still preventing denormal/no-progress loops.
+constant float ADAPT_H_MIN = 1e-6f;
+constant float ADAPT_H_MAX = 50.0f;
+constant float ADAPT_ERR_TINY_DOPRI = 1e-12f;
+constant float ADAPT_ERR_TINY_RK4 = 1e-10f;
+
 // ── KNdS parameters (passed as uniform) ─────────────────────
 struct KNdSParams {
     float M;
@@ -37,6 +44,11 @@ struct CameraParams {
     int   intersection_mode; // 0 = linear, 1 = hermite
     int   elliptic_fallback_black; // 0 = normal fallback, 1 = force black on fallback rays
     int   anti_fireflies; // 0 = off, 1 = robust anti-fireflies filter (ray-bundle path)
+    int   max_steps; // hard cap on adaptive integration iterations per ray
+    float step_init; // initial affine step size
+    float integrator_tol; // adaptive integrator tolerance
+    float pixel_offset_x; // subpixel X offset in pixel units
+    float pixel_offset_y; // subpixel Y offset in pixel units
 };
 
 struct RenderParams {
@@ -181,7 +193,7 @@ static bool dopri5_adaptive_bl(thread float& r, thread float& theta, thread floa
                                thread float& h,
                                float pt, float pphi,
                                float M, float a, float Q, float L,
-                               float tol = 2e-5f) {
+                               float tol) {
     const BLState s0{r, theta, phi, pr, pth};
     const BLDeriv k1 = eval_bl_rhs_state(s0, pt, pphi, M, a, Q, L);
 
@@ -252,18 +264,18 @@ static bool dopri5_adaptive_bl(thread float& r, thread float& theta, thread floa
     const float err = sqrt((er0*er0 + er1*er1 + er2*er2 + er3*er3) * 0.25f);
 
     if (!isfinite(err)) {
-        h = max(h * 0.5f, 1e-6f);
+        h = max(h * 0.5f, ADAPT_H_MIN);
         return false;
     }
 
-    if (err <= 1.0f || h < 1e-6f) {
+    if (err <= 1.0f || h < ADAPT_H_MIN) {
         r = y5.r; theta = y5.theta; phi = y5.phi; pr = y5.pr; pth = y5.pth;
-        const float fac = (err > 1e-12f) ? 0.9f * pow(1.0f/err, 0.2f) : 2.0f;
-        h = clamp(h * fac, 1e-6f, 50.0f);
+        const float fac = (err > ADAPT_ERR_TINY_DOPRI) ? 0.9f * pow(1.0f/err, 0.2f) : 2.0f;
+        h = clamp(h * fac, ADAPT_H_MIN, ADAPT_H_MAX);
         return true;
     }
 
-    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), 1e-6f, h * 0.5f);
+    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), ADAPT_H_MIN, h * 0.5f);
     return false;
 }
 
@@ -272,9 +284,10 @@ static bool adaptive_step_bl(thread float& r, thread float& theta, thread float&
                              thread float& h,
                              float pt, float pphi,
                              float M, float a, float Q, float L,
-                             int integrator_mode) {
+                             int integrator_mode,
+                             float tol) {
     if (integrator_mode == 1) {
-        return dopri5_adaptive_bl(r, theta, phi, pr, pth, h, pt, pphi, M, a, Q, L);
+        return dopri5_adaptive_bl(r, theta, phi, pr, pth, h, pt, pphi, M, a, Q, L, tol);
     }
 
     const float step_used = h;
@@ -286,15 +299,14 @@ static bool adaptive_step_bl(thread float& r, thread float& theta, thread float&
     rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, step_used*0.5f);
 
     const float err = length(float4(r_h-r_f, th_h-th_f, pr_h-pr_f, pth_h-pth_f)) / 15.0f;
-    const float tol = 2e-5f;
-    if (err < tol || h < 1e-6f) {
+    if (err < tol || h < ADAPT_H_MIN) {
         r = r_f; theta = th_f; phi = ph_f; pr = pr_f; pth = pth_f;
-        const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-        h = clamp(h*sc, 1e-6f, 50.0f);
+        const float sc = (err > ADAPT_ERR_TINY_RK4) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
+        h = clamp(h*sc, ADAPT_H_MIN, ADAPT_H_MAX);
         return true;
     }
 
-    h = clamp(h*0.9f*pow(tol/err, 0.25f), 1e-6f, h*0.5f);
+    h = clamp(h*0.9f*pow(tol/err, 0.25f), ADAPT_H_MIN, h*0.5f);
     return false;
 }
 
@@ -667,7 +679,7 @@ static bool dopri5_adaptive_ks(thread float& X, thread float& Y, thread float& Z
                                thread float& pX, thread float& pY, thread float& pZ,
                                thread float& h,
                                float pT, float M, float a, float Q,
-                               float tol = 2e-5f) {
+                               float tol) {
     const KSState s0{X, Y, Z, pX, pY, pZ};
     const KSDeriv k1 = eval_ks_rhs_state(s0, pT, M, a, Q);
 
@@ -745,18 +757,18 @@ static bool dopri5_adaptive_ks(thread float& X, thread float& Y, thread float& Z
     const float err = sqrt((er0*er0 + er1*er1 + er2*er2 + er3*er3 + er4*er4 + er5*er5) / 6.0f);
 
     if (!isfinite(err)) {
-        h = max(h * 0.5f, 1e-6f);
+        h = max(h * 0.5f, ADAPT_H_MIN);
         return false;
     }
 
-    if (err <= 1.0f || h < 1e-6f) {
+    if (err <= 1.0f || h < ADAPT_H_MIN) {
         X = y5.X; Y = y5.Y; Z = y5.Z; pX = y5.pX; pY = y5.pY; pZ = y5.pZ;
-        const float fac = (err > 1e-12f) ? 0.9f * pow(1.0f/err, 0.2f) : 2.0f;
-        h = clamp(h * fac, 1e-6f, 50.0f);
+        const float fac = (err > ADAPT_ERR_TINY_DOPRI) ? 0.9f * pow(1.0f/err, 0.2f) : 2.0f;
+        h = clamp(h * fac, ADAPT_H_MIN, ADAPT_H_MAX);
         return true;
     }
 
-    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), 1e-6f, h * 0.5f);
+    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), ADAPT_H_MIN, h * 0.5f);
     return false;
 }
 
@@ -764,9 +776,10 @@ static bool adaptive_step_ks(thread float& X, thread float& Y, thread float& Z,
                              thread float& pX, thread float& pY, thread float& pZ,
                              thread float& h,
                              float pT, float M, float a, float Q,
-                             int integrator_mode) {
+                             int integrator_mode,
+                             float tol) {
     if (integrator_mode == 1) {
-        return dopri5_adaptive_ks(X, Y, Z, pX, pY, pZ, h, pT, M, a, Q);
+        return dopri5_adaptive_ks(X, Y, Z, pX, pY, pZ, h, pT, M, a, Q, tol);
     }
 
     const float step_used = h;
@@ -781,15 +794,14 @@ static bool adaptive_step_ks(thread float& X, thread float& Y, thread float& Z,
         (X_h-X_f)*(X_h-X_f) + (Y_h-Y_f)*(Y_h-Y_f) + (Z_h-Z_f)*(Z_h-Z_f) +
         (pX_h-pX_f)*(pX_h-pX_f) + (pY_h-pY_f)*(pY_h-pY_f) + (pZ_h-pZ_f)*(pZ_h-pZ_f)
     ) / 15.0f;
-    const float tol = 2e-5f;
-    if (err < tol || h < 1e-6f) {
+    if (err < tol || h < ADAPT_H_MIN) {
         X = X_f; Y = Y_f; Z = Z_f; pX = pX_f; pY = pY_f; pZ = pZ_f;
-        const float sc = (err > 1e-10f) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-        h = clamp(h*sc, 1e-6f, 50.0f);
+        const float sc = (err > ADAPT_ERR_TINY_RK4) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
+        h = clamp(h*sc, ADAPT_H_MIN, ADAPT_H_MAX);
         return true;
     }
 
-    h = clamp(h*0.9f*pow(tol/err, 0.25f), 1e-6f, h*0.5f);
+    h = clamp(h*0.9f*pow(tol/err, 0.25f), ADAPT_H_MIN, h*0.5f);
     return false;
 }
 
@@ -1598,7 +1610,10 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
                                                       float r_obs, float theta_obs, float phi_obs,
                                                       float r_horizon, float r_isco, float r_disk_out,
                                                       int intersection_mode,
-                                                      int integrator_mode) {
+                                                      int integrator_mode,
+                                                      int max_steps,
+                                                      float step_init,
+                                                      float integrator_tol) {
     RayTraceResultBL res{};
     res.outcome = 2;
     res.r_hit = 0.0f;
@@ -1667,7 +1682,7 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
     }
 
     float r = r_obs, theta = theta_obs, phi = phi_obs;
-    float dlam = 1.0f;
+    float dlam = max(step_init, ADAPT_H_MIN);
     float prev_r = r_obs;
     float prev_theta = theta_obs;
     float prev_phi = phi_obs;
@@ -1675,9 +1690,11 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
     float prev_pth = pth;
     const float r_escape = r_obs * 1.05f;
 
-    for (int iter = 0; iter < 60000; ++iter) {
+    const int iter_cap = max(max_steps, 1);
+    for (int iter = 0; iter < iter_cap; ++iter) {
         const float step_used = dlam;
-        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L, integrator_mode)) {
+        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L,
+                              integrator_mode, integrator_tol)) {
             continue;
         }
 
@@ -1772,7 +1789,10 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                                                       float r_obs, float theta_obs, float phi_obs,
                                                       float r_horizon, float r_isco, float r_disk_out,
                                                       int intersection_mode,
-                                                      int integrator_mode) {
+                                                      int integrator_mode,
+                                                      int max_steps,
+                                                      float step_init,
+                                                      float integrator_tol) {
     RayTraceResultBL res{};
     res.outcome = 2;
     res.r_hit = 0.0f;
@@ -1867,16 +1887,18 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
     }
     if (!ks_ok) return res;
 
-    float dlam_ks = 1.0f;
+    float dlam_ks = max(step_init, ADAPT_H_MIN);
     float prevX = X, prevY = Y, prevZ = Z;
     float prevPX = pX, prevPY = pY, prevPZ = pZ;
     float prev_r_ks = r_obs;
     const float rh_cut = r_horizon * 1.03f;
     const float r_escape = r_obs * 1.05f;
 
-    for (int iter = 0; iter < 60000; ++iter) {
+    const int iter_cap = max(max_steps, 1);
+    for (int iter = 0; iter < iter_cap; ++iter) {
         const float step_used_ks = dlam_ks;
-        if (!adaptive_step_ks(X, Y, Z, pX, pY, pZ, dlam_ks, pT, M, a, Q, integrator_mode)) {
+        if (!adaptive_step_ks(X, Y, Z, pX, pY, pZ, dlam_ks, pT, M, a, Q,
+                              integrator_mode, integrator_tol)) {
             continue;
         }
 
@@ -1986,17 +2008,22 @@ static RayTraceResultBL trace_standard_chart_from_angles(float alpha, float beta
                                                          float r_obs, float theta_obs, float phi_obs,
                                                          float r_horizon, float r_isco, float r_disk_out,
                                                          int chart, int intersection_mode,
-                                                         int integrator_mode) {
+                                                         int integrator_mode,
+                                                         int max_steps,
+                                                         float step_init,
+                                                         float integrator_tol) {
     if (chart == 1 && abs(L) <= 1e-8f) {
         return trace_standard_ks_from_angles(alpha, beta, M, a, Q, L,
                                              r_obs, theta_obs, phi_obs,
                                              r_horizon, r_isco, r_disk_out,
-                                             intersection_mode, integrator_mode);
+                                             intersection_mode, integrator_mode,
+                                             max_steps, step_init, integrator_tol);
     }
     return trace_standard_bl_from_angles(alpha, beta, M, a, Q, L,
                                          r_obs, theta_obs, phi_obs,
                                          r_horizon, r_isco, r_disk_out,
-                                         intersection_mode, integrator_mode);
+                                         intersection_mode, integrator_mode,
+                                         max_steps, step_init, integrator_tol);
 }
 
 // ── Main compute implementation (shared by all entry kernels) ─
@@ -2022,8 +2049,10 @@ static inline void trace_pixel_impl(
 
     // ── Pixel → (α, β) ───────────────────────────────────────
     const int span = max(width - 1, 1);
-    const float alpha = cp.fov_h*(float(px) - 0.5f*(width-1))  / float(span);
-    const float beta  = cp.fov_h*(0.5f*(height-1) - float(py)) / float(span);
+    const float pxf = float(px) + cp.pixel_offset_x;
+    const float pyf = float(py) + cp.pixel_offset_y;
+    const float alpha = cp.fov_h*(pxf - 0.5f*(width-1))  / float(span);
+    const float beta  = cp.fov_h*(0.5f*(height-1) - pyf) / float(span);
 
     // ── Ray-bundle mode (GPU native, standard solver; BL and KS) ─
     const bool bundle_chart_ok = (cp.chart == 0) || (cp.chart == 1 && abs(L) <= 1e-8f);
@@ -2033,7 +2062,8 @@ static inline void trace_pixel_impl(
             alpha, beta, M, a, Q, L,
             cp.r_obs, cp.theta_obs, cp.phi_obs,
             kp.r_horizon, kp.r_isco, kp.r_disk_out,
-            cp.chart, cp.intersection_mode, cp.integrator_mode);
+            cp.chart, cp.intersection_mode, cp.integrator_mode,
+            cp.max_steps, cp.step_init, cp.integrator_tol);
 
         if (c.outcome == 0) {
             const float4 bgc = clamp(sample_background(bg_tex, bg_samp, c.theta_esc, c.phi_esc), 0.0f, 1.0f);
@@ -2053,22 +2083,26 @@ static inline void trace_pixel_impl(
                     alpha + eps, beta, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode, cp.integrator_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode,
+                    cp.max_steps, cp.step_init, cp.integrator_tol);
                 const RayTraceResultBL am = trace_standard_chart_from_angles(
                     alpha - eps, beta, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode, cp.integrator_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode,
+                    cp.max_steps, cp.step_init, cp.integrator_tol);
                 const RayTraceResultBL bp = trace_standard_chart_from_angles(
                     alpha, beta + eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode, cp.integrator_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode,
+                    cp.max_steps, cp.step_init, cp.integrator_tol);
                 const RayTraceResultBL bm = trace_standard_chart_from_angles(
                     alpha, beta - eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                    cp.chart, cp.intersection_mode, cp.integrator_mode);
+                    cp.chart, cp.intersection_mode, cp.integrator_mode,
+                    cp.max_steps, cp.step_init, cp.integrator_tol);
 
                 if (ap.outcome == 1 && am.outcome == 1 && bp.outcome == 1 && bm.outcome == 1) {
                     const float dr_da = (ap.r_hit - am.r_hit) / (2.0f * eps);
@@ -2201,7 +2235,7 @@ static inline void trace_pixel_impl(
 
     // ── Trace ─────────────────────────────────────────────────
     float r = r0, theta = th0, phi = cp.phi_obs;
-    float dlam = 1.0f;
+    float dlam = max(cp.step_init, ADAPT_H_MIN);
     float prev_r = r0;
     float prev_theta = th0;
     float prev_phi = phi;
@@ -2245,7 +2279,8 @@ static inline void trace_pixel_impl(
                 alpha, beta, M, a, Q, L,
                 cp.r_obs, cp.theta_obs, cp.phi_obs,
                 kp.r_horizon, kp.r_isco, kp.r_disk_out,
-                cp.chart, cp.intersection_mode, cp.integrator_mode);
+                cp.chart, cp.intersection_mode, cp.integrator_mode,
+                cp.max_steps, cp.step_init, cp.integrator_tol);
             if (verify.outcome == 2) {
                 output[py * width + px] = colour;
                 return;
@@ -2303,7 +2338,7 @@ static inline void trace_pixel_impl(
                 (dth0 >= 0.0f) ? 1 : -1
             };
 
-            float h = 1.0f;
+            float h = max(cp.step_init, ADAPT_H_MIN);
             float prev_r_sep = s.r;
             float prev_theta_sep = s.theta;
             float prev_phi_sep = s.phi;
@@ -2313,7 +2348,8 @@ static inline void trace_pixel_impl(
             constexpr float Th_turn_eps = 1e-9f;
             bool done = false;
 
-            for (int iter = 0; iter < 60000; ++iter) {
+            const int semi_iter_cap = max(cp.max_steps, 1);
+            for (int iter = 0; iter < semi_iter_cap; ++iter) {
                 SeparableState s_prev = s;
                 const float prev_Rpot_step = prev_Rpot;
                 const float prev_Thpot_step = prev_Thpot;
@@ -2321,7 +2357,7 @@ static inline void trace_pixel_impl(
                 int rejects = 0;
                 while (true) {
                     step_used = h;
-                    if (rk4_adaptive_separable_kerr(sc, s, h)) break;
+                    if (rk4_adaptive_separable_kerr(sc, s, h, cp.integrator_tol)) break;
                     if (!isfinite(h) || ++rejects > 64) {
                         semi_ok = false;
                         break;
@@ -2446,14 +2482,16 @@ static inline void trace_pixel_impl(
         }
 
         if (ks_ok) {
-            float dlam_ks = 1.0f;
+            float dlam_ks = max(cp.step_init, ADAPT_H_MIN);
             float prevX = X, prevY = Y, prevZ = Z;
             float prevPX = pX, prevPY = pY, prevPZ = pZ;
             float prev_r_ks = r0;
 
-            for (int iter = 0; iter < 60000; ++iter) {
+            const int ks_iter_cap = max(cp.max_steps, 1);
+            for (int iter = 0; iter < ks_iter_cap; ++iter) {
                 const float step_used_ks = dlam_ks;
-                if (!adaptive_step_ks(X, Y, Z, pX, pY, pZ, dlam_ks, pT, M, a, Q, cp.integrator_mode)) {
+                if (!adaptive_step_ks(X, Y, Z, pX, pY, pZ, dlam_ks, pT, M, a, Q,
+                                      cp.integrator_mode, cp.integrator_tol)) {
                     continue;
                 }
 
@@ -2567,8 +2605,10 @@ static inline void trace_pixel_impl(
         }
     }
 
-    for (int iter = 0; iter < 60000; ++iter) {
-        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L, cp.integrator_mode)) {
+    const int std_iter_cap = max(cp.max_steps, 1);
+    for (int iter = 0; iter < std_iter_cap; ++iter) {
+        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L,
+                              cp.integrator_mode, cp.integrator_tol)) {
             continue;
         }
 

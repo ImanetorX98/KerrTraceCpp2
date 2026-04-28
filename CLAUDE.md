@@ -147,43 +147,43 @@ where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
 
 ## Known Issues & Ongoing Work
 
-### elliptic-closed solver — BUG (under investigation, 2026-04-24)
+### elliptic-closed solver — Region III bug (2026-04-26)
 
-**Status**: Root cause identified, partial fix applied, not yet resolved.
+**Status**: Root cause fully identified. Fallback guard in place; ~53% fallback rate at
+default a=0.998 (near-extremal). Correct images produced; performance is suboptimal.
 
-**Symptom**: `--elliptic-closed` renders show enlarged black shadow — the secondary image
-(bright arc above the BH) is missing or wrong in both CPU (BL chart) and GPU (Metal).
+**Symptom (original)**: enlarged black shadow, secondary image missing.
+**Fix applied (2026-04-24)**: guard `if (r_now < mp.r1) return fallback` rejects hits in
+the inner inaccessible region. This fixed the visual corruption.
 
-**Root cause (identified)**:
-The radial map in `init_elliptic_radial_map` / `elliptic_closed_first_hit` uses the
-**inner pair** of roots (r3, r4 in descending order = smallest two roots of the radial
-potential R(r)). For an observer at r_obs >> all roots, the accessible region is
-r > r1 (outermost root). The formula `r = (r4*r31 - r3*r41*sn²)/(r31 - r41*sn²)`
-has a singularity at sn²* = r31/r41 ∈ (0,1) which maps sn² ∈ (sn²*, 1] to the
-observer's region r ∈ (r1, +∞). This produces physically valid r_now for some rays.
+**Remaining efficiency problem**: ~23 000 rays per 1920×1080 frame hit
+`r_now < rh_cut` (rh_cut = 1.03·r₊) and fall back to numerical.
 
-**Secondary image issue**:
-The elliptic solver evaluates **only the first equatorial crossing** (τ_first from
-`first_equator_crossing_mino_time`). For some rays that should form the secondary image,
-the elliptic solver may classify them as DISK_HIT at the wrong r_now (not the actual
-disk crossing), producing incorrect color (typically very dark due to wrong emissivity),
-while the fallback numerical path gives the correct result.
+**Root cause of the 23k fallback rays (diagnosed 2026-04-26)**:
+These are **Region III** photons (2 real + 2 complex roots, both real roots inside r₊).
+The GL B75 radial formula for Region III computes r on the **hypothetical post-bounce
+leg**: in BL/GL coordinates the inner turning point r_hi is inside r₊, so the formula
+treats the photon as bouncing at r_hi and returning outward.  In reality these photons
+cross θ=π/2 **before reaching the horizon**, giving a genuine disk hit at r ≈ 2–2.4M.
+The GL formula evaluates r at τ_first on the (unphysical) outgoing leg, returning
+r ≈ 1.09M (sub-horizon) — completely wrong.
 
-**Partial fix applied (2026-04-24)**:
-- Added guard `if (r_now < mp.r1) return fallback` in both `main.cpp` and `tracer.metal`
-  to reject disk hits in the inner inaccessible region.
-- Changed `return 1 (HORIZON)` to `return 0 (fallback)` for sub-horizon r_now values.
-- These partially reduce false classifications but do NOT fully fix the solver.
+**Confirmed**: diagnostic run showed 100% (5001/5001) of sub-horizon Region III rays
+give DISK_HIT (not HORIZON) under both BL and KS numerical tracers.
 
-**Correct fix needed**:
-Implement the Gralla & Lupsasca (2019) Type-I orbit radial map using the **outer pair**
-of turning points (r1, r2 in descending notation = the two largest roots). The correct
-formula (GL Eq. A10 inversion) uses r ∈ [r2_GL, r4_GL] (GL ascending) = [r2, r1] (code
-descending). Until this is implemented, use `--standard` (default) for correct images.
+**Guard in place**: `if (r_now < rh_cut) return fallback_trace(DIRECT_RADIAL_INVALID)`
+(lines ~1263 in `trace_single_elliptic_closed`) with explanatory comment.  This is
+correct and safe; do not replace it with a direct HORIZON return.
 
-**Standard render (Metal GPU, ray-bundles) confirmed working correctly**:
-- 720p and 1080p frames rendered on 2026-04-24, bump/diagonal artifact resolved.
-- Correct physics: secondary image visible, bright left side (a=0.5 approaching material).
+**Correct long-term fix**:
+For Region III where r_hi < r₊, the GL B75 formula is only reliable for r > r_hi on
+the *ingoing* leg.  Properly handling these rays requires either:
+(a) Detecting when τ_first corresponds to the outgoing leg and computing τ_first for
+    the actual ingoing disk crossing instead, or
+(b) Switching to direct numerical integration for all Region III photons.
+Option (b) is already in effect via the fallback guard.
+
+**Standard renders confirmed correct** at both a=0.5 and a=0.998 (near-extremal).
 
 ### Build notes (2026-04-24)
 - CPU binary: `cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu`

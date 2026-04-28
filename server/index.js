@@ -16,22 +16,37 @@ const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server, path: '/ws' });
 
 const ROOT         = path.resolve(__dirname, '..');
-const BINARY_CPU   = path.join(ROOT, 'build', 'kerr_tracer');
-const BINARY_METAL = path.join(ROOT, 'build', 'kerr_tracer_metal');
+const BINARY_MAIN  = path.join(ROOT, 'build', 'kerr_tracer');
+const BINARY_CPU_ONLY = path.join(ROOT, 'build_cpu', 'kerr_tracer');
+const BINARY_METAL_LEGACY = path.join(ROOT, 'build', 'kerr_tracer_metal');
 const BINARY_CUDA  = path.join(ROOT, 'build', 'kerr_tracer_cuda');
 const OUT_DIR      = path.join(ROOT, 'out');
 const ASSETS_DIR   = path.join(ROOT, 'assets', 'backgrounds');
+const DEFAULT_BACKGROUND = 'sfondo5.jpg';
+
+function firstExisting(paths) {
+  for (const p of paths) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+// Prefer dedicated CPU build when available.
+const BINARY_CPU = firstExisting([BINARY_CPU_ONLY, BINARY_MAIN]);
+// Prefer unified up-to-date build for Metal; legacy target is fallback only.
+const BINARY_METAL = firstExisting([BINARY_MAIN, BINARY_METAL_LEGACY]);
 
 function resolveBinary(backend) {
-  if (backend === 'metal' && fs.existsSync(BINARY_METAL)) return BINARY_METAL;
-  if (backend === 'cuda'  && fs.existsSync(BINARY_CUDA))  return BINARY_CUDA;
-  return BINARY_CPU;
+  if (backend === 'metal' && BINARY_METAL) return BINARY_METAL;
+  if (backend === 'cuda'  && fs.existsSync(BINARY_CUDA)) return BINARY_CUDA;
+  if (BINARY_CPU) return BINARY_CPU;
+  return BINARY_MAIN;
 }
 
 function availableBackends() {
   const b = [];
-  if (fs.existsSync(BINARY_CPU))   b.push('cpu');
-  if (fs.existsSync(BINARY_METAL)) b.push('metal');
+  if (BINARY_CPU) b.push('cpu');
+  if (BINARY_METAL) b.push('metal');
   if (fs.existsSync(BINARY_CUDA))  b.push('cuda');
   return b;
 }
@@ -58,6 +73,29 @@ app.use('/renders', express.static(OUT_DIR));
 // ── Active render state ───────────────────────────────────────
 let activeJob = null;   // { proc, clients: Set<WebSocket>, outfile }
 
+function nowSeconds() {
+  return Date.now() / 1000;
+}
+
+function startProgressHeartbeat(job) {
+  if (!job) return;
+  job.startedAtSec = nowSeconds();
+  job.hasRealProgress = false;
+  job.heartbeat = setInterval(() => {
+    if (!activeJob || activeJob !== job) return;
+    if (job.hasRealProgress) return;
+    const elapsed = Math.max(0, nowSeconds() - job.startedAtSec);
+    // Heartbeat progress: elapsed-only update (UI can show indeterminate bar).
+    broadcast({ type: 'progress', elapsed });
+  }, 1000);
+}
+
+function stopProgressHeartbeat(job) {
+  if (!job || !job.heartbeat) return;
+  clearInterval(job.heartbeat);
+  job.heartbeat = null;
+}
+
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
@@ -77,10 +115,16 @@ wss.on('connection', ws => {
 app.get('/api/info', (req, res) => {
   const backgrounds = fs.readdirSync(ASSETS_DIR)
     .filter(f => /\.(jpg|jpeg|png)$/i.test(f))
-    .map(f => f);
+    .map(f => f)
+    .sort((a, b) => {
+      if (a === DEFAULT_BACKGROUND) return -1;
+      if (b === DEFAULT_BACKGROUND) return 1;
+      return a.localeCompare(b);
+    });
 
   res.json({
     resolutions: Object.keys(RESOLUTIONS),
+    resolutionSizes: RESOLUTIONS,
     backgrounds,
     backends: availableBackends(),
   });
@@ -134,8 +178,14 @@ app.post('/api/colorize', (req, res) => {
 
   broadcast({ type: 'start', args, resolution: 'recolor' });
 
-  const proc = spawn(BINARY, args, { cwd: ROOT });
-  activeJob = { proc };
+  const binary = resolveBinary('cpu');
+  if (!binary || !fs.existsSync(binary)) {
+    return res.status(503).json({ error: 'No renderer binary found for colorize' });
+  }
+  const proc = spawn(binary, args, { cwd: ROOT });
+  const job = { proc, heartbeat: null, startedAtSec: nowSeconds(), hasRealProgress: false };
+  activeJob = job;
+  startProgressHeartbeat(job);
 
   proc.stdout.on('data', chunk => {
     broadcast({ type: 'stdout', line: chunk.toString() });
@@ -145,11 +195,13 @@ app.post('/api/colorize', (req, res) => {
     const raw = chunk.toString();
     const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
     if (match) {
+      job.hasRealProgress = true;
       broadcast({ type: 'progress', pct: parseInt(match[1]), elapsed: parseFloat(match[2]), eta: parseFloat(match[3]) });
     }
   });
 
   proc.on('close', code => {
+    stopProgressHeartbeat(job);
     const outFile = fs.readdirSync(OUT_DIR)
       .filter(f => /\.(png|mp4)$/.test(f))
       .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
@@ -189,6 +241,23 @@ app.post('/api/render', (req, res) => {
   if (p.bundles)  args.push('--bundles');
   if (p.anti_fireflies) args.push('--anti-fireflies');
   if (p.dopri5)   args.push('--dopri5');
+  if (p.gpu_fp64) args.push('--gpu-fp64');
+  if (p.max_steps !== undefined) {
+    const v = Number(p.max_steps);
+    if (Number.isFinite(v)) args.push('--max-steps', String(Math.max(1, Math.floor(v))));
+  }
+  if (p.step_init !== undefined) {
+    const v = Number(p.step_init);
+    if (Number.isFinite(v)) args.push('--step-init', String(Math.max(1e-10, v)));
+  }
+  if (p.integrator_tol !== undefined) {
+    const v = Number(p.integrator_tol);
+    if (Number.isFinite(v)) args.push('--integrator-tol', String(Math.max(1e-10, v)));
+  }
+  if (p.camera_spp !== undefined) {
+    const v = Number(p.camera_spp);
+    if (Number.isFinite(v)) args.push('--camera-spp', String(Math.max(1, Math.floor(v))));
+  }
   let solverMode = 'standard';
   if (typeof p.solver_mode === 'string') {
     const m = p.solver_mode.toLowerCase();
@@ -233,9 +302,40 @@ app.post('/api/render', (req, res) => {
     if (p.anim_disk_end    !== undefined) args.push('--disk-out-end',   String(p.anim_disk_end));
   }
 
-  if (p.background) {
-    const bgPath = path.join(ASSETS_DIR, p.background);
-    if (fs.existsSync(bgPath)) args.push('--bg', bgPath);
+  const requestedBg = (typeof p.background === 'string' && p.background.trim().length > 0)
+    ? p.background.trim()
+    : DEFAULT_BACKGROUND;
+  if (requestedBg) {
+    const bgPath = path.join(ASSETS_DIR, requestedBg);
+    if (fs.existsSync(bgPath)) {
+      args.push('--bg', bgPath);
+    } else {
+      console.warn(`[render] background not found: ${requestedBg}`);
+    }
+  }
+
+  // Disk palette
+  if (p.disk_palette === 'interstellar') {
+    args.push('--disk-interstellar');
+    if (p.disk_rings   !== undefined) args.push('--disk-rings',   String(Math.max(1, Math.floor(Number(p.disk_rings)))));
+    if (p.disk_sectors !== undefined) args.push('--disk-sectors', String(Math.max(1, Math.floor(Number(p.disk_sectors)))));
+    if (p.disk_sigma   !== undefined) args.push('--disk-sigma',   String(Math.max(0.01, Number(p.disk_sigma))));
+  }
+
+  // Wormhole (DNEG metric)
+  if (p.wormhole) {
+    args.push('--wormhole');
+    if (p.wh_rho     !== undefined) args.push('--wh-throat',  String(p.wh_rho));
+    if (p.wh_M_lens  !== undefined) args.push('--wh-lensing', String(p.wh_M_lens));
+    if (p.wh_a_tunnel !== undefined) args.push('--wh-tunnel',  String(p.wh_a_tunnel));
+    if (typeof p.bg_b === 'string' && p.bg_b.trim().length > 0) {
+      const bgBPath = path.join(ASSETS_DIR, p.bg_b.trim());
+      if (fs.existsSync(bgBPath)) {
+        args.push('--bg-b', bgBPath);
+      } else {
+        console.warn(`[render] --bg-b not found: ${p.bg_b}`);
+      }
+    }
   }
 
   // Always save geodesic cache alongside every render
@@ -248,7 +348,9 @@ app.post('/api/render', (req, res) => {
   broadcast({ type: 'start', args, resolution: res_key });
 
   const proc = spawn(binary, args, { cwd: ROOT });
-  activeJob = { proc };
+  const job = { proc, heartbeat: null, startedAtSec: nowSeconds(), hasRealProgress: false };
+  activeJob = job;
+  startProgressHeartbeat(job);
 
   proc.stdout.on('data', chunk => {
     const line = chunk.toString();
@@ -261,6 +363,7 @@ app.post('/api/render', (req, res) => {
     // Extract percentage from progress bar
     const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
     if (match) {
+      job.hasRealProgress = true;
       broadcast({
         type: 'progress',
         pct: parseInt(match[1]),
@@ -271,6 +374,7 @@ app.post('/api/render', (req, res) => {
   });
 
   proc.on('close', code => {
+    stopProgressHeartbeat(job);
     const outFile = fs.readdirSync(OUT_DIR)
       .filter(f => /\.(png|mp4)$/.test(f))
       .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
@@ -295,7 +399,10 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`KNdS Render Server → http://localhost:${PORT}`);
   console.log(`Backends: ${availableBackends().join(', ')}`);
-  console.log(`CPU:   ${BINARY_CPU}`);
-  console.log(`Metal: ${BINARY_METAL}`);
+  console.log(`CPU:   ${BINARY_CPU ?? 'not found'}`);
+  console.log(`Metal: ${BINARY_METAL ?? 'not found'}`);
+  if (BINARY_METAL_LEGACY && fs.existsSync(BINARY_METAL_LEGACY) && BINARY_METAL !== BINARY_METAL_LEGACY) {
+    console.log(`Metal legacy (ignored): ${BINARY_METAL_LEGACY}`);
+  }
   console.log(`Output: ${OUT_DIR}`);
 });

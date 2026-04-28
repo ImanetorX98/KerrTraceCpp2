@@ -25,6 +25,8 @@ import { RenderService, RenderParams, RenderFile, GeoFile, ColorizeParams, ApiIn
   styleUrl: './app.scss',
 })
 export class App implements OnInit, OnDestroy {
+  readonly supersamplingLevels = [1, 2, 3, 4, 6, 8, 12, 16];
+
   // ── Info from server ──────────────────────────────────────────
   info: ApiInfo | null = null;
 
@@ -45,8 +47,22 @@ export class App implements OnInit, OnDestroy {
     semi_analytic: false,
     bundles: false,
     anti_fireflies: false,
+    gpu_fp64: false,
     dopri5: false,
-    background: '',
+    max_steps: 60000,
+    step_init: 1.0,
+    integrator_tol: 2e-5,
+    camera_spp: 2,
+    background: 'sfondo5.jpg',
+    disk_palette: 'blackbody',
+    disk_rings: 7,
+    disk_sectors: 14,
+    disk_sigma: 0.5,
+    wormhole: false,
+    wh_rho: 1.0,
+    wh_M_lens: 1.0,
+    wh_a_tunnel: 0.01,
+    bg_b: '',
     anim: false,
     anim_frames: 60,
     anim_fps: 30,
@@ -68,6 +84,7 @@ export class App implements OnInit, OnDestroy {
   // ── State signals ─────────────────────────────────────────────
   readonly status   = signal<'idle' | 'running' | 'done' | 'error'>('idle');
   readonly progress = signal(0);
+  readonly hasDeterminateProgress = signal(false);
   readonly elapsed  = signal(0);
   readonly eta      = signal(0);
   readonly logLines = signal<string[]>([]);
@@ -93,6 +110,13 @@ export class App implements OnInit, OnDestroy {
   ngOnInit() {
     this.svc.getInfo().subscribe(info => {
       this.info = info;
+      if (info.backgrounds?.length) {
+        if (info.backgrounds.includes('sfondo5.jpg')) {
+          this.params.background = 'sfondo5.jpg';
+        } else if (!info.backgrounds.includes(this.params.background)) {
+          this.params.background = info.backgrounds[0];
+        }
+      }
     });
     this.loadRenders();
     this.loadGeoFiles();
@@ -105,12 +129,22 @@ export class App implements OnInit, OnDestroy {
         case 'start':
           this.status.set('running');
           this.progress.set(0);
+          this.hasDeterminateProgress.set(false);
+          this.elapsed.set(0);
+          this.eta.set(0);
           this.logLines.set([`Starting: ${msg.args?.join(' ')}`]);
           break;
         case 'progress':
-          this.progress.set(msg.pct ?? 0);
-          this.elapsed.set(msg.elapsed ?? 0);
-          this.eta.set(msg.eta ?? 0);
+          if (typeof msg.pct === 'number') {
+            this.progress.set(msg.pct);
+            this.hasDeterminateProgress.set(true);
+          }
+          if (typeof msg.elapsed === 'number') {
+            this.elapsed.set(msg.elapsed);
+          }
+          if (typeof msg.eta === 'number') {
+            this.eta.set(msg.eta);
+          }
           break;
         case 'stdout':
           if (msg.line?.trim()) {
@@ -120,10 +154,7 @@ export class App implements OnInit, OnDestroy {
         case 'done':
           this.status.set(msg.code === 0 ? 'done' : 'error');
           this.progress.set(100);
-          if (msg.file) {
-            this.activeRender.set(msg.file);
-            setTimeout(() => { this.loadRenders(); this.loadGeoFiles(); }, 500);
-          }
+          this.refreshOutputs(msg.file ?? null);
           break;
       }
     });
@@ -133,11 +164,65 @@ export class App implements OnInit, OnDestroy {
     this.sub?.unsubscribe();
   }
 
+  toggleBundles() {
+    this.params.bundles = !this.params.bundles;
+    if (!this.params.bundles) {
+      this.params.anti_fireflies = false;
+    }
+  }
+
+  toggleAntiFireflies() {
+    if (!this.params.bundles) {
+      this.params.anti_fireflies = false;
+      return;
+    }
+    this.params.anti_fireflies = !this.params.anti_fireflies;
+  }
+
+  toggleGpuFp64() {
+    if (this.params.backend === 'cpu') {
+      this.params.gpu_fp64 = false;
+      return;
+    }
+    this.params.gpu_fp64 = !this.params.gpu_fp64;
+  }
+
+  isEllipticClosedAvailable(): boolean {
+    const eps = 1e-12;
+    return Math.abs(this.params.q) <= eps && Math.abs(this.params.lambda) <= eps;
+  }
+
+  setCharge(v: number) {
+    this.params.q = v;
+    this.enforceSolverConstraints();
+  }
+
+  setLambda(v: number) {
+    this.params.lambda = v;
+    this.enforceSolverConstraints();
+  }
+
+  private enforceSolverConstraints() {
+    if (!this.isEllipticClosedAvailable() && this.params.solver_mode === 'elliptic_closed') {
+      this.params.solver_mode = 'standard';
+    }
+  }
+
   startRender() {
     // Keep legacy payload field in sync for backward compatibility.
+    this.enforceSolverConstraints();
     this.params.semi_analytic = this.params.solver_mode === 'semi_analytic';
+    if (!this.params.bundles) {
+      this.params.anti_fireflies = false;
+    }
     this.svc.startRender(this.params).subscribe({
-      next: () => { this.status.set('running'); this.progress.set(0); },
+      next: () => {
+        this.status.set('running');
+        this.progress.set(0);
+        this.hasDeterminateProgress.set(false);
+        this.elapsed.set(0);
+        this.eta.set(0);
+      },
       error: err => {
         if (err.status === 409) alert('Render already running');
         else console.error(err);
@@ -147,6 +232,18 @@ export class App implements OnInit, OnDestroy {
 
   cancelRender() {
     this.svc.cancelRender().subscribe();
+  }
+
+  private refreshOutputs(preferredFile: string | null) {
+    const refreshOnce = () => {
+      this.loadRenders();
+      this.loadGeoFiles();
+      if (preferredFile) this.activeRender.set(preferredFile);
+    };
+    // Retry a few times to avoid races between process exit and fs mtime visibility.
+    [0, 250, 800, 1800].forEach(delay => {
+      setTimeout(refreshOnce, delay);
+    });
   }
 
   loadRenders() {
@@ -170,7 +267,13 @@ export class App implements OnInit, OnDestroy {
   startColorize() {
     if (!this.colorParams.geoFile) return;
     this.svc.colorize(this.colorParams).subscribe({
-      next: () => { this.status.set('running'); this.progress.set(0); },
+      next: () => {
+        this.status.set('running');
+        this.progress.set(0);
+        this.hasDeterminateProgress.set(false);
+        this.elapsed.set(0);
+        this.eta.set(0);
+      },
       error: err => {
         if (err.status === 409) alert('Render already running');
         else console.error(err);
@@ -186,8 +289,35 @@ export class App implements OnInit, OnDestroy {
     return v.toFixed(d);
   }
 
+  fmtClock(seconds: number): string {
+    const s = Math.max(0, Math.floor(seconds || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) {
+      return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    }
+    return `${m}:${String(sec).padStart(2, '0')}`;
+  }
+
   fmtSize(bytes: number): string {
     if (bytes > 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
     return (bytes / 1e3).toFixed(0) + ' KB';
+  }
+
+  currentResolutionSize(): { w: number; h: number } | null {
+    const sizes = this.info?.resolutionSizes;
+    if (!sizes) return null;
+    return sizes[this.params.resolution] ?? null;
+  }
+
+  raysPerFrame(): number | null {
+    const sz = this.currentResolutionSize();
+    if (!sz) return null;
+    return Math.max(1, Math.floor(this.params.camera_spp)) * sz.w * sz.h;
+  }
+
+  fmtInt(v: number): string {
+    return new Intl.NumberFormat('it-IT').format(Math.floor(v));
   }
 }

@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { Subject } from 'rxjs';
 
 export interface RenderParams {
@@ -21,8 +21,24 @@ export interface RenderParams {
   semi_analytic: boolean;
   bundles: boolean;
   anti_fireflies: boolean;
+  gpu_fp64: boolean;
   dopri5: boolean;
+  max_steps: number;
+  step_init: number;
+  integrator_tol: number;
+  camera_spp: number;
   background: string;
+  // Disk palette
+  disk_palette: 'blackbody' | 'interstellar';
+  disk_rings: number;
+  disk_sectors: number;
+  disk_sigma: number;
+  // Wormhole (DNEG metric)
+  wormhole: boolean;
+  wh_rho: number;
+  wh_M_lens: number;
+  wh_a_tunnel: number;
+  bg_b: string;
   // Animation
   anim: boolean;
   anim_frames: number;
@@ -76,6 +92,7 @@ export interface ColorizeParams {
 
 export interface ApiInfo {
   resolutions: string[];
+  resolutionSizes?: Record<string, { w: number; h: number }>;
   backgrounds: string[];
   backends: string[];
 }
@@ -109,11 +126,13 @@ export class RenderService {
   }
 
   getInfo() {
-    return this.http.get<ApiInfo>('/api/info');
+    const params = new HttpParams().set('_ts', Date.now().toString());
+    return this.http.get<ApiInfo>('/api/info', { params });
   }
 
   getRenders() {
-    return this.http.get<RenderFile[]>('/api/renders');
+    const params = new HttpParams().set('_ts', Date.now().toString());
+    return this.http.get<RenderFile[]>('/api/renders', { params });
   }
 
   startRender(params: RenderParams) {
@@ -125,7 +144,8 @@ export class RenderService {
   }
 
   getGeoFiles() {
-    return this.http.get<GeoFile[]>('/api/geo-files');
+    const params = new HttpParams().set('_ts', Date.now().toString());
+    return this.http.get<GeoFile[]>('/api/geo-files', { params });
   }
 
   colorize(params: ColorizeParams) {

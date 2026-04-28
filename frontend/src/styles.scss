@@ -233,6 +233,20 @@ html, body {
     user-select: none;
     flex: 1;
   }
+
+  &.disabled {
+    cursor: not-allowed;
+
+    label {
+      opacity: .55;
+      cursor: not-allowed;
+    }
+
+    .switch {
+      opacity: .55;
+      cursor: not-allowed;
+    }
+  }
 }
 
 .switch {
@@ -479,7 +493,15 @@ html, body {
 
   mat-icon { color: inherit; }
 
-  &:hover { border-color: $border-hi; color: $text-mid; }
+  &:not(:disabled):hover { border-color: $border-hi; color: $text-mid; }
+
+  &:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+    border-color: $border;
+    color: $text-lo;
+    background: #0f0f0f;
+  }
 
   &.active {
     border-color: $border-hi;

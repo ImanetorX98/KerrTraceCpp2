@@ -28,6 +28,11 @@ struct CameraParams_C {
     int   intersection_mode; // 0 = linear, 1 = hermite
     int   elliptic_fallback_black; // 0 = normal fallback, 1 = fallback pixels forced to black
     int   anti_fireflies; // 0 = off, 1 = robust anti-fireflies filter (ray-bundle path)
+    int   max_steps; // hard cap on adaptive integration iterations per ray
+    float step_init; // initial affine step size
+    float integrator_tol; // adaptive integrator tolerance
+    float pixel_offset_x; // subpixel X offset in pixel units
+    float pixel_offset_y; // subpixel Y offset in pixel units
 };
 
 /// Renders the image on the default Metal GPU device.

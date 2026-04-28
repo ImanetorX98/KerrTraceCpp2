@@ -22,4 +22,5 @@ struct CameraParams_CUDA {
 /// Launch the CUDA kernel and return the rendered RGBA buffer.
 std::vector<uint32_t> cuda_render(
     const KNdSParams_CUDA&  kp,
-    const CameraParams_CUDA& cp);
+    const CameraParams_CUDA& cp,
+    bool require_fp64);

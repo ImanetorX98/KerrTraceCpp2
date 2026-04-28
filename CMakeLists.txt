@@ -9,6 +9,7 @@ include(CTest)
 # ── Backend selection ─────────────────────────────────────────
 option(USE_METAL "Use Metal GPU backend (macOS only)"  OFF)
 option(USE_CUDA  "Use CUDA GPU backend (Linux/Windows)" OFF)
+option(CUDA_ENABLE_FAST_MATH "Enable --use_fast_math for CUDA kernels (faster, less precise)" OFF)
 
 # ── Common CPU sources ────────────────────────────────────────
 set(CPU_SOURCES main.cpp)
@@ -32,11 +33,16 @@ endif()
 if(USE_CUDA)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # Broad default to support most Windows/Linux NVIDIA cards out of the box.
+        set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75;80;86;89" CACHE STRING
+            "CUDA architectures to build for" FORCE)
+    endif()
     list(APPEND CPU_SOURCES gpu/cuda/tracer.cu)
     # Separate compilation so CUDA sources can include our headers
     set_source_files_properties(gpu/cuda/tracer.cu
         PROPERTIES LANGUAGE CUDA)
-    message(STATUS "CUDA backend enabled")
+    message(STATUS "CUDA backend enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
 endif()
 
 # ── Executable ────────────────────────────────────────────────
@@ -65,7 +71,11 @@ endif()
 if(USE_CUDA)
     target_compile_definitions(kerr_tracer PRIVATE USE_CUDA)
     target_compile_options(kerr_tracer PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>: -O3 --use_fast_math -arch=sm_86>)
+        $<$<COMPILE_LANGUAGE:CUDA>: -O3>)
+    if(CUDA_ENABLE_FAST_MATH)
+        target_compile_options(kerr_tracer PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>: --use_fast_math>)
+    endif()
     set_target_properties(kerr_tracer PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
 endif()

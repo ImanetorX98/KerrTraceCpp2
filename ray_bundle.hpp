@@ -270,6 +270,7 @@ struct BundleResult {
     double magnif      = 1.0;  ///< |det J|  — solid-angle magnification
     double theta_esc   = 0.0;  ///< final θ on escape (for background lookup)
     double phi_esc     = 0.0;  ///< final φ on escape
+    double phi_disk    = 0.0;  ///< BL azimuthal angle at disk crossing
 };
 
 // ── Initial deviation vectors ΔΨ_α, ΔΨ_β ────────────────────
@@ -302,10 +303,17 @@ static BundleResult trace_bundle(int px, int py,
                                   const KNdSMetric& g,
                                   double r_disk_in,
                                   double r_disk_out,
-                                  double r_escape) {
+                                  double r_escape,
+                                  int max_steps = 500000,
+                                  double step_init = 1.0,
+                                  double tol = 1e-7,
+                                  double pixel_offset_x = 0.0,
+                                  double pixel_offset_y = 0.0) {
     const int span = (cam.width > 1) ? (cam.width - 1) : 1;
-    const double alpha = cam.fov_h*(px - 0.5*(cam.width-1))  / span;
-    const double beta  = cam.fov_h*(0.5*(cam.height-1) - py) / span;
+    const double x = (double)px + pixel_offset_x;
+    const double y = (double)py + pixel_offset_y;
+    const double alpha = cam.fov_h*(x - 0.5*(cam.width-1))  / span;
+    const double beta  = cam.fov_h*(0.5*(cam.height-1) - y) / span;
 
     BundleState bs;
     bs.geo = cam.angle_ray(alpha, beta, g);
@@ -313,15 +321,16 @@ static BundleResult trace_bundle(int px, int py,
 
     const double rh  = g.r_horizon();
     const double rh_cut = rh * 1.03;
-    double dlam      = 1.0;
+    double dlam      = std::max(step_init, 1e-10);
+    const int max_iter = std::max(1, max_steps);
 
-    for (int iter = 0; iter < 500000; ++iter) {
+    for (int iter = 0; iter < max_iter; ++iter) {
         const BundleState bs_prev = bs;
         double step_used = dlam;
         int rejects = 0;
         while (true) {
             step_used = dlam;
-            if (bundle_adaptive(g, bs, dlam)) break;
+            if (bundle_adaptive(g, bs, dlam, tol)) break;
             if (!std::isfinite(dlam) || ++rejects > 64) return {};
         }
 
@@ -331,9 +340,10 @@ static BundleResult trace_bundle(int px, int py,
         enum class StepEvent { NONE, DISK, HORIZON, ESCAPE };
         StepEvent best_event = StepEvent::NONE;
 
-        double disk_r_hit = 0.0;
-        double disk_red = 1.0;
-        double disk_det = 1.0;
+        double disk_r_hit  = 0.0;
+        double disk_red    = 1.0;
+        double disk_det    = 1.0;
+        double disk_phi    = 0.0;
 
         const double q0 = bs_prev.geo.theta - M_PI/2.0;
         const double q1 = bs.geo.theta      - M_PI/2.0;
@@ -380,11 +390,12 @@ static BundleResult trace_bundle(int px, int py,
 
                 double det = std::abs(J00*J11 - J01*J10);
                 det = det < 1e-12 ? 1e-12 : det;
-                disk_r_hit = r_hit;
-                disk_red = red;
-                disk_det = det;
-                best_alpha = alpha;
-                best_event = StepEvent::DISK;
+                disk_r_hit  = r_hit;
+                disk_red    = red;
+                disk_det    = det;
+                disk_phi    = bs_prev.geo.phi + alpha * (bs.geo.phi - bs_prev.geo.phi);
+                best_alpha  = alpha;
+                best_event  = StepEvent::DISK;
             }
         }
         const bool horizon_cross = ((bs_prev.geo.r > rh_cut) && (r <= rh_cut)) || (r <= rh_cut);
@@ -410,7 +421,7 @@ static BundleResult trace_bundle(int px, int py,
         }
 
         if (best_event == StepEvent::DISK) {
-            return {true, disk_r_hit, disk_red, disk_det};
+            return {true, disk_r_hit, disk_red, disk_det, 0.0, 0.0, disk_phi};
         }
         if (best_event == StepEvent::HORIZON) {
             return {};
