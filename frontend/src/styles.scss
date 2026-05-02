@@ -447,6 +447,76 @@ html, body {
   gap: 10px;
 }
 
+.render-split {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.split-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: $text-lo;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+}
+
+.split-canvas {
+  position: relative;
+  border: 1px solid $border;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #080808;
+  aspect-ratio: 16 / 9;
+}
+
+.split-base,
+.split-top {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #080808;
+}
+
+.split-overlay {
+  position: absolute;
+  inset: 0 auto 0 0;
+  overflow: hidden;
+}
+
+.split-overlay .split-top {
+  width: 100%;
+}
+
+.split-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid rgba(255, 255, 255, .9);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
+  pointer-events: none;
+}
+
+.split-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.split-controls input[type="range"] {
+  flex: 1;
+}
+
+.split-end {
+  font-size: 11px;
+  color: $text-mid;
+  width: 12px;
+  text-align: center;
+}
+
 .compare-pane {
   display: flex;
   flex-direction: column;

@@ -110,6 +110,8 @@ export class App implements OnInit, OnDestroy {
   readonly activeRender = signal<string | null>(null);
   readonly compareRender = signal<string | null>(null);
   compareMode = false;
+  compareLayout: 'split' | 'side_by_side' = 'split';
+  compareSplitPercent = 50;
   historyQuery = '';
   historyResolutionFilter = 'all';
   historyBackendFilter = 'all';
@@ -374,6 +376,19 @@ export class App implements OnInit, OnDestroy {
       const alt = this.renders.find(r => r.name !== active);
       this.compareRender.set(alt?.name ?? null);
     }
+  }
+
+  setCompareLayout(layout: 'split' | 'side_by_side') {
+    this.compareLayout = layout;
+  }
+
+  clampCompareSplit() {
+    const v = Number(this.compareSplitPercent);
+    if (!Number.isFinite(v)) {
+      this.compareSplitPercent = 50;
+      return;
+    }
+    this.compareSplitPercent = Math.max(0, Math.min(100, Math.round(v)));
   }
 
   selectCompareRender(name: string) {

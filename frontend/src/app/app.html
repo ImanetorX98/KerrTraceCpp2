@@ -9,7 +9,7 @@
     <div style="display:flex;align-items:center;gap:16px">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.4 — Wormhole</div>
+        <div><strong>Version</strong> v0.2.5 — Wormhole</div>
       </div>
       <span class="status-chip" [class]="status()">
         <span *ngIf="status()==='idle'">Idle</span>
@@ -629,6 +629,18 @@
                 (click)="swapCompare()">
           Swap A/B
         </button>
+        <button class="backend-btn"
+                [class.active]="compareMode && compareLayout === 'split'"
+                [disabled]="!compareMode"
+                (click)="setCompareLayout('split')">
+          Split
+        </button>
+        <button class="backend-btn"
+                [class.active]="compareMode && compareLayout === 'side_by_side'"
+                [disabled]="!compareMode"
+                (click)="setCompareLayout('side_by_side')">
+          Side-by-side
+        </button>
         <mat-select *ngIf="compareMode"
                     [ngModel]="compareRender()"
                     (ngModelChange)="selectCompareRender($event)"
@@ -645,7 +657,39 @@
         <span class="render-placeholder" *ngIf="!previewUrl()">No render yet</span>
       </div>
 
-      <div class="render-compare" *ngIf="compareMode">
+      <div class="render-split" *ngIf="compareMode && compareLayout === 'split'">
+        <div class="split-labels">
+          <span>A (active)</span>
+          <span>B (compare)</span>
+        </div>
+        <div class="split-canvas" *ngIf="previewUrl() && comparePreviewUrl(); else splitMissing">
+          <img class="split-base" [src]="comparePreviewUrl()!" alt="render B" />
+          <div class="split-overlay" [style.width.%]="compareSplitPercent">
+            <img class="split-top" [src]="previewUrl()!" alt="render A" />
+          </div>
+          <div class="split-divider" [style.left.%]="compareSplitPercent"></div>
+        </div>
+        <ng-template #splitMissing>
+          <div class="render-view mini">
+            <span class="render-placeholder">Seleziona due frame per il compare split</span>
+          </div>
+        </ng-template>
+        <div class="split-controls">
+          <span class="split-end">A</span>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            [(ngModel)]="compareSplitPercent"
+            (ngModelChange)="clampCompareSplit()"
+            aria-label="Split compare slider"
+          />
+          <span class="split-end">B</span>
+        </div>
+      </div>
+
+      <div class="render-compare" *ngIf="compareMode && compareLayout === 'side_by_side'">
         <div class="compare-pane">
           <div class="compare-label">A (active)</div>
           <div class="render-view mini">
