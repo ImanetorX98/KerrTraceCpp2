@@ -13,7 +13,15 @@ import { FormsModule } from '@angular/forms';
     <div class="ni-wrap">
       <button class="ni-btn" (click)="decrement()" [disabled]="value <= min" tabindex="-1">−</button>
 
-      <span class="ni-val" *ngIf="!editing" (click)="startEdit()">
+      <span class="ni-val" *ngIf="!editing"
+            tabindex="0"
+            role="spinbutton"
+            [attr.aria-valuemin]="min"
+            [attr.aria-valuemax]="max"
+            [attr.aria-valuenow]="value"
+            [attr.aria-valuetext]="display + (unit ? ' ' + unit : '')"
+            (click)="startEdit()"
+            (keydown)="onDisplayKeydown($event)">
         {{ display }}<span class="ni-unit" *ngIf="unit"> {{unit}}</span>
       </span>
 
@@ -95,10 +103,17 @@ import { FormsModule } from '@angular/forms';
       user-select: none;
       padding: 0 4px;
       white-space: nowrap;
+      outline: none;
 
       &:hover {
         color: #fff;
         background: #161616;
+      }
+
+      &:focus-visible {
+        background: #1a1a1a;
+        box-shadow: inset 0 0 0 1px #5a7fff;
+        color: #fff;
       }
 
       .ni-unit {
@@ -176,6 +191,23 @@ export class NumericInputComponent implements AfterViewChecked {
 
   increment() { this.emit(this.value + this.step); }
   decrement() { this.emit(this.value - this.step); }
+
+  onDisplayKeydown(event: KeyboardEvent) {
+    if (event.key === 'ArrowUp' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      this.increment();
+      return;
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowLeft') {
+      event.preventDefault();
+      this.decrement();
+      return;
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      this.startEdit();
+    }
+  }
 
   private emit(v: number) {
     const factor = Math.pow(10, this.decimals + 2);

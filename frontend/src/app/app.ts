@@ -12,6 +12,18 @@ import { MatTooltipModule } from '@angular/material/tooltip';
 
 import { RenderService, RenderParams, RenderFile, GeoFile, ColorizeParams, ApiInfo } from './render.service';
 
+interface RenderMetaLite {
+  resolution: string;
+  backend: 'cpu' | 'metal' | 'cuda' | 'unknown';
+  chart: 'ks' | 'bl' | 'unknown';
+}
+
+interface SavedPreset {
+  name: string;
+  createdAt: string;
+  params: RenderParams;
+}
+
 @Component({
   selector: 'app-root',
   standalone: true,
@@ -26,6 +38,9 @@ import { RenderService, RenderParams, RenderFile, GeoFile, ColorizeParams, ApiIn
 })
 export class App implements OnInit, OnDestroy {
   readonly supersamplingLevels = [1, 2, 3, 4, 6, 8, 12, 16];
+  readonly historyResolutionOptions = ['all', '144p', '256p', '480p', '512p', '720p', '1080p', '2K', '4K', 'custom'];
+  readonly historyBackendOptions = ['all', 'cpu', 'metal', 'cuda'];
+  readonly historyChartOptions = ['all', 'ks', 'bl'];
 
   // ── Info from server ──────────────────────────────────────────
   info: ApiInfo | null = null;
@@ -53,7 +68,7 @@ export class App implements OnInit, OnDestroy {
     step_init: 1.0,
     integrator_tol: 2e-5,
     camera_spp: 2,
-    background: 'sfondo5.jpg',
+    background: 'black.png',
     scene_mode: 'black_hole',
     disk_palette: 'blackbody',
     disk_rings: 7,
@@ -93,6 +108,16 @@ export class App implements OnInit, OnDestroy {
   // ── Gallery ───────────────────────────────────────────────────
   renders: RenderFile[] = [];
   readonly activeRender = signal<string | null>(null);
+  readonly compareRender = signal<string | null>(null);
+  compareMode = false;
+  historyQuery = '';
+  historyResolutionFilter = 'all';
+  historyBackendFilter = 'all';
+  historyChartFilter = 'all';
+  private readonly presetStorageKey = 'knds_presets_v1';
+  presets: SavedPreset[] = [];
+  presetDraftName = '';
+  selectedPresetName = '';
 
   // ── Post-process panel ────────────────────────────────────────
   geoFiles: GeoFile[] = [];
@@ -104,19 +129,22 @@ export class App implements OnInit, OnDestroy {
     return r ? this.svc.renderUrl(r) : null;
   });
 
+  readonly comparePreviewUrl = computed(() => {
+    const r = this.compareRender();
+    return r ? this.svc.renderUrl(r) : null;
+  });
+
   private sub: Subscription | null = null;
+  private statusPollTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(readonly svc: RenderService) {}
 
   ngOnInit() {
+    this.loadPresets();
     this.svc.getInfo().subscribe(info => {
       this.info = info;
-      if (info.backgrounds?.length) {
-        if (info.backgrounds.includes('sfondo5.jpg')) {
-          this.params.background = 'sfondo5.jpg';
-        } else if (!info.backgrounds.includes(this.params.background)) {
-          this.params.background = info.backgrounds[0];
-        }
+      if (info.backgrounds?.length && !info.backgrounds.includes(this.params.background)) {
+        this.params.background = info.backgrounds[0];
       }
     });
     this.loadRenders();
@@ -134,6 +162,7 @@ export class App implements OnInit, OnDestroy {
           this.elapsed.set(0);
           this.eta.set(0);
           this.logLines.set([`Starting: ${msg.args?.join(' ')}`]);
+          this.startStatusPolling();
           break;
         case 'progress':
           if (typeof msg.pct === 'number') {
@@ -155,14 +184,24 @@ export class App implements OnInit, OnDestroy {
         case 'done':
           this.status.set(msg.code === 0 ? 'done' : 'error');
           this.progress.set(100);
+          this.stopStatusPolling();
           this.refreshOutputs(msg.file ?? null);
           break;
+      }
+    });
+
+    // Fallback for remote/tunnel sessions: keep UI in sync even if WS drops.
+    this.svc.getStatus().subscribe(s => {
+      if (s.running) {
+        this.status.set('running');
+        this.startStatusPolling();
       }
     });
   }
 
   ngOnDestroy() {
     this.sub?.unsubscribe();
+    this.stopStatusPolling();
   }
 
   setSceneMode(mode: 'black_hole' | 'wormhole') {
@@ -228,6 +267,7 @@ export class App implements OnInit, OnDestroy {
         this.hasDeterminateProgress.set(false);
         this.elapsed.set(0);
         this.eta.set(0);
+        this.startStatusPolling();
       },
       error: err => {
         if (err.status === 409) alert('Render already running');
@@ -238,13 +278,18 @@ export class App implements OnInit, OnDestroy {
 
   cancelRender() {
     this.svc.cancelRender().subscribe();
+    this.stopStatusPolling();
   }
 
   private refreshOutputs(preferredFile: string | null) {
     const refreshOnce = () => {
-      this.loadRenders();
+      this.svc.getRenders().subscribe(files => {
+        this.renders = files;
+        const select = preferredFile ?? (files.length > 0 ? files[0].name : null);
+        if (select) this.activeRender.set(select);
+        this.syncCompareSelection();
+      });
       this.loadGeoFiles();
-      if (preferredFile) this.activeRender.set(preferredFile);
     };
     // Retry a few times to avoid races between process exit and fs mtime visibility.
     [0, 250, 800, 1800].forEach(delay => {
@@ -258,7 +303,34 @@ export class App implements OnInit, OnDestroy {
       if (!this.activeRender() && files.length > 0) {
         this.activeRender.set(files[0].name);
       }
+      this.syncCompareSelection();
     });
+  }
+
+  private startStatusPolling() {
+    if (this.statusPollTimer !== null) return;
+    this.statusPollTimer = setInterval(() => {
+      if (this.status() !== 'running') return;
+      this.svc.getStatus().subscribe({
+        next: s => {
+          if (!s.running) {
+            this.status.set('done');
+            this.progress.set(100);
+            this.stopStatusPolling();
+            this.refreshOutputs(s.lastFile ?? null);
+          }
+        },
+        error: () => {
+          // Keep running; WS may still deliver completion.
+        },
+      });
+    }, 2000);
+  }
+
+  private stopStatusPolling() {
+    if (this.statusPollTimer === null) return;
+    clearInterval(this.statusPollTimer);
+    this.statusPollTimer = null;
   }
 
   loadGeoFiles() {
@@ -289,6 +361,155 @@ export class App implements OnInit, OnDestroy {
 
   selectRender(name: string) {
     this.activeRender.set(name);
+    if (this.compareMode && !this.compareRender()) {
+      const alt = this.renders.find(r => r.name !== name);
+      this.compareRender.set(alt?.name ?? null);
+    }
+  }
+
+  toggleCompareMode() {
+    this.compareMode = !this.compareMode;
+    if (this.compareMode && !this.compareRender()) {
+      const active = this.activeRender();
+      const alt = this.renders.find(r => r.name !== active);
+      this.compareRender.set(alt?.name ?? null);
+    }
+  }
+
+  selectCompareRender(name: string) {
+    this.compareRender.set(name);
+  }
+
+  swapCompare() {
+    const a = this.activeRender();
+    const b = this.compareRender();
+    if (!a || !b) return;
+    this.activeRender.set(b);
+    this.compareRender.set(a);
+  }
+
+  filteredRenders(): RenderFile[] {
+    const q = this.historyQuery.trim().toLowerCase();
+    return this.renders.filter(r => {
+      const meta = this.getRenderMeta(r.name);
+      if (q && !r.name.toLowerCase().includes(q)) return false;
+      if (this.historyResolutionFilter !== 'all') {
+        if (this.historyResolutionFilter === 'custom') {
+          if (meta.resolution !== 'custom') return false;
+        } else if (meta.resolution !== this.historyResolutionFilter) {
+          return false;
+        }
+      }
+      if (this.historyBackendFilter !== 'all' && meta.backend !== this.historyBackendFilter) return false;
+      if (this.historyChartFilter !== 'all' && meta.chart !== this.historyChartFilter) return false;
+      return true;
+    });
+  }
+
+  getRenderMeta(name: string): RenderMetaLite {
+    const lower = name.toLowerCase();
+    let resolution = 'unknown';
+    if (lower.startsWith('4k_')) resolution = '4K';
+    else if (lower.startsWith('2k_')) resolution = '2K';
+    else if (lower.startsWith('1080p_')) resolution = '1080p';
+    else if (lower.startsWith('720p_')) resolution = '720p';
+    else if (lower.startsWith('512p_')) resolution = '512p';
+    else if (lower.startsWith('480p_') || lower.startsWith('hd_')) resolution = '480p';
+    else if (lower.startsWith('256p_')) resolution = '256p';
+    else if (lower.startsWith('144p_')) resolution = '144p';
+    else if (lower.startsWith('custom_')) resolution = 'custom';
+
+    let backend: RenderMetaLite['backend'] = 'unknown';
+    if (lower.includes('gpu-metal')) backend = 'metal';
+    else if (lower.includes('gpu-cuda')) backend = 'cuda';
+    else if (lower.includes('_cpu_') || lower.endsWith('_cpu.png') || lower.includes('_cpu-')) backend = 'cpu';
+
+    let chart: RenderMetaLite['chart'] = 'unknown';
+    if (lower.includes('_ks-') || lower.includes('_ks_')) chart = 'ks';
+    else if (lower.includes('_bl-') || lower.includes('_bl_')) chart = 'bl';
+
+    return { resolution, backend, chart };
+  }
+
+  humanBackend(meta: RenderMetaLite): string {
+    if (meta.backend === 'metal') return 'GPU Metal';
+    if (meta.backend === 'cuda') return 'GPU CUDA';
+    if (meta.backend === 'cpu') return 'CPU';
+    return 'N/A';
+  }
+
+  saveCurrentPreset() {
+    const name = this.presetDraftName.trim();
+    if (!name) return;
+    const snapshot = this.cloneParams(this.params);
+    const existingIdx = this.presets.findIndex(p => p.name.toLowerCase() === name.toLowerCase());
+    const next: SavedPreset = {
+      name,
+      createdAt: new Date().toISOString(),
+      params: snapshot,
+    };
+    if (existingIdx >= 0) this.presets.splice(existingIdx, 1);
+    this.presets.unshift(next);
+    this.presets = this.presets.slice(0, 40);
+    this.selectedPresetName = name;
+    this.persistPresets();
+  }
+
+  applySelectedPreset() {
+    if (!this.selectedPresetName) return;
+    const preset = this.presets.find(p => p.name === this.selectedPresetName);
+    if (!preset) return;
+    this.params = this.cloneParams(preset.params);
+    this.enforceSolverConstraints();
+    if (!this.params.bundles) this.params.anti_fireflies = false;
+  }
+
+  deleteSelectedPreset() {
+    if (!this.selectedPresetName) return;
+    this.presets = this.presets.filter(p => p.name !== this.selectedPresetName);
+    this.persistPresets();
+    this.selectedPresetName = '';
+  }
+
+  private cloneParams(src: RenderParams): RenderParams {
+    return JSON.parse(JSON.stringify(src)) as RenderParams;
+  }
+
+  private loadPresets() {
+    try {
+      const raw = localStorage.getItem(this.presetStorageKey);
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (!Array.isArray(data)) return;
+      const presets = data
+        .filter((p: any) => p && typeof p.name === 'string' && p.params)
+        .map((p: any) => ({
+          name: p.name,
+          createdAt: typeof p.createdAt === 'string' ? p.createdAt : new Date().toISOString(),
+          params: this.cloneParams(p.params as RenderParams),
+        })) as SavedPreset[];
+      this.presets = presets.slice(0, 40);
+      if (this.presets.length > 0) this.selectedPresetName = this.presets[0].name;
+    } catch {
+      this.presets = [];
+    }
+  }
+
+  private persistPresets() {
+    localStorage.setItem(this.presetStorageKey, JSON.stringify(this.presets));
+  }
+
+  private syncCompareSelection() {
+    const names = new Set(this.renders.map(r => r.name));
+    const active = this.activeRender();
+    const compare = this.compareRender();
+    if (active && !names.has(active)) this.activeRender.set(this.renders[0]?.name ?? null);
+    if (compare && !names.has(compare)) this.compareRender.set(null);
+    if (this.compareMode && !this.compareRender()) {
+      const a = this.activeRender();
+      const alt = this.renders.find(r => r.name !== a);
+      this.compareRender.set(alt?.name ?? null);
+    }
   }
 
   fmt(v: number, d = 2): string {

@@ -79,6 +79,12 @@ export interface RenderFile {
   mtime: string;
 }
 
+export interface RenderMeta extends RenderFile {
+  resolution: string;
+  backend: 'cpu' | 'metal' | 'cuda' | 'unknown';
+  chart: 'ks' | 'bl' | 'unknown';
+}
+
 export interface GeoFile {
   name: string;
   size: number;
@@ -99,6 +105,12 @@ export interface ApiInfo {
   backends: string[];
 }
 
+export interface ApiStatus {
+  running: boolean;
+  startedAtSec?: number | null;
+  lastFile?: string | null;
+}
+
 @Injectable({ providedIn: 'root' })
 export class RenderService {
   readonly messages$ = new Subject<WsMessage>();
@@ -111,9 +123,9 @@ export class RenderService {
 
   private connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    // In dev, proxy doesn't handle WS — connect directly to backend port
-    const host = location.hostname;
-    this.ws = new WebSocket(`${proto}://${host}:3001/ws`);
+    // Use same-origin WS path so it works behind reverse proxies/tunnels
+    // (e.g. Cloudflare Tunnel from phone) and in local dev via proxy.
+    this.ws = new WebSocket(`${proto}://${location.host}/ws`);
 
     this.ws.onmessage = ev => {
       try {
@@ -130,6 +142,11 @@ export class RenderService {
   getInfo() {
     const params = new HttpParams().set('_ts', Date.now().toString());
     return this.http.get<ApiInfo>('/api/info', { params });
+  }
+
+  getStatus() {
+    const params = new HttpParams().set('_ts', Date.now().toString());
+    return this.http.get<ApiStatus>('/api/status', { params });
   }
 
   getRenders() {
@@ -155,6 +172,11 @@ export class RenderService {
   }
 
   renderUrl(filename: string): string {
-    return `/api/renders/${filename}`;
+    return `/api/renders/${encodeURIComponent(filename)}`;
+  }
+
+  renderThumbUrl(filename: string, width = 360): string {
+    const w = Math.max(64, Math.min(1024, Math.floor(width)));
+    return `/api/renders-thumb/${encodeURIComponent(filename)}?w=${w}`;
   }
 }

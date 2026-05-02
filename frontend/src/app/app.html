@@ -9,7 +9,7 @@
     <div style="display:flex;align-items:center;gap:16px">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.3 — Wormhole</div>
+        <div><strong>Version</strong> v0.2.4 — Wormhole</div>
       </div>
       <span class="status-chip" [class]="status()">
         <span *ngIf="status()==='idle'">Idle</span>
@@ -199,30 +199,60 @@
           </div>
         </div>
 
-        <div class="switch-row" (click)="toggleBundles()">
+        <div class="switch-row"
+             tabindex="0"
+             role="switch"
+             [attr.aria-checked]="params.bundles"
+             [attr.aria-disabled]="false"
+             (click)="toggleBundles()"
+             (keydown.enter)="toggleBundles()"
+             (keydown.space)="$event.preventDefault(); toggleBundles()">
           <label>Ray bundles</label>
-          <button class="switch" [class.on]="params.bundles"></button>
+          <button class="switch" type="button" tabindex="-1" [class.on]="params.bundles"></button>
         </div>
         <div class="switch-row"
              [class.disabled]="!params.bundles"
-             (click)="toggleAntiFireflies()">
+             [attr.tabindex]="params.bundles ? 0 : -1"
+             role="switch"
+             [attr.aria-checked]="params.anti_fireflies"
+             [attr.aria-disabled]="!params.bundles"
+             (click)="toggleAntiFireflies()"
+             (keydown.enter)="toggleAntiFireflies()"
+             (keydown.space)="$event.preventDefault(); toggleAntiFireflies()">
           <label>Anti-fireflies (bundle)</label>
           <button class="switch"
+                  type="button"
+                  tabindex="-1"
                   [class.on]="params.anti_fireflies"
                   [disabled]="!params.bundles"></button>
         </div>
         <div class="switch-row"
              [class.disabled]="params.backend === 'cpu'"
              [matTooltip]="params.backend === 'cpu' ? 'Disponibile solo con backend GPU' : ''"
-             (click)="toggleGpuFp64()">
+             [attr.tabindex]="params.backend !== 'cpu' ? 0 : -1"
+             role="switch"
+             [attr.aria-checked]="params.gpu_fp64"
+             [attr.aria-disabled]="params.backend === 'cpu'"
+             (click)="toggleGpuFp64()"
+             (keydown.enter)="toggleGpuFp64()"
+             (keydown.space)="$event.preventDefault(); toggleGpuFp64()">
           <label>GPU FP64 (experimental)</label>
           <button class="switch"
+                  type="button"
+                  tabindex="-1"
                   [class.on]="params.gpu_fp64"
                   [disabled]="params.backend === 'cpu'"></button>
         </div>
-        <div class="switch-row" (click)="params.dopri5 = !params.dopri5">
+        <div class="switch-row"
+             tabindex="0"
+             role="switch"
+             [attr.aria-checked]="params.dopri5"
+             [attr.aria-disabled]="false"
+             (click)="params.dopri5 = !params.dopri5"
+             (keydown.enter)="params.dopri5 = !params.dopri5"
+             (keydown.space)="$event.preventDefault(); params.dopri5 = !params.dopri5">
           <label>DOPRI5 integrator</label>
-          <button class="switch" [class.on]="params.dopri5"></button>
+          <button class="switch" type="button" tabindex="-1" [class.on]="params.dopri5"></button>
         </div>
         <div class="param-row">
           <label>Max steps</label>
@@ -281,19 +311,25 @@
             </button>
           </div>
         </div>
-        <div class="switch-row" (click)="params.anim = !params.anim">
+        <div class="switch-row"
+             tabindex="0"
+             role="switch"
+             [attr.aria-checked]="params.anim"
+             [attr.aria-disabled]="false"
+             (click)="params.anim = !params.anim"
+             (keydown.enter)="params.anim = !params.anim"
+             (keydown.space)="$event.preventDefault(); params.anim = !params.anim">
           <label>Animation mode</label>
-          <button class="switch" [class.on]="params.anim"></button>
+          <button class="switch" type="button" tabindex="-1" [class.on]="params.anim"></button>
         </div>
 
         <hr class="divider">
 
         <h2>Background HDRI</h2>
-        <mat-select [(ngModel)]="params.background" placeholder="None"
+        <mat-select [(ngModel)]="params.background" placeholder="Black"
                     style="width:100%;font-size:13px">
-          <mat-option value="">None</mat-option>
           <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg">
-            {{bg}}
+            {{bg === 'black.png' ? 'Black' : bg}}
           </mat-option>
         </mat-select>
 
@@ -330,6 +366,41 @@
         </div>
       </div>
 
+      <!-- Preset manager -->
+      <div class="panel" style="margin-bottom:14px">
+        <h2>Preset manager</h2>
+        <div class="preset-row">
+          <input
+            class="preset-input"
+            type="text"
+            [(ngModel)]="presetDraftName"
+            placeholder="Nome preset (es: KS_720p_GPU)"
+            (keydown.enter)="saveCurrentPreset()"
+          />
+          <button class="action-btn primary compact" (click)="saveCurrentPreset()">Save</button>
+        </div>
+        <div class="preset-row" style="margin-top:8px">
+          <mat-select [(ngModel)]="selectedPresetName" placeholder="Select preset"
+                      style="flex:1;font-size:13px">
+            <mat-option *ngFor="let p of presets" [value]="p.name">
+              {{p.name}}
+            </mat-option>
+          </mat-select>
+        </div>
+        <div class="preset-row" style="margin-top:8px">
+          <button class="action-btn primary compact"
+                  [disabled]="!selectedPresetName"
+                  (click)="applySelectedPreset()">
+            Apply
+          </button>
+          <button class="action-btn danger compact"
+                  [disabled]="!selectedPresetName"
+                  (click)="deleteSelectedPreset()">
+            Delete
+          </button>
+        </div>
+      </div>
+
       <!-- Animation panel -->
       <div class="panel anim-panel" style="margin-bottom:14px" *ngIf="params.anim">
         <h2>Animation</h2>
@@ -352,9 +423,17 @@
           <label>Orbits φ</label>
           <num-input [(value)]="params.anim_orbits" [min]="0" [max]="10" [step]="0.25" [decimals]="2"></num-input>
         </div>
-        <div class="switch-row" style="border-bottom:none;padding:6px 0 0" (click)="params.anim_ease = !params.anim_ease">
+        <div class="switch-row"
+             style="border-bottom:none;padding:6px 0 0"
+             tabindex="0"
+             role="switch"
+             [attr.aria-checked]="params.anim_ease"
+             [attr.aria-disabled]="false"
+             (click)="params.anim_ease = !params.anim_ease"
+             (keydown.enter)="params.anim_ease = !params.anim_ease"
+             (keydown.space)="$event.preventDefault(); params.anim_ease = !params.anim_ease">
           <label>Smooth easing</label>
-          <button class="switch" [class.on]="params.anim_ease"></button>
+          <button class="switch" type="button" tabindex="-1" [class.on]="params.anim_ease"></button>
         </div>
 
         <!-- Sweep ranges -->
@@ -538,11 +617,49 @@
     <div class="right-col">
 
       <!-- Render viewer -->
-      <div class="render-view">
-        <img *ngIf="previewUrl()" [src]="previewUrl()!" alt="render" />
-        <span class="render-placeholder" *ngIf="!previewUrl()">
-          No render yet
-        </span>
+      <div class="render-toolbar">
+        <button class="backend-btn"
+                [class.active]="compareMode"
+                [disabled]="renders.length < 2"
+                (click)="toggleCompareMode()">
+          Compare mode
+        </button>
+        <button class="backend-btn"
+                [disabled]="!compareMode || !compareRender()"
+                (click)="swapCompare()">
+          Swap A/B
+        </button>
+        <mat-select *ngIf="compareMode"
+                    [ngModel]="compareRender()"
+                    (ngModelChange)="selectCompareRender($event)"
+                    style="min-width:220px;font-size:12px"
+                    placeholder="Compare with...">
+          <mat-option *ngFor="let r of renders" [value]="r.name" [disabled]="r.name === activeRender()">
+            {{r.name}}
+          </mat-option>
+        </mat-select>
+      </div>
+
+      <div class="render-view" *ngIf="!compareMode">
+        <img *ngIf="previewUrl()" [src]="previewUrl()!" alt="render A" />
+        <span class="render-placeholder" *ngIf="!previewUrl()">No render yet</span>
+      </div>
+
+      <div class="render-compare" *ngIf="compareMode">
+        <div class="compare-pane">
+          <div class="compare-label">A (active)</div>
+          <div class="render-view mini">
+            <img *ngIf="previewUrl()" [src]="previewUrl()!" alt="render A" />
+            <span class="render-placeholder" *ngIf="!previewUrl()">No render A</span>
+          </div>
+        </div>
+        <div class="compare-pane">
+          <div class="compare-label">B (compare)</div>
+          <div class="render-view mini">
+            <img *ngIf="comparePreviewUrl()" [src]="comparePreviewUrl()!" alt="render B" />
+            <span class="render-placeholder" *ngIf="!comparePreviewUrl()">Select compare frame</span>
+          </div>
+        </div>
       </div>
 
       <!-- Gallery -->
@@ -555,18 +672,54 @@
           </button>
         </div>
 
-        <div class="gallery" *ngIf="renders.length > 0; else noRenders">
+        <div class="history-filters">
+          <input
+            class="history-search"
+            type="text"
+            [(ngModel)]="historyQuery"
+            placeholder="Cerca file..."
+          />
+          <div class="history-selects">
+            <mat-select [(ngModel)]="historyResolutionFilter" style="font-size:12px">
+              <mat-option *ngFor="let opt of historyResolutionOptions" [value]="opt">
+                Res: {{opt}}
+              </mat-option>
+            </mat-select>
+            <mat-select [(ngModel)]="historyBackendFilter" style="font-size:12px">
+              <mat-option *ngFor="let opt of historyBackendOptions" [value]="opt">
+                Backend: {{opt}}
+              </mat-option>
+            </mat-select>
+            <mat-select [(ngModel)]="historyChartFilter" style="font-size:12px">
+              <mat-option *ngFor="let opt of historyChartOptions" [value]="opt">
+                Chart: {{opt}}
+              </mat-option>
+            </mat-select>
+          </div>
+        </div>
+
+        <div class="gallery" *ngIf="filteredRenders().length > 0; else noRenders">
           <div class="gallery-thumb"
-               *ngFor="let r of renders"
+               *ngFor="let r of filteredRenders()"
                [class.active]="r.name === activeRender()"
                (click)="selectRender(r.name)">
-            <img [src]="svc.renderUrl(r.name)" [alt]="r.name" loading="lazy" />
+            <img [src]="svc.renderThumbUrl(r.name, 360)" [alt]="r.name" loading="lazy" decoding="async" />
+            <div class="meta-row">
+              <span class="meta-chip">{{getRenderMeta(r.name).resolution}}</span>
+              <span class="meta-chip">{{humanBackend(getRenderMeta(r.name))}}</span>
+              <span class="meta-chip">{{getRenderMeta(r.name).chart | uppercase}}</span>
+            </div>
             <div class="fname" [title]="r.name">{{r.name}}</div>
+            <button class="compare-btn"
+                    *ngIf="compareMode && r.name !== activeRender()"
+                    (click)="selectCompareRender(r.name); $event.stopPropagation()">
+              Set B
+            </button>
           </div>
         </div>
 
         <ng-template #noRenders>
-          <div style="color:#333;font-size:12px;padding:8px 0">No renders yet.</div>
+          <div style="color:#333;font-size:12px;padding:8px 0">Nessun render per i filtri correnti.</div>
         </ng-template>
       </div>
     </div>

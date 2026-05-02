@@ -6,5 +6,10 @@
   "/renders": {
     "target": "http://localhost:3001",
     "secure": false
+  },
+  "/ws": {
+    "target": "ws://localhost:3001",
+    "ws": true,
+    "secure": false
   }
 }

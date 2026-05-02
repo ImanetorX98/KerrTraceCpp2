@@ -9,7 +9,7 @@ const http       = require('http');
 const WebSocket  = require('ws');
 const path       = require('path');
 const fs         = require('fs');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const app    = express();
 const server = http.createServer(app);
@@ -21,6 +21,7 @@ const BINARY_CPU_ONLY = path.join(ROOT, 'build_cpu', 'kerr_tracer');
 const BINARY_METAL_LEGACY = path.join(ROOT, 'build', 'kerr_tracer_metal');
 const BINARY_CUDA  = path.join(ROOT, 'build', 'kerr_tracer_cuda');
 const OUT_DIR      = path.join(ROOT, 'out');
+const THUMB_DIR    = path.join(OUT_DIR, '.thumbs');
 const ASSETS_DIR   = path.join(ROOT, 'assets', 'backgrounds');
 const DEFAULT_BACKGROUND = 'sfondo5.jpg';
 
@@ -69,6 +70,9 @@ const DEFAULT_DISK_OUT = 12;
 app.use(cors());
 app.use(express.json());
 app.use('/renders', express.static(OUT_DIR));
+if (!fs.existsSync(THUMB_DIR)) {
+  fs.mkdirSync(THUMB_DIR, { recursive: true });
+}
 
 // ── Active render state ───────────────────────────────────────
 let activeJob = null;   // { proc, clients: Set<WebSocket>, outfile }
@@ -101,6 +105,48 @@ function broadcast(data) {
   wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
 }
 
+function latestOutputFile() {
+  return fs.readdirSync(OUT_DIR)
+    .filter(f => /\.(png|mp4)$/.test(f))
+    .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
+    .sort((a, b) => b.t - a.t)[0]?.f ?? null;
+}
+
+function safeOutputFilePath(fileName) {
+  const raw = String(fileName || '');
+  const base = path.basename(raw);
+  if (!base || base !== raw) return null;
+  if (!/\.(png|jpg|jpeg|mp4)$/i.test(base)) return null;
+  return path.join(OUT_DIR, base);
+}
+
+function ensureRenderThumbnail(sourceFilePath, sourceName, widthPx) {
+  const parsed = path.parse(sourceName);
+  const thumbName = `${parsed.name}_w${widthPx}.jpg`;
+  const thumbPath = path.join(THUMB_DIR, thumbName);
+  try {
+    const srcStat = fs.statSync(sourceFilePath);
+    if (fs.existsSync(thumbPath)) {
+      const thumbStat = fs.statSync(thumbPath);
+      if (thumbStat.mtimeMs >= srcStat.mtimeMs) {
+        return thumbPath;
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  if (process.platform === 'darwin') {
+    const out = spawnSync(
+      'sips',
+      ['-s', 'format', 'jpeg', '-Z', String(widthPx), sourceFilePath, '--out', thumbPath],
+      { stdio: 'ignore' }
+    );
+    if (out.status === 0 && fs.existsSync(thumbPath)) return thumbPath;
+  }
+  return null;
+}
+
 // ── WebSocket ─────────────────────────────────────────────────
 wss.on('connection', ws => {
   // Send current job status on connect
@@ -115,7 +161,6 @@ wss.on('connection', ws => {
 app.get('/api/info', (req, res) => {
   const backgrounds = fs.readdirSync(ASSETS_DIR)
     .filter(f => /\.(jpg|jpeg|png)$/i.test(f))
-    .map(f => f)
     .sort((a, b) => {
       if (a === DEFAULT_BACKGROUND) return -1;
       if (b === DEFAULT_BACKGROUND) return 1;
@@ -127,6 +172,15 @@ app.get('/api/info', (req, res) => {
     resolutionSizes: RESOLUTIONS,
     backgrounds,
     backends: availableBackends(),
+  });
+});
+
+// ── GET /api/status ───────────────────────────────────────────
+app.get('/api/status', (req, res) => {
+  res.json({
+    running: !!activeJob,
+    startedAtSec: activeJob?.startedAtSec ?? null,
+    lastFile: latestOutputFile(),
   });
 });
 
@@ -144,9 +198,24 @@ app.get('/api/renders', (req, res) => {
 
 // ── GET /api/renders/:file ────────────────────────────────────
 app.get('/api/renders/:file', (req, res) => {
-  const file = path.join(OUT_DIR, req.params.file);
-  if (!fs.existsSync(file)) return res.sendStatus(404);
+  const file = safeOutputFilePath(req.params.file);
+  if (!file || !fs.existsSync(file)) return res.sendStatus(404);
   res.sendFile(file);
+});
+
+// ── GET /api/renders-thumb/:file ─────────────────────────────
+app.get('/api/renders-thumb/:file', (req, res) => {
+  const source = safeOutputFilePath(req.params.file);
+  if (!source || !fs.existsSync(source)) return res.sendStatus(404);
+  const sourceName = path.basename(source);
+  const wRaw = Number(req.query.w);
+  const width = Number.isFinite(wRaw) ? Math.max(64, Math.min(1024, Math.floor(wRaw))) : 360;
+  const thumb = ensureRenderThumbnail(source, sourceName, width);
+  // Short cache: thumbnails are regenerated when source mtime changes.
+  res.setHeader('Cache-Control', 'public, max-age=60');
+  if (thumb && fs.existsSync(thumb)) return res.sendFile(thumb);
+  // Fallback path (e.g. non-macOS): serve original render.
+  return res.sendFile(source);
 });
 
 // ── GET /api/geo-files ────────────────────────────────────────
@@ -202,10 +271,7 @@ app.post('/api/colorize', (req, res) => {
 
   proc.on('close', code => {
     stopProgressHeartbeat(job);
-    const outFile = fs.readdirSync(OUT_DIR)
-      .filter(f => /\.(png|mp4)$/.test(f))
-      .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
-      .sort((a, b) => b.t - a.t)[0]?.f ?? null;
+    const outFile = latestOutputFile();
 
     broadcast({ type: 'done', code, file: outFile });
     activeJob = null;
@@ -302,9 +368,9 @@ app.post('/api/render', (req, res) => {
     if (p.anim_disk_end    !== undefined) args.push('--disk-out-end',   String(p.anim_disk_end));
   }
 
-  const requestedBg = (typeof p.background === 'string' && p.background.trim().length > 0)
+  const requestedBg = (typeof p.background === 'string' && p.background.trim().length > 0 && p.background.trim() !== 'none')
     ? p.background.trim()
-    : DEFAULT_BACKGROUND;
+    : null;
   if (requestedBg) {
     const bgPath = path.join(ASSETS_DIR, requestedBg);
     if (fs.existsSync(bgPath)) {
@@ -375,10 +441,7 @@ app.post('/api/render', (req, res) => {
 
   proc.on('close', code => {
     stopProgressHeartbeat(job);
-    const outFile = fs.readdirSync(OUT_DIR)
-      .filter(f => /\.(png|mp4)$/.test(f))
-      .map(f => ({ f, t: fs.statSync(path.join(OUT_DIR, f)).mtime }))
-      .sort((a, b) => b.t - a.t)[0]?.f ?? null;
+    const outFile = latestOutputFile();
 
     broadcast({ type: 'done', code, file: outFile });
     activeJob = null;
