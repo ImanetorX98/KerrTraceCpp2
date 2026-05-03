@@ -77,6 +77,15 @@ export interface RenderFile {
   name: string;
   size: number;
   mtime: string;
+  meta?: RenderFileMeta;
+}
+
+export interface RenderFileMeta {
+  resolution: string;
+  backend: 'cpu' | 'metal' | 'cuda' | 'unknown';
+  chart: 'ks' | 'bl' | 'unknown';
+  rayMode?: 'single_ray' | 'ray_bundle';
+  solver?: 'standard' | 'semi_analytic' | 'elliptic_closed';
 }
 
 export interface RenderMeta extends RenderFile {
@@ -109,6 +118,17 @@ export interface ApiStatus {
   running: boolean;
   startedAtSec?: number | null;
   lastFile?: string | null;
+}
+
+export interface RenderHistoryQuery {
+  limit?: number;
+  q?: string;
+  resolution?: string;
+  backend?: string;
+  chart?: string;
+  type?: string;
+  from?: string;
+  to?: string;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -149,8 +169,14 @@ export class RenderService {
     return this.http.get<ApiStatus>('/api/status', { params });
   }
 
-  getRenders() {
-    const params = new HttpParams().set('_ts', Date.now().toString());
+  getRenders(query: RenderHistoryQuery = {}) {
+    let params = new HttpParams().set('_ts', Date.now().toString());
+    Object.entries(query).forEach(([k, v]) => {
+      if (v === undefined || v === null) return;
+      const s = String(v).trim();
+      if (!s) return;
+      params = params.set(k, s);
+    });
     return this.http.get<RenderFile[]>('/api/renders', { params });
   }
 

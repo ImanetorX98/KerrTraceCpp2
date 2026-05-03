@@ -112,6 +112,102 @@ function latestOutputFile() {
     .sort((a, b) => b.t - a.t)[0]?.f ?? null;
 }
 
+function toBoundedInt(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+function parseDateYmd(value, endOfDay = false) {
+  if (typeof value !== 'string') return null;
+  const m = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const monthIdx = Number(m[2]) - 1;
+  const day = Number(m[3]);
+  const hour = endOfDay ? 23 : 0;
+  const minute = endOfDay ? 59 : 0;
+  const second = endOfDay ? 59 : 0;
+  const ms = endOfDay ? 999 : 0;
+  return new Date(Date.UTC(year, monthIdx, day, hour, minute, second, ms));
+}
+
+function parseRenderMeta(fileName) {
+  const lower = String(fileName || '').toLowerCase();
+
+  let resolution = 'unknown';
+  if (lower.startsWith('4k_')) resolution = '4K';
+  else if (lower.startsWith('2k_')) resolution = '2K';
+  else if (lower.startsWith('1080p_')) resolution = '1080p';
+  else if (lower.startsWith('720p_')) resolution = '720p';
+  else if (lower.startsWith('512p_')) resolution = '512p';
+  else if (lower.startsWith('480p_') || lower.startsWith('hd_')) resolution = '480p';
+  else if (lower.startsWith('256p_')) resolution = '256p';
+  else if (lower.startsWith('144p_')) resolution = '144p';
+  else if (lower.startsWith('custom_')) resolution = 'custom';
+
+  let backend = 'unknown';
+  if (lower.includes('gpu-metal')) backend = 'metal';
+  else if (lower.includes('gpu-cuda')) backend = 'cuda';
+  else if (lower.includes('_cpu_') || lower.endsWith('_cpu.png') || lower.includes('_cpu-')) backend = 'cpu';
+
+  let chart = 'unknown';
+  if (lower.includes('_ks-') || lower.includes('_ks_')) chart = 'ks';
+  else if (lower.includes('_bl-') || lower.includes('_bl_')) chart = 'bl';
+
+  let rayMode = 'single_ray';
+  if (lower.includes('ray-bundle') || lower.includes('ray_bundle') || lower.includes('bundles')) {
+    rayMode = 'ray_bundle';
+  }
+
+  let solver = 'standard';
+  if (lower.includes('elliptic-closed') || lower.includes('elliptic_closed')) solver = 'elliptic_closed';
+  else if (lower.includes('semi-analytic') || lower.includes('semi_analytic')) solver = 'semi_analytic';
+
+  return { resolution, backend, chart, rayMode, solver };
+}
+
+function normalizeTypeToken(type) {
+  return String(type || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/-/g, '_');
+}
+
+function normalizeResolutionToken(value) {
+  const raw = String(value || '').trim();
+  const lower = raw.toLowerCase();
+  if (!raw || lower === 'all') return 'all';
+  if (lower === '4k') return '4K';
+  if (lower === '2k') return '2K';
+  if (lower === '1080p') return '1080p';
+  if (lower === '720p') return '720p';
+  if (lower === '512p') return '512p';
+  if (lower === '480p' || lower === 'hd') return '480p';
+  if (lower === '256p') return '256p';
+  if (lower === '144p') return '144p';
+  if (lower === 'custom') return 'custom';
+  return raw;
+}
+
+function matchesTypeFilter(meta, typeToken) {
+  if (!typeToken || typeToken === 'all') return true;
+  if (meta.backend === typeToken || meta.chart === typeToken || meta.rayMode === typeToken || meta.solver === typeToken) {
+    return true;
+  }
+  if (typeToken === 'raybundle' || typeToken === 'bundle' || typeToken === 'raybundles') {
+    return meta.rayMode === 'ray_bundle';
+  }
+  if (typeToken === 'single' || typeToken === 'single_ray' || typeToken === 'single_rays') {
+    return meta.rayMode === 'single_ray';
+  }
+  if (typeToken === 'rk4' || typeToken === 'standard_rk' || typeToken === 'standard_rk4') {
+    return meta.solver === 'standard';
+  }
+  return false;
+}
+
 function safeOutputFilePath(fileName) {
   const raw = String(fileName || '');
   const base = path.basename(raw);
@@ -186,14 +282,54 @@ app.get('/api/status', (req, res) => {
 
 // ── GET /api/renders ─────────────────────────────────────────
 app.get('/api/renders', (req, res) => {
-  const files = fs.readdirSync(OUT_DIR)
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+  const resolutionFilter = normalizeResolutionToken(req.query.resolution);
+  const backendFilter = typeof req.query.backend === 'string'
+    ? req.query.backend.trim().toLowerCase()
+    : 'all';
+  const chartFilter = typeof req.query.chart === 'string'
+    ? req.query.chart.trim().toLowerCase()
+    : 'all';
+  const typeToken = normalizeTypeToken(req.query.type);
+  const fromDate = parseDateYmd(req.query.from, false);
+  const toDate = parseDateYmd(req.query.to, true);
+  const limit = toBoundedInt(req.query.limit, 10, 1, 2000);
+
+  let files = fs.readdirSync(OUT_DIR)
     .filter(f => /\.png$/.test(f))
     .map(f => {
       const stat = fs.statSync(path.join(OUT_DIR, f));
-      return { name: f, size: stat.size, mtime: stat.mtime };
+      return {
+        name: f,
+        size: stat.size,
+        mtime: stat.mtime.toISOString(),
+        mtimeMs: stat.mtime.getTime(),
+        meta: parseRenderMeta(f),
+      };
     })
-    .sort((a, b) => b.mtime - a.mtime);
-  res.json(files);
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  files = files.filter(f => {
+    if (q && !f.name.toLowerCase().includes(q)) return false;
+    if (resolutionFilter !== 'all') {
+      if (resolutionFilter === 'custom') {
+        if (f.meta.resolution !== 'custom') return false;
+      } else if (f.meta.resolution !== resolutionFilter) {
+        return false;
+      }
+    }
+    if (backendFilter !== 'all' && f.meta.backend !== backendFilter) return false;
+    if (chartFilter !== 'all' && f.meta.chart !== chartFilter) return false;
+    if (!matchesTypeFilter(f.meta, typeToken)) return false;
+    if (fromDate && f.mtimeMs < fromDate.getTime()) return false;
+    if (toDate && f.mtimeMs > toDate.getTime()) return false;
+    return true;
+  });
+
+  files = files.slice(0, limit);
+
+  const payload = files.map(({ mtimeMs, ...rest }) => rest);
+  res.json(payload);
 });
 
 // ── GET /api/renders/:file ────────────────────────────────────
@@ -383,8 +519,8 @@ app.post('/api/render', (req, res) => {
   // Disk palette
   if (p.disk_palette === 'interstellar') {
     args.push('--disk-interstellar');
-    if (p.disk_rings   !== undefined) args.push('--disk-rings',   String(Math.max(1, Math.floor(Number(p.disk_rings)))));
-    if (p.disk_sectors !== undefined) args.push('--disk-sectors', String(Math.max(1, Math.floor(Number(p.disk_sectors)))));
+    if (p.disk_rings   !== undefined) args.push('--disk-rings',   String(Math.min(32,  Math.max(1, Math.floor(Number(p.disk_rings))))));
+    if (p.disk_sectors !== undefined) args.push('--disk-sectors', String(Math.min(256, Math.max(1, Math.floor(Number(p.disk_sectors))))));
     if (p.disk_sigma   !== undefined) args.push('--disk-sigma',   String(Math.max(0.01, Number(p.disk_sigma))));
   }
 

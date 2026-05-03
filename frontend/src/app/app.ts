@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, signal, computed } from '@angular/core';
+import { Component, OnInit, OnDestroy, HostListener, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClientModule } from '@angular/common/http';
@@ -10,7 +10,15 @@ import { MatSelectModule } from '@angular/material/select';
 import { MatIconModule } from '@angular/material/icon';
 import { MatTooltipModule } from '@angular/material/tooltip';
 
-import { RenderService, RenderParams, RenderFile, GeoFile, ColorizeParams, ApiInfo } from './render.service';
+import {
+  RenderService,
+  RenderParams,
+  RenderFile,
+  GeoFile,
+  ColorizeParams,
+  ApiInfo,
+  RenderHistoryQuery,
+} from './render.service';
 
 interface RenderMetaLite {
   resolution: string;
@@ -41,6 +49,14 @@ export class App implements OnInit, OnDestroy {
   readonly historyResolutionOptions = ['all', '144p', '256p', '480p', '512p', '720p', '1080p', '2K', '4K', 'custom'];
   readonly historyBackendOptions = ['all', 'cpu', 'metal', 'cuda'];
   readonly historyChartOptions = ['all', 'ks', 'bl'];
+  readonly historyTypeOptions = [
+    'all',
+    'single_ray',
+    'ray_bundle',
+    'standard_rk4',
+    'semi_analytic',
+    'elliptic_closed',
+  ];
 
   // ── Info from server ──────────────────────────────────────────
   info: ApiInfo | null = null;
@@ -48,7 +64,7 @@ export class App implements OnInit, OnDestroy {
   // ── Render parameters ─────────────────────────────────────────
   params: RenderParams = {
     resolution: '720p',
-    a: 0.998,
+    a: 0.7,
     q: 0.0,
     lambda: 0.0,
     disk_out: 12,
@@ -85,8 +101,8 @@ export class App implements OnInit, OnDestroy {
     anim_crf: 18,
     anim_orbits: 1,
     anim_ease: true,
-    anim_a_start: 0.998,
-    anim_a_end: 0.998,
+    anim_a_start: 0.7,
+    anim_a_end: 0.7,
     anim_theta_start: 80,
     anim_theta_end: 80,
     anim_phi_start: 0,
@@ -113,9 +129,15 @@ export class App implements OnInit, OnDestroy {
   compareLayout: 'split' | 'side_by_side' = 'split';
   compareSplitPercent = 50;
   historyQuery = '';
+  historyDateFrom = '';
+  historyDateTo = '';
+  historyTypeFilter = 'all';
   historyResolutionFilter = 'all';
   historyBackendFilter = 'all';
   historyChartFilter = 'all';
+  historyLimit = 10;
+  historyMode: 'latest' | 'search' = 'latest';
+  readonly isMobileView = signal(false);
   private readonly presetStorageKey = 'knds_presets_v1';
   presets: SavedPreset[] = [];
   presetDraftName = '';
@@ -141,7 +163,17 @@ export class App implements OnInit, OnDestroy {
 
   constructor(readonly svc: RenderService) {}
 
+  @HostListener('window:resize')
+  onWindowResize() {
+    this.updateViewportFlag();
+  }
+
+  private updateViewportFlag() {
+    this.isMobileView.set(window.innerWidth <= 860);
+  }
+
   ngOnInit() {
+    this.updateViewportFlag();
     this.loadPresets();
     this.svc.getInfo().subscribe(info => {
       this.info = info;
@@ -149,7 +181,7 @@ export class App implements OnInit, OnDestroy {
         this.params.background = info.backgrounds[0];
       }
     });
-    this.loadRenders();
+    this.loadLatestRenders();
     this.loadGeoFiles();
 
     this.sub = this.svc.messages$.subscribe(msg => {
@@ -285,7 +317,7 @@ export class App implements OnInit, OnDestroy {
 
   private refreshOutputs(preferredFile: string | null) {
     const refreshOnce = () => {
-      this.svc.getRenders().subscribe(files => {
+      this.svc.getRenders(this.buildHistoryQuery()).subscribe(files => {
         this.renders = files;
         const select = preferredFile ?? (files.length > 0 ? files[0].name : null);
         if (select) this.activeRender.set(select);
@@ -300,13 +332,76 @@ export class App implements OnInit, OnDestroy {
   }
 
   loadRenders() {
-    this.svc.getRenders().subscribe(files => {
+    this.svc.getRenders(this.buildHistoryQuery()).subscribe(files => {
       this.renders = files;
       if (!this.activeRender() && files.length > 0) {
         this.activeRender.set(files[0].name);
       }
       this.syncCompareSelection();
     });
+  }
+
+  loadLatestRenders() {
+    this.historyMode = 'latest';
+    this.historyLimit = 10;
+    this.loadRenders();
+  }
+
+  runHistorySearch() {
+    this.historyMode = 'search';
+    this.historyLimit = 300;
+    this.loadRenders();
+  }
+
+  resetHistoryToLatest() {
+    this.historyQuery = '';
+    this.historyDateFrom = '';
+    this.historyDateTo = '';
+    this.historyTypeFilter = 'all';
+    this.historyResolutionFilter = 'all';
+    this.historyBackendFilter = 'all';
+    this.historyChartFilter = 'all';
+    this.historyMode = 'latest';
+    this.historyLimit = 10;
+    this.loadRenders();
+  }
+
+  historySummaryLabel(): string {
+    if (this.historyMode === 'latest') {
+      return 'Mostrando le ultime 10 immagini';
+    }
+    return `Ricerca archivio (max ${this.historyLimit})`;
+  }
+
+  private buildHistoryQuery(): RenderHistoryQuery {
+    if (this.historyMode !== 'search') {
+      // Strict default mode: always show only latest 10.
+      return { limit: 10 };
+    }
+
+    const q = this.historyQuery.trim();
+    const from = this.historyDateFrom;
+    const to = this.historyDateTo;
+    const normalizedFrom = from && to && from > to ? to : from;
+    const normalizedTo = from && to && from > to ? from : to;
+    const hasFilters = q.length > 0
+      || normalizedFrom.length > 0
+      || normalizedTo.length > 0
+      || this.historyTypeFilter !== 'all'
+      || this.historyResolutionFilter !== 'all'
+      || this.historyBackendFilter !== 'all'
+      || this.historyChartFilter !== 'all';
+
+    return {
+      limit: this.historyLimit,
+      q: q || undefined,
+      from: normalizedFrom || undefined,
+      to: normalizedTo || undefined,
+      type: this.historyTypeFilter !== 'all' ? this.historyTypeFilter : undefined,
+      resolution: this.historyResolutionFilter !== 'all' ? this.historyResolutionFilter : undefined,
+      backend: this.historyBackendFilter !== 'all' ? this.historyBackendFilter : undefined,
+      chart: this.historyChartFilter !== 'all' ? this.historyChartFilter : undefined,
+    };
   }
 
   private startStatusPolling() {
@@ -404,24 +499,22 @@ export class App implements OnInit, OnDestroy {
   }
 
   filteredRenders(): RenderFile[] {
-    const q = this.historyQuery.trim().toLowerCase();
-    return this.renders.filter(r => {
-      const meta = this.getRenderMeta(r.name);
-      if (q && !r.name.toLowerCase().includes(q)) return false;
-      if (this.historyResolutionFilter !== 'all') {
-        if (this.historyResolutionFilter === 'custom') {
-          if (meta.resolution !== 'custom') return false;
-        } else if (meta.resolution !== this.historyResolutionFilter) {
-          return false;
-        }
-      }
-      if (this.historyBackendFilter !== 'all' && meta.backend !== this.historyBackendFilter) return false;
-      if (this.historyChartFilter !== 'all' && meta.chart !== this.historyChartFilter) return false;
-      return true;
-    });
+    return this.renders;
   }
 
-  getRenderMeta(name: string): RenderMetaLite {
+  getRenderMeta(renderOrName: RenderFile | string): RenderMetaLite {
+    if (typeof renderOrName !== 'string') {
+      const serverMeta = renderOrName.meta;
+      if (serverMeta) {
+        return {
+          resolution: serverMeta.resolution,
+          backend: serverMeta.backend,
+          chart: serverMeta.chart,
+        };
+      }
+    }
+
+    const name = typeof renderOrName === 'string' ? renderOrName : renderOrName.name;
     const lower = name.toLowerCase();
     let resolution = 'unknown';
     if (lower.startsWith('4k_')) resolution = '4K';
@@ -451,6 +544,16 @@ export class App implements OnInit, OnDestroy {
     if (meta.backend === 'cuda') return 'GPU CUDA';
     if (meta.backend === 'cpu') return 'CPU';
     return 'N/A';
+  }
+
+  historyTypeLabel(type: string): string {
+    if (type === 'all') return 'Tipo: tutti';
+    if (type === 'single_ray') return 'Tipo: single-ray';
+    if (type === 'ray_bundle') return 'Tipo: ray-bundle';
+    if (type === 'standard_rk4') return 'Tipo: standard RK4';
+    if (type === 'semi_analytic') return 'Tipo: semi-analytic';
+    if (type === 'elliptic_closed') return 'Tipo: elliptic-closed';
+    return `Tipo: ${type}`;
   }
 
   saveCurrentPreset() {

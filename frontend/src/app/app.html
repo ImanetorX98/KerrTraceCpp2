@@ -1,4 +1,4 @@
-<div class="page">
+<div class="page" [class.mobile-view]="isMobileView()" [class.desktop-view]="!isMobileView()">
 
   <!-- ── Header ─────────────────────────────────────────────── -->
   <header class="app-header">
@@ -9,7 +9,8 @@
     <div style="display:flex;align-items:center;gap:16px">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.5 — Wormhole</div>
+        <div><strong>Version</strong> v0.2.6 — Wormhole</div>
+        <div><strong>Layout</strong> {{ isMobileView() ? 'Smartphone' : 'Desktop' }}</div>
       </div>
       <span class="status-chip" [class]="status()">
         <span *ngIf="status()==='idle'">Idle</span>
@@ -348,13 +349,13 @@
           <div class="param-row">
             <label>Rings</label>
             <num-input [(value)]="params.disk_rings"
-                       [min]="1" [max]="20" [step]="1" [decimals]="0">
+                       [min]="1" [max]="32" [step]="1" [decimals]="0">
             </num-input>
           </div>
           <div class="param-row">
             <label>Sectors</label>
             <num-input [(value)]="params.disk_sectors"
-                       [min]="1" [max]="40" [step]="1" [decimals]="0">
+                       [min]="1" [max]="256" [step]="1" [decimals]="0">
             </num-input>
           </div>
           <div class="param-row">
@@ -711,19 +712,38 @@
         <div class="gallery-header">
           <h2 style="margin:0">Render history</h2>
           <button class="action-btn danger" style="padding:0 8px;height:28px"
-                  (click)="loadRenders()">
+                  (click)="loadLatestRenders()">
             <mat-icon style="font-size:14px;width:14px;height:14px">refresh</mat-icon>
           </button>
         </div>
 
         <div class="history-filters">
+          <div class="history-summary">
+            {{ historySummaryLabel() }}
+          </div>
           <input
             class="history-search"
             type="text"
             [(ngModel)]="historyQuery"
-            placeholder="Cerca file..."
+            placeholder="Cerca file (nome)..."
+            (keydown.enter)="runHistorySearch()"
           />
+          <div class="history-date-row">
+            <label>
+              Da
+              <input type="date" [(ngModel)]="historyDateFrom" />
+            </label>
+            <label>
+              A
+              <input type="date" [(ngModel)]="historyDateTo" />
+            </label>
+          </div>
           <div class="history-selects">
+            <mat-select [(ngModel)]="historyTypeFilter" style="font-size:12px">
+              <mat-option *ngFor="let opt of historyTypeOptions" [value]="opt">
+                {{historyTypeLabel(opt)}}
+              </mat-option>
+            </mat-select>
             <mat-select [(ngModel)]="historyResolutionFilter" style="font-size:12px">
               <mat-option *ngFor="let opt of historyResolutionOptions" [value]="opt">
                 Res: {{opt}}
@@ -740,6 +760,10 @@
               </mat-option>
             </mat-select>
           </div>
+          <div class="history-actions">
+            <button class="backend-btn" (click)="runHistorySearch()">Search archive</button>
+            <button class="backend-btn" (click)="resetHistoryToLatest()">Latest 10</button>
+          </div>
         </div>
 
         <div class="gallery" *ngIf="filteredRenders().length > 0; else noRenders">
@@ -749,9 +773,9 @@
                (click)="selectRender(r.name)">
             <img [src]="svc.renderThumbUrl(r.name, 360)" [alt]="r.name" loading="lazy" decoding="async" />
             <div class="meta-row">
-              <span class="meta-chip">{{getRenderMeta(r.name).resolution}}</span>
-              <span class="meta-chip">{{humanBackend(getRenderMeta(r.name))}}</span>
-              <span class="meta-chip">{{getRenderMeta(r.name).chart | uppercase}}</span>
+              <span class="meta-chip">{{getRenderMeta(r).resolution}}</span>
+              <span class="meta-chip">{{humanBackend(getRenderMeta(r))}}</span>
+              <span class="meta-chip">{{getRenderMeta(r).chart | uppercase}}</span>
             </div>
             <div class="fname" [title]="r.name">{{r.name}}</div>
             <button class="compare-btn"
