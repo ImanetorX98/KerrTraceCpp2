@@ -6,10 +6,10 @@
       <h1 class="app-title">KNdS Ray Tracer</h1>
       <div class="app-subtitle">Kerr-Newman-de Sitter relativistic renderer</div>
     </div>
-    <div style="display:flex;align-items:center;gap:16px">
+    <div class="header-side">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.7 — Wormhole</div>
+        <div><strong>Version</strong> v0.2.8 — Wormhole</div>
         <div><strong>Layout</strong> {{ isMobileView() ? 'Smartphone' : 'Desktop' }}</div>
       </div>
       <span class="status-chip" [class]="status()">
@@ -334,37 +334,39 @@
           </mat-option>
         </mat-select>
 
-        <hr class="divider">
+        <ng-container *ngIf="params.scene_mode === 'black_hole'">
+          <hr class="divider">
 
-        <h2>Disk palette</h2>
-        <div style="display:flex;gap:6px;margin-bottom:10px">
-          <button class="backend-btn"
-                  [class.active]="params.disk_palette === 'blackbody'"
-                  (click)="params.disk_palette = 'blackbody'">Blackbody</button>
-          <button class="backend-btn"
-                  [class.active]="params.disk_palette === 'interstellar'"
-                  (click)="params.disk_palette = 'interstellar'">Interstellar</button>
-        </div>
-        <div *ngIf="params.disk_palette === 'interstellar'">
-          <div class="param-row">
-            <label>Rings</label>
-            <num-input [(value)]="params.disk_rings"
-                       [min]="1" [max]="32" [step]="1" [decimals]="0">
-            </num-input>
+          <h2>Disk palette</h2>
+          <div style="display:flex;gap:6px;margin-bottom:10px">
+            <button class="backend-btn"
+                    [class.active]="params.disk_palette === 'blackbody'"
+                    (click)="params.disk_palette = 'blackbody'">Blackbody</button>
+            <button class="backend-btn"
+                    [class.active]="params.disk_palette === 'interstellar'"
+                    (click)="params.disk_palette = 'interstellar'">Interstellar</button>
           </div>
-          <div class="param-row">
-            <label>Sectors</label>
-            <num-input [(value)]="params.disk_sectors"
-                       [min]="1" [max]="256" [step]="1" [decimals]="0">
-            </num-input>
+          <div *ngIf="params.disk_palette === 'interstellar'">
+            <div class="param-row">
+              <label>Rings</label>
+              <num-input [(value)]="params.disk_rings"
+                         [min]="1" [max]="32" [step]="1" [decimals]="0">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Sectors</label>
+              <num-input [(value)]="params.disk_sectors"
+                         [min]="1" [max]="256" [step]="1" [decimals]="0">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Blend σ</label>
+              <num-input [(value)]="params.disk_sigma"
+                         [min]="0.1" [max]="2.0" [step]="0.05" [decimals]="2">
+              </num-input>
+            </div>
           </div>
-          <div class="param-row">
-            <label>Blend σ</label>
-            <num-input [(value)]="params.disk_sigma"
-                       [min]="0.1" [max]="2.0" [step]="0.05" [decimals]="2">
-            </num-input>
-          </div>
-        </div>
+        </ng-container>
       </div>
 
       <!-- Preset manager -->
@@ -617,6 +619,59 @@
     <!-- ══════════════════════════════════════════════════════ -->
     <div class="right-col">
 
+      <!-- Queue / jobs -->
+      <div class="panel" style="margin-bottom:14px">
+        <div class="gallery-header">
+          <h2 style="margin:0">Render queue</h2>
+          <button class="action-btn danger" style="padding:0 8px;height:28px"
+                  (click)="loadQueueState()">
+            <mat-icon style="font-size:14px;width:14px;height:14px">refresh</mat-icon>
+          </button>
+        </div>
+
+        <div *ngIf="queueActive() as active" class="job-card">
+          <div class="job-head">
+            <span class="job-badge" [ngClass]="queueStatusClass(active.status)">
+              {{queueStatusLabel(active.status)}}
+            </span>
+            <span class="job-id">#{{active.id}}</span>
+            <span class="job-meta">{{active.resolution}} · {{active.backend | uppercase}} · {{active.chart | uppercase}}</span>
+            <button class="backend-btn" (click)="cancelQueuedJob(active.id)">Cancel</button>
+          </div>
+          <div class="job-progress-row">
+            <span>{{active.progressPct ?? 0 | number:'1.0-0'}}%</span>
+            <span>{{fmtClock(active.elapsedSec ?? 0)}} elapsed</span>
+          </div>
+          <mat-progress-bar mode="determinate" [value]="active.progressPct ?? 0"></mat-progress-bar>
+        </div>
+
+        <div class="job-empty" *ngIf="!queueActive()">Nessun job attivo.</div>
+
+        <div class="job-list-title" *ngIf="queuePending().length > 0">In coda</div>
+        <div class="job-card queued" *ngFor="let q of queuePending()">
+          <div class="job-head">
+            <span class="job-badge" [ngClass]="queueStatusClass(q.status)">{{queueStatusLabel(q.status)}}</span>
+            <span class="job-id">#{{q.id}}</span>
+            <span class="job-meta">{{q.resolution}} · {{q.backend | uppercase}} · pos {{q.queueIndex}}</span>
+            <div style="display:flex;gap:4px">
+              <button class="backend-btn" (click)="moveQueuedJob(q.id, 'up')">↑</button>
+              <button class="backend-btn" (click)="moveQueuedJob(q.id, 'down')">↓</button>
+              <button class="backend-btn" (click)="cancelQueuedJob(q.id)">✕</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="job-list-title" *ngIf="queueRecent().length > 0">Recenti</div>
+        <div class="job-card recent" *ngFor="let rj of queueRecent().slice(0, 6)">
+          <div class="job-head">
+            <span class="job-badge" [ngClass]="queueStatusClass(rj.status)">{{queueStatusLabel(rj.status)}}</span>
+            <span class="job-id">#{{rj.id}}</span>
+            <span class="job-meta">{{rj.resolution}} · {{rj.backend | uppercase}}</span>
+          </div>
+          <div class="job-warn" *ngIf="rj.fallbackUsed">Fallback rilevato</div>
+        </div>
+      </div>
+
       <!-- Render viewer -->
       <div class="render-toolbar">
         <button class="backend-btn"
@@ -656,6 +711,7 @@
       <div class="render-view" *ngIf="!compareMode">
         <img *ngIf="previewUrl()" [src]="previewUrl()!" alt="render A" />
         <span class="render-placeholder" *ngIf="!previewUrl()">No render yet</span>
+        <span class="live-preview-tag" *ngIf="status()==='running' && livePreviewFile()">Live preview</span>
       </div>
 
       <div class="render-split" *ngIf="compareMode && compareLayout === 'split'">
@@ -763,6 +819,11 @@
           <div class="history-actions">
             <button class="backend-btn" (click)="runHistorySearch()">Search archive</button>
             <button class="backend-btn" (click)="resetHistoryToLatest()">Latest 10</button>
+            <button *ngIf="historyMode==='search'" class="backend-btn" (click)="historyPrevPage()" [disabled]="!historyHasPrev">Prev</button>
+            <button *ngIf="historyMode==='search'" class="backend-btn" (click)="historyNextPage()" [disabled]="!historyHasNext">Next</button>
+          </div>
+          <div class="history-summary">
+            Pagina {{historyPage}} / {{historyTotalPages}} · Totale {{historyTotal}}
           </div>
         </div>
 

@@ -110,6 +110,12 @@ html, body {
   line-height: 1.6;
 }
 
+.header-side {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
 .app-meta strong {
   color: $text-mid;
   font-weight: 500;
@@ -431,6 +437,7 @@ html, body {
   align-items: center;
   justify-content: center;
   min-height: 280px;
+  position: relative;
 }
 
 .render-toolbar {
@@ -544,6 +551,94 @@ html, body {
   color: #2a2a2a;
   font-size: 13px;
   user-select: none;
+}
+
+.live-preview-tag {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: #dcdcdc;
+  background: rgba(8, 8, 8, .78);
+  border: 1px solid #3a3a3a;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.job-card {
+  border: 1px solid #222;
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 8px;
+  background: #101010;
+}
+
+.job-card.recent {
+  background: #0d0d0d;
+}
+
+.job-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.job-badge {
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  padding: 1px 7px;
+  border: 1px solid #333;
+  color: #bbb;
+}
+
+.job-badge.job-running { color: #90caf9; border-color: #3b5f7f; }
+.job-badge.job-queued { color: #c5e1a5; border-color: #435d34; }
+.job-badge.job-done { color: #a5d6a7; border-color: #2f5d34; }
+.job-badge.job-failed { color: #ef9a9a; border-color: #7a2d2d; }
+.job-badge.job-cancelled { color: #b0bec5; border-color: #43505a; }
+
+.job-id {
+  font-size: 11px;
+  color: #8e8e8e;
+}
+
+.job-meta {
+  font-size: 11px;
+  color: #777;
+  margin-right: auto;
+}
+
+.job-progress-row {
+  margin: 6px 0 4px;
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #7f7f7f;
+}
+
+.job-list-title {
+  margin: 10px 0 6px;
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: #5e5e5e;
+}
+
+.job-empty {
+  font-size: 12px;
+  color: #525252;
+  margin-bottom: 8px;
+}
+
+.job-warn {
+  margin-top: 4px;
+  color: #d5b06b;
+  font-size: 11px;
 }
 
 // ── Gallery ────────────────────────────────────────────────────
@@ -811,8 +906,34 @@ html, body {
 @media (max-width: 860px) {
   .app-header {
     align-items: flex-start;
-    flex-direction: column;
-    gap: 12px;
+    flex-direction: row;
+    gap: 10px;
+  }
+
+  .app-header > div:first-child {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .header-side {
+    margin-left: auto;
+    align-items: flex-end;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .app-title {
+    font-size: 16px;
+  }
+
+  .app-subtitle {
+    font-size: 11px;
+  }
+
+  .app-meta {
+    font-size: 10px;
+    line-height: 1.4;
   }
 
   .right-col {

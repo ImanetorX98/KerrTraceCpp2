@@ -60,8 +60,36 @@ export interface RenderParams {
   anim_disk_end: number;
 }
 
+export interface QueueJobState {
+  id: number;
+  kind: 'render' | 'colorize';
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+  resolution: string;
+  backend: string;
+  chart: 'ks' | 'bl' | 'unknown';
+  createdAt: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  progressPct?: number;
+  elapsedSec?: number;
+  etaSec?: number;
+  code?: number | null;
+  outputFile?: string | null;
+  previewFile?: string | null;
+  queueIndex?: number | null;
+  fallbackUsed?: boolean;
+  warnings?: string[];
+  logsTail?: string[];
+}
+
+export interface QueueStateResponse {
+  active: QueueJobState | null;
+  queued: QueueJobState[];
+  recent: QueueJobState[];
+}
+
 export interface WsMessage {
-  type: 'status' | 'start' | 'progress' | 'done' | 'stdout';
+  type: 'status' | 'start' | 'progress' | 'done' | 'stdout' | 'queue_state' | 'job_preview';
   running?: boolean;
   pct?: number;
   elapsed?: number;
@@ -71,6 +99,10 @@ export interface WsMessage {
   line?: string;
   args?: string[];
   resolution?: string;
+  jobId?: number;
+  active?: QueueJobState | null;
+  queued?: QueueJobState[];
+  recent?: QueueJobState[];
 }
 
 export interface RenderFile {
@@ -118,10 +150,16 @@ export interface ApiStatus {
   running: boolean;
   startedAtSec?: number | null;
   lastFile?: string | null;
+  activeJobId?: number | null;
+  queuedCount?: number;
+  recentCount?: number;
 }
 
 export interface RenderHistoryQuery {
   limit?: number;
+  page?: number;
+  page_size?: number;
+  include_total?: 0 | 1;
   q?: string;
   resolution?: string;
   backend?: string;
@@ -129,6 +167,16 @@ export interface RenderHistoryQuery {
   type?: string;
   from?: string;
   to?: string;
+}
+
+export interface RenderHistoryPage {
+  items: RenderFile[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -180,12 +228,33 @@ export class RenderService {
     return this.http.get<RenderFile[]>('/api/renders', { params });
   }
 
-  startRender(params: RenderParams) {
-    return this.http.post<{ status: string; args: string[] }>('/api/render', params);
+  getRendersPage(query: RenderHistoryQuery = {}) {
+    let params = new HttpParams().set('_ts', Date.now().toString());
+    Object.entries(query).forEach(([k, v]) => {
+      if (v === undefined || v === null) return;
+      const s = String(v).trim();
+      if (!s) return;
+      params = params.set(k, s);
+    });
+    return this.http.get<RenderHistoryPage>('/api/renders', { params });
   }
 
-  cancelRender() {
-    return this.http.post<{ status: string }>('/api/cancel', {});
+  startRender(params: RenderParams) {
+    return this.http.post<{ status: string; args: string[]; jobId?: number; queuePosition?: number }>('/api/render', params);
+  }
+
+  cancelRender(jobId?: number) {
+    const body = jobId ? { jobId } : {};
+    return this.http.post<{ status: string; jobId?: number; active?: boolean }>('/api/cancel', body);
+  }
+
+  getQueueState() {
+    const params = new HttpParams().set('_ts', Date.now().toString());
+    return this.http.get<QueueStateResponse>('/api/queue', { params });
+  }
+
+  reorderQueue(jobId: number, direction: 'up' | 'down') {
+    return this.http.post<{ status: string }>('/api/queue/reorder', { jobId, direction });
   }
 
   getGeoFiles() {
@@ -194,7 +263,7 @@ export class RenderService {
   }
 
   colorize(params: ColorizeParams) {
-    return this.http.post<{ status: string; args: string[] }>('/api/colorize', params);
+    return this.http.post<{ status: string; args: string[]; jobId?: number; queuePosition?: number }>('/api/colorize', params);
   }
 
   renderUrl(filename: string): string {
@@ -204,5 +273,9 @@ export class RenderService {
   renderThumbUrl(filename: string, width = 360): string {
     const w = Math.max(64, Math.min(1024, Math.floor(width)));
     return `/api/renders-thumb/${encodeURIComponent(filename)}?w=${w}`;
+  }
+
+  livePreviewUrl(filename: string): string {
+    return `/api/live-preview/${encodeURIComponent(filename)}?_ts=${Date.now()}`;
   }
 }

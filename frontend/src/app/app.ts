@@ -18,6 +18,8 @@ import {
   ColorizeParams,
   ApiInfo,
   RenderHistoryQuery,
+  QueueJobState,
+  QueueStateResponse,
 } from './render.service';
 
 interface RenderMetaLite {
@@ -70,7 +72,7 @@ export class App implements OnInit, OnDestroy {
     disk_out: 12,
     theta: 80,
     phi: 0,
-    r_obs: 40,
+    r_obs: 60,
     fov: 30,
     backend: 'cpu',
     integration_chart: 'ks',
@@ -107,8 +109,8 @@ export class App implements OnInit, OnDestroy {
     anim_theta_end: 80,
     anim_phi_start: 0,
     anim_phi_end: 360,
-    anim_r_start: 40,
-    anim_r_end: 40,
+    anim_r_start: 60,
+    anim_r_end: 60,
     anim_disk_start: 12,
     anim_disk_end: 12,
   };
@@ -120,6 +122,10 @@ export class App implements OnInit, OnDestroy {
   readonly elapsed  = signal(0);
   readonly eta      = signal(0);
   readonly logLines = signal<string[]>([]);
+  readonly queueActive = signal<QueueJobState | null>(null);
+  readonly queuePending = signal<QueueJobState[]>([]);
+  readonly queueRecent = signal<QueueJobState[]>([]);
+  readonly livePreviewFile = signal<string | null>(null);
 
   // ── Gallery ───────────────────────────────────────────────────
   renders: RenderFile[] = [];
@@ -135,7 +141,12 @@ export class App implements OnInit, OnDestroy {
   historyResolutionFilter = 'all';
   historyBackendFilter = 'all';
   historyChartFilter = 'all';
-  historyLimit = 10;
+  historyPage = 1;
+  historyPageSize = 24;
+  historyTotal = 0;
+  historyTotalPages = 1;
+  historyHasNext = false;
+  historyHasPrev = false;
   historyMode: 'latest' | 'search' = 'latest';
   readonly isMobileView = signal(false);
   private readonly presetStorageKey = 'knds_presets_v1';
@@ -149,6 +160,9 @@ export class App implements OnInit, OnDestroy {
   postProcessTab: 'render' | 'recolor' = 'render';
 
   readonly previewUrl = computed(() => {
+    if (this.status() === 'running' && this.livePreviewFile()) {
+      return this.svc.livePreviewUrl(this.livePreviewFile()!);
+    }
     const r = this.activeRender();
     return r ? this.svc.renderUrl(r) : null;
   });
@@ -183,11 +197,19 @@ export class App implements OnInit, OnDestroy {
     });
     this.loadLatestRenders();
     this.loadGeoFiles();
+    this.loadQueueState();
 
     this.sub = this.svc.messages$.subscribe(msg => {
       switch (msg.type) {
         case 'status':
           if (msg.running) this.status.set('running');
+          break;
+        case 'queue_state':
+          this.applyQueueState({
+            active: msg.active ?? null,
+            queued: msg.queued ?? [],
+            recent: msg.recent ?? [],
+          });
           break;
         case 'start':
           this.status.set('running');
@@ -197,6 +219,11 @@ export class App implements OnInit, OnDestroy {
           this.eta.set(0);
           this.logLines.set([`Starting: ${msg.args?.join(' ')}`]);
           this.startStatusPolling();
+          break;
+        case 'job_preview':
+          if (msg.file) {
+            this.livePreviewFile.set(msg.file);
+          }
           break;
         case 'progress':
           if (typeof msg.pct === 'number') {
@@ -218,6 +245,7 @@ export class App implements OnInit, OnDestroy {
         case 'done':
           this.status.set(msg.code === 0 ? 'done' : 'error');
           this.progress.set(100);
+          this.livePreviewFile.set(null);
           this.stopStatusPolling();
           this.refreshOutputs(msg.file ?? null);
           break;
@@ -236,6 +264,30 @@ export class App implements OnInit, OnDestroy {
   ngOnDestroy() {
     this.sub?.unsubscribe();
     this.stopStatusPolling();
+  }
+
+  private applyQueueState(state: QueueStateResponse) {
+    this.queueActive.set(state.active ?? null);
+    this.queuePending.set(Array.isArray(state.queued) ? state.queued : []);
+    this.queueRecent.set(Array.isArray(state.recent) ? state.recent.slice(0, 24) : []);
+    if (state.active?.previewFile) {
+      this.livePreviewFile.set(state.active.previewFile);
+    }
+    if (state.active?.status === 'running') {
+      this.status.set('running');
+    } else if (!state.active && this.status() === 'running') {
+      this.status.set('done');
+      this.livePreviewFile.set(null);
+    }
+  }
+
+  loadQueueState() {
+    this.svc.getQueueState().subscribe({
+      next: s => this.applyQueueState(s),
+      error: () => {
+        // noop
+      },
+    });
   }
 
   setSceneMode(mode: 'black_hole' | 'wormhole') {
@@ -295,34 +347,37 @@ export class App implements OnInit, OnDestroy {
       this.params.anti_fireflies = false;
     }
     this.svc.startRender(this.params).subscribe({
-      next: () => {
-        this.status.set('running');
-        this.progress.set(0);
-        this.hasDeterminateProgress.set(false);
-        this.elapsed.set(0);
-        this.eta.set(0);
-        this.startStatusPolling();
+      next: rsp => {
+        if (rsp.status === 'started') {
+          this.status.set('running');
+          this.progress.set(0);
+          this.hasDeterminateProgress.set(false);
+          this.elapsed.set(0);
+          this.eta.set(0);
+          this.startStatusPolling();
+        } else {
+          this.logLines.update(l => [...l.slice(-49), `Queued render job #${rsp.jobId ?? '?'} (pos ${rsp.queuePosition ?? '?'})`]);
+        }
+        this.loadQueueState();
       },
       error: err => {
-        if (err.status === 409) alert('Render already running');
-        else console.error(err);
+        console.error(err);
       },
     });
   }
 
-  cancelRender() {
-    this.svc.cancelRender().subscribe();
+  cancelRender(jobId?: number) {
+    this.svc.cancelRender(jobId).subscribe({
+      next: () => this.loadQueueState(),
+      error: err => console.error(err),
+    });
     this.stopStatusPolling();
   }
 
   private refreshOutputs(preferredFile: string | null) {
     const refreshOnce = () => {
-      this.svc.getRenders(this.buildHistoryQuery()).subscribe(files => {
-        this.renders = files;
-        const select = preferredFile ?? (files.length > 0 ? files[0].name : null);
-        if (select) this.activeRender.set(select);
-        this.syncCompareSelection();
-      });
+      this.loadRenders(preferredFile);
+      this.loadQueueState();
       this.loadGeoFiles();
     };
     // Retry a few times to avoid races between process exit and fs mtime visibility.
@@ -331,25 +386,47 @@ export class App implements OnInit, OnDestroy {
     });
   }
 
-  loadRenders() {
-    this.svc.getRenders(this.buildHistoryQuery()).subscribe(files => {
-      this.renders = files;
-      if (!this.activeRender() && files.length > 0) {
-        this.activeRender.set(files[0].name);
-      }
+  loadRenders(preferredFile: string | null = null) {
+    const query = this.buildHistoryQuery();
+    this.svc.getRendersPage(query).subscribe(page => {
+      this.renders = page.items;
+      this.historyTotal = page.total;
+      this.historyTotalPages = page.totalPages;
+      this.historyHasNext = page.hasNext;
+      this.historyHasPrev = page.hasPrev;
+      const select = preferredFile
+        ?? this.activeRender()
+        ?? (page.items.length > 0 ? page.items[0].name : null);
+      if (select) this.activeRender.set(select);
       this.syncCompareSelection();
     });
   }
 
   loadLatestRenders() {
     this.historyMode = 'latest';
-    this.historyLimit = 10;
+    this.historyPage = 1;
+    this.historyPageSize = 10;
     this.loadRenders();
   }
 
   runHistorySearch() {
     this.historyMode = 'search';
-    this.historyLimit = 300;
+    this.historyPage = 1;
+    this.historyPageSize = 24;
+    this.loadRenders();
+  }
+
+  historyNextPage() {
+    if (this.historyMode !== 'search') return;
+    if (!this.historyHasNext) return;
+    this.historyPage += 1;
+    this.loadRenders();
+  }
+
+  historyPrevPage() {
+    if (this.historyMode !== 'search') return;
+    if (!this.historyHasPrev) return;
+    this.historyPage = Math.max(1, this.historyPage - 1);
     this.loadRenders();
   }
 
@@ -362,7 +439,8 @@ export class App implements OnInit, OnDestroy {
     this.historyBackendFilter = 'all';
     this.historyChartFilter = 'all';
     this.historyMode = 'latest';
-    this.historyLimit = 10;
+    this.historyPage = 1;
+    this.historyPageSize = 10;
     this.loadRenders();
   }
 
@@ -370,13 +448,18 @@ export class App implements OnInit, OnDestroy {
     if (this.historyMode === 'latest') {
       return 'Mostrando le ultime 10 immagini';
     }
-    return `Ricerca archivio (max ${this.historyLimit})`;
+    return `Archivio: ${this.historyTotal} risultati`;
   }
 
   private buildHistoryQuery(): RenderHistoryQuery {
     if (this.historyMode !== 'search') {
       // Strict default mode: always show only latest 10.
-      return { limit: 10 };
+      return {
+        include_total: 1,
+        page: this.historyPage,
+        page_size: 10,
+        limit: 10,
+      };
     }
 
     const q = this.historyQuery.trim();
@@ -384,16 +467,11 @@ export class App implements OnInit, OnDestroy {
     const to = this.historyDateTo;
     const normalizedFrom = from && to && from > to ? to : from;
     const normalizedTo = from && to && from > to ? from : to;
-    const hasFilters = q.length > 0
-      || normalizedFrom.length > 0
-      || normalizedTo.length > 0
-      || this.historyTypeFilter !== 'all'
-      || this.historyResolutionFilter !== 'all'
-      || this.historyBackendFilter !== 'all'
-      || this.historyChartFilter !== 'all';
-
     return {
-      limit: this.historyLimit,
+      include_total: 1,
+      page: this.historyPage,
+      page_size: this.historyPageSize,
+      limit: this.historyPageSize,
       q: q || undefined,
       from: normalizedFrom || undefined,
       to: normalizedTo || undefined,
@@ -410,6 +488,7 @@ export class App implements OnInit, OnDestroy {
       if (this.status() !== 'running') return;
       this.svc.getStatus().subscribe({
         next: s => {
+          this.loadQueueState();
           if (!s.running) {
             this.status.set('done');
             this.progress.set(100);
@@ -442,16 +521,20 @@ export class App implements OnInit, OnDestroy {
   startColorize() {
     if (!this.colorParams.geoFile) return;
     this.svc.colorize(this.colorParams).subscribe({
-      next: () => {
-        this.status.set('running');
-        this.progress.set(0);
-        this.hasDeterminateProgress.set(false);
-        this.elapsed.set(0);
-        this.eta.set(0);
+      next: rsp => {
+        if (rsp.status === 'started') {
+          this.status.set('running');
+          this.progress.set(0);
+          this.hasDeterminateProgress.set(false);
+          this.elapsed.set(0);
+          this.eta.set(0);
+        } else {
+          this.logLines.update(l => [...l.slice(-49), `Queued colorize job #${rsp.jobId ?? '?'} (pos ${rsp.queuePosition ?? '?'})`]);
+        }
+        this.loadQueueState();
       },
       error: err => {
-        if (err.status === 409) alert('Render already running');
-        else console.error(err);
+        console.error(err);
       },
     });
   }
@@ -554,6 +637,30 @@ export class App implements OnInit, OnDestroy {
     if (type === 'semi_analytic') return 'Tipo: semi-analytic';
     if (type === 'elliptic_closed') return 'Tipo: elliptic-closed';
     return `Tipo: ${type}`;
+  }
+
+  queueStatusLabel(status: QueueJobState['status']): string {
+    if (status === 'queued') return 'Queued';
+    if (status === 'running') return 'Running';
+    if (status === 'done') return 'Done';
+    if (status === 'failed') return 'Failed';
+    if (status === 'cancelled') return 'Cancelled';
+    return status;
+  }
+
+  queueStatusClass(status: QueueJobState['status']): string {
+    return `job-${status}`;
+  }
+
+  cancelQueuedJob(jobId: number) {
+    this.cancelRender(jobId);
+  }
+
+  moveQueuedJob(jobId: number, direction: 'up' | 'down') {
+    this.svc.reorderQueue(jobId, direction).subscribe({
+      next: () => this.loadQueueState(),
+      error: err => console.error(err),
+    });
   }
 
   saveCurrentPreset() {

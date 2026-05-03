@@ -357,7 +357,7 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
             step_used = dlam;
             if (adaptive_step(g, s, dlam, intg, fsal, ctl.tol)) break;
             if (!std::isfinite(dlam) || ++rejects > 64)
-                return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+                return {Outcome::ESCAPED, s.r, 1.0, 0.0, s.theta, s.phi};
         }
 
         double best_alpha = 2.0;
@@ -427,10 +427,10 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
         if (best_event == StepEvent::ESCAPE) {
             const double th_esc = s_prev.theta + best_alpha * (s.theta - s_prev.theta);
             const double ph_esc = s_prev.phi   + best_alpha * (s.phi   - s_prev.phi);
-            return {Outcome::ESCAPED, r_escape, 1.0, th_esc, ph_esc};
+            return {Outcome::ESCAPED, r_escape, 1.0, 0.0, th_esc, ph_esc};
         }
     }
-    return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+    return {Outcome::ESCAPED, s.r, 1.0, 0.0, s.theta, s.phi};
 }
 
 // ── Separable Kerr fast path (Q=0, Lambda=0, BL chart) ──────
@@ -693,13 +693,13 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
         if (best_event == StepEvent::ESCAPE) {
             const double th_esc = s_prev.theta + best_alpha * (s.theta - s_prev.theta);
             const double ph_esc = s_prev.phi   + best_alpha * (s.phi   - s_prev.phi);
-            return {Outcome::ESCAPED, r_escape, 1.0, th_esc, ph_esc};
+            return {Outcome::ESCAPED, r_escape, 1.0, 0.0, th_esc, ph_esc};
         }
         prev_Rpot = Rnow;
         prev_Thpot = Thnow;
     }
 
-    return {Outcome::ESCAPED, s.r, 1.0, s.theta, s.phi};
+    return {Outcome::ESCAPED, s.r, 1.0, 0.0, s.theta, s.phi};
 }
 
 // ── Elliptic-closed helpers (Carlson RF + Jacobi inversion) ──
@@ -1560,7 +1560,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
             if (!std::isfinite(dlam) || ++rejects > 64) {
                 double r_tmp, th_tmp, ph_tmp;
                 KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_tmp, th_tmp, ph_tmp);
-                return {Outcome::ESCAPED, r_tmp, 1.0, th_tmp, ph_tmp};
+                return {Outcome::ESCAPED, r_tmp, 1.0, 0.0, th_tmp, ph_tmp};
             }
         }
 
@@ -1648,7 +1648,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
             const double Z_esc = s_prev.Z + best_alpha * (s.Z - s_prev.Z);
             double r_esc, th_esc, ph_esc;
             KNdSMetric::KS_to_BL_spatial(X_esc, Y_esc, Z_esc, g.a, r_esc, th_esc, ph_esc);
-            return {Outcome::ESCAPED, r_esc, 1.0, th_esc, ph_esc};
+            return {Outcome::ESCAPED, r_esc, 1.0, 0.0, th_esc, ph_esc};
         }
 
         prev_r_ks = r_now;
@@ -1656,7 +1656,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
 
     double r_end, th_end, ph_end;
     KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_end, th_end, ph_end);
-    return {Outcome::ESCAPED, r_end, 1.0, th_end, ph_end};
+    return {Outcome::ESCAPED, r_end, 1.0, 0.0, th_end, ph_end};
 }
 
 // ── Colorization (Phase 2) ────────────────────────────────────
@@ -1884,7 +1884,7 @@ static void print_progress(int done, int total, double elapsed) {
 
 // ── Per-frame camera/physics parameters ───────────────────────
 struct FrameParams {
-    double a=0.998, theta=80.0, phi=0.0, r_obs=40.0, disk_out=12.0, fov=30.0;
+    double a=0.7, theta=80.0, phi=0.0, r_obs=60.0, disk_out=12.0, fov=30.0;
     // Wormhole mode (DNEG metric)
     bool   wormhole      = false;
     double wh_rho        = 1.0;   ///< throat areal radius ρ  [geometric units]
@@ -2510,10 +2510,10 @@ int main(int argc, char** argv) {
     RaySolverMode solver_mode=RaySolverMode::STANDARD;
     IntersectionMode intersection_mode=IntersectionMode::HERMITE;
     int metal_kernel_mode=0; // 0=auto, 1=unified, 2=single, 3=bundle (Metal only)
-    std::string bg_path = "assets/backgrounds/sfondo5.jpg";
+    std::string bg_path;
 
     // ── Single-frame / base params ───────────────────────────
-    double arg_a=0.998, arg_disk_out=12.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
+    double arg_a=0.7, arg_disk_out=12.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
     double arg_Q=0.0, arg_Lam=0.0, arg_fov=30.0;
 
     // ── Wormhole params ───────────────────────────────────────
@@ -2711,7 +2711,7 @@ int main(int argc, char** argv) {
     const int H = custom_h ? custom_h : res_4k ? 2160 : res_2k ? 1440
                 : res_720p ? 720  : hd_preview ? 480 : preview ? 270 : 1080;
 
-    const double default_r_obs = 40.0;
+    const double default_r_obs = 60.0;
     const double base_r_obs    = (arg_r_obs>0) ? arg_r_obs : default_r_obs;
 
     const char* res_tag = res_4k ? "4k" : res_2k ? "2k" : custom_w ? "custom"

@@ -64,7 +64,7 @@ const RESOLUTIONS = {
   '4K':    { w: 3840, h: 2160 },
 };
 
-const DEFAULT_R_OBS = 40;
+const DEFAULT_R_OBS = 60;
 const DEFAULT_DISK_OUT = 12;
 
 app.use(cors());
@@ -74,8 +74,12 @@ if (!fs.existsSync(THUMB_DIR)) {
   fs.mkdirSync(THUMB_DIR, { recursive: true });
 }
 
-// ── Active render state ───────────────────────────────────────
-let activeJob = null;   // { proc, clients: Set<WebSocket>, outfile }
+// ── Render queue state ────────────────────────────────────────
+let activeJob = null;
+let queuedJobs = [];
+let recentJobs = [];
+let nextJobId = 1;
+const MAX_RECENT_JOBS = 80;
 
 function nowSeconds() {
   return Date.now() / 1000;
@@ -86,11 +90,13 @@ function startProgressHeartbeat(job) {
   job.startedAtSec = nowSeconds();
   job.hasRealProgress = false;
   job.heartbeat = setInterval(() => {
-    if (!activeJob || activeJob !== job) return;
+    if (!activeJob || activeJob !== job || job.status !== 'running') return;
     if (job.hasRealProgress) return;
     const elapsed = Math.max(0, nowSeconds() - job.startedAtSec);
+    job.elapsedSec = elapsed;
     // Heartbeat progress: elapsed-only update (UI can show indeterminate bar).
-    broadcast({ type: 'progress', elapsed });
+    broadcast({ type: 'progress', elapsed, jobId: job.id });
+    broadcastQueueSnapshot();
   }, 1000);
 }
 
@@ -103,6 +109,228 @@ function stopProgressHeartbeat(job) {
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+}
+
+function tailLines(text, keep = 80) {
+  const lines = String(text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  if (lines.length <= keep) return lines;
+  return lines.slice(lines.length - keep);
+}
+
+function buildQueueSnapshot() {
+  const serialize = (j, queueIndex = null) => ({
+    id: j.id,
+    kind: j.kind,
+    status: j.status,
+    resolution: j.resolution || 'unknown',
+    backend: j.backend || 'cpu',
+    chart: j.chart || 'ks',
+    createdAt: j.createdAt,
+    startedAt: j.startedAt || null,
+    finishedAt: j.finishedAt || null,
+    progressPct: Number.isFinite(j.progressPct) ? j.progressPct : 0,
+    elapsedSec: Number.isFinite(j.elapsedSec) ? j.elapsedSec : 0,
+    etaSec: Number.isFinite(j.etaSec) ? j.etaSec : 0,
+    code: j.code ?? null,
+    outputFile: j.outputFile || null,
+    previewFile: j.previewFile || null,
+    queueIndex,
+    fallbackUsed: !!j.fallbackUsed,
+    warnings: Array.isArray(j.warnings) ? j.warnings.slice(-8) : [],
+    logsTail: Array.isArray(j.logsTail) ? j.logsTail.slice(-8) : [],
+  });
+
+  return {
+    active: activeJob ? serialize(activeJob) : null,
+    queued: queuedJobs.map((j, idx) => serialize(j, idx + 1)),
+    recent: recentJobs.map(j => serialize(j)),
+  };
+}
+
+function broadcastQueueSnapshot() {
+  broadcast({ type: 'queue_state', ...buildQueueSnapshot() });
+}
+
+function rememberRecentJob(job) {
+  recentJobs.unshift({
+    ...job,
+    logsTail: Array.isArray(job.logsTail) ? job.logsTail.slice(-80) : [],
+    warnings: Array.isArray(job.warnings) ? job.warnings.slice(-40) : [],
+  });
+  if (recentJobs.length > MAX_RECENT_JOBS) {
+    recentJobs = recentJobs.slice(0, MAX_RECENT_JOBS);
+  }
+}
+
+function extractSavedFileFromStdoutChunk(chunkText) {
+  const m = String(chunkText || '').match(/Saved:\s+(.+\.(png|mp4))/i);
+  if (!m) return null;
+  return path.basename(m[1].trim());
+}
+
+function markFallbackFromLine(job, line) {
+  const txt = String(line || '').toLowerCase();
+  if (!txt) return;
+  if (txt.includes('fallback')) {
+    job.fallbackUsed = true;
+    if (!job.warnings) job.warnings = [];
+    job.warnings.push(line.trim());
+    job.warnings = job.warnings.slice(-40);
+  }
+}
+
+function stripArgWithValue(args, flag) {
+  const out = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === flag) {
+      i += 1;
+      continue;
+    }
+    out.push(args[i]);
+  }
+  return out;
+}
+
+function runAuxPreviewJob(job) {
+  if (!job || job.kind !== 'render' || !job.binary || !Array.isArray(job.args)) return;
+  if (job.args.includes('--anim')) return;
+
+  let previewArgs = job.args.slice();
+  ['--4k', '--2k', '--720p', '--hd', '--preview'].forEach(flag => {
+    previewArgs = previewArgs.filter(a => a !== flag);
+  });
+  previewArgs = stripArgWithValue(previewArgs, '--custom-res');
+  previewArgs = stripArgWithValue(previewArgs, '--camera-spp');
+  previewArgs = stripArgWithValue(previewArgs, '--geo-file');
+  previewArgs.push('--preview', '--camera-spp', '1');
+
+  const p = spawn(job.binary, previewArgs, { cwd: ROOT });
+  p.stdout.on('data', chunk => {
+    const line = chunk.toString();
+    const saved = extractSavedFileFromStdoutChunk(line);
+    if (saved) {
+      const src = path.join(OUT_DIR, saved);
+      const ext = path.extname(saved).toLowerCase() || '.png';
+      const stableName = `job_${job.id}_preview${ext}`;
+      const dst = path.join(THUMB_DIR, stableName);
+      try {
+        if (fs.existsSync(src)) {
+          fs.copyFileSync(src, dst);
+          fs.unlinkSync(src);
+          job.previewFile = stableName;
+        } else {
+          job.previewFile = saved;
+        }
+      } catch {
+        job.previewFile = saved;
+      }
+      broadcast({ type: 'job_preview', jobId: job.id, file: job.previewFile });
+      broadcastQueueSnapshot();
+    }
+  });
+  p.on('error', () => {
+    // Non-blocking helper process: ignore errors.
+  });
+}
+
+function startNextQueuedJob() {
+  if (activeJob || queuedJobs.length === 0) return;
+  const job = queuedJobs.shift();
+  if (!job) return;
+
+  job.status = 'running';
+  job.startedAt = new Date().toISOString();
+  job.startedAtSec = nowSeconds();
+  job.hasRealProgress = false;
+  job.progressPct = 0;
+  job.elapsedSec = 0;
+  job.etaSec = 0;
+  job.logsTail = [];
+  job.warnings = [];
+  job.fallbackUsed = false;
+
+  const proc = spawn(job.binary, job.args, { cwd: ROOT });
+  job.proc = proc;
+  activeJob = job;
+  startProgressHeartbeat(job);
+
+  broadcast({ type: 'start', args: job.args, resolution: job.resolution, jobId: job.id });
+  broadcastQueueSnapshot();
+  runAuxPreviewJob(job);
+
+  proc.stdout.on('data', chunk => {
+    const line = chunk.toString();
+    broadcast({ type: 'stdout', line, jobId: job.id });
+    const saved = extractSavedFileFromStdoutChunk(line);
+    if (saved) {
+      job.outputFile = saved;
+    }
+    markFallbackFromLine(job, line);
+    const tail = tailLines(line, 12);
+    if (tail.length > 0) {
+      job.logsTail = [...(job.logsTail || []), ...tail].slice(-80);
+    }
+  });
+
+  proc.stderr.on('data', chunk => {
+    const raw = chunk.toString();
+    const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
+    if (match) {
+      job.hasRealProgress = true;
+      job.progressPct = parseInt(match[1], 10);
+      job.elapsedSec = parseFloat(match[2]);
+      job.etaSec = parseFloat(match[3]);
+      broadcast({
+        type: 'progress',
+        pct: job.progressPct,
+        elapsed: job.elapsedSec,
+        eta: job.etaSec,
+        jobId: job.id,
+      });
+      broadcastQueueSnapshot();
+    }
+    markFallbackFromLine(job, raw);
+    const tail = tailLines(raw, 12);
+    if (tail.length > 0) {
+      job.logsTail = [...(job.logsTail || []), ...tail].slice(-80);
+    }
+  });
+
+  proc.on('close', code => {
+    stopProgressHeartbeat(job);
+    const wasCancelled = !!job.cancelRequested;
+    job.finishedAt = new Date().toISOString();
+    job.code = code;
+    job.status = wasCancelled ? 'cancelled' : (code === 0 ? 'done' : 'failed');
+    if (!job.outputFile && code === 0) {
+      job.outputFile = latestOutputFile();
+    }
+    rememberRecentJob(job);
+
+    broadcast({ type: 'done', code, file: job.outputFile || null, jobId: job.id });
+    activeJob = null;
+    broadcastQueueSnapshot();
+    startNextQueuedJob();
+  });
+}
+
+function enqueueJob(job) {
+  const next = {
+    ...job,
+    id: nextJobId++,
+    createdAt: new Date().toISOString(),
+    status: 'queued',
+    progressPct: 0,
+    elapsedSec: 0,
+    etaSec: 0,
+    logsTail: [],
+    warnings: [],
+    fallbackUsed: false,
+  };
+  queuedJobs.push(next);
+  broadcastQueueSnapshot();
+  startNextQueuedJob();
+  return next;
 }
 
 function latestOutputFile() {
@@ -251,6 +479,7 @@ wss.on('connection', ws => {
   } else {
     ws.send(JSON.stringify({ type: 'status', running: false }));
   }
+  ws.send(JSON.stringify({ type: 'queue_state', ...buildQueueSnapshot() }));
 });
 
 // ── GET /api/info ─────────────────────────────────────────────
@@ -277,7 +506,15 @@ app.get('/api/status', (req, res) => {
     running: !!activeJob,
     startedAtSec: activeJob?.startedAtSec ?? null,
     lastFile: latestOutputFile(),
+    activeJobId: activeJob?.id ?? null,
+    queuedCount: queuedJobs.length,
+    recentCount: recentJobs.length,
   });
+});
+
+// ── GET /api/queue ────────────────────────────────────────────
+app.get('/api/queue', (req, res) => {
+  res.json(buildQueueSnapshot());
 });
 
 // ── GET /api/renders ─────────────────────────────────────────
@@ -294,6 +531,12 @@ app.get('/api/renders', (req, res) => {
   const fromDate = parseDateYmd(req.query.from, false);
   const toDate = parseDateYmd(req.query.to, true);
   const limit = toBoundedInt(req.query.limit, 10, 1, 2000);
+  const page = toBoundedInt(req.query.page, 1, 1, 1000000);
+  const pageSize = toBoundedInt(req.query.page_size ?? req.query.pageSize, limit, 1, 200);
+  const includeTotal = String(req.query.include_total ?? req.query.includeTotal ?? '') === '1'
+    || req.query.page !== undefined
+    || req.query.page_size !== undefined
+    || req.query.pageSize !== undefined;
 
   let files = fs.readdirSync(OUT_DIR)
     .filter(f => /\.png$/.test(f))
@@ -326,10 +569,24 @@ app.get('/api/renders', (req, res) => {
     return true;
   });
 
-  files = files.slice(0, limit);
+  if (!includeTotal) {
+    files = files.slice(0, limit);
+    const payload = files.map(({ mtimeMs, ...rest }) => rest);
+    return res.json(payload);
+  }
 
-  const payload = files.map(({ mtimeMs, ...rest }) => rest);
-  res.json(payload);
+  const total = files.length;
+  const start = (page - 1) * pageSize;
+  const items = files.slice(start, start + pageSize).map(({ mtimeMs, ...rest }) => rest);
+  return res.json({
+    items,
+    total,
+    page,
+    pageSize,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    hasNext: start + pageSize < total,
+    hasPrev: page > 1,
+  });
 });
 
 // ── GET /api/renders/:file ────────────────────────────────────
@@ -354,6 +611,17 @@ app.get('/api/renders-thumb/:file', (req, res) => {
   return res.sendFile(source);
 });
 
+// ── GET /api/live-preview/:file ───────────────────────────────
+app.get('/api/live-preview/:file', (req, res) => {
+  const base = path.basename(String(req.params.file || ''));
+  if (!base || base !== req.params.file) return res.sendStatus(404);
+  if (!/\.(png|jpg|jpeg)$/i.test(base)) return res.sendStatus(404);
+  const file = path.join(THUMB_DIR, base);
+  if (!fs.existsSync(file)) return res.sendStatus(404);
+  res.setHeader('Cache-Control', 'no-cache');
+  return res.sendFile(file);
+});
+
 // ── GET /api/geo-files ────────────────────────────────────────
 app.get('/api/geo-files', (req, res) => {
   const files = fs.readdirSync(OUT_DIR)
@@ -368,8 +636,6 @@ app.get('/api/geo-files', (req, res) => {
 
 // ── POST /api/colorize ────────────────────────────────────────
 app.post('/api/colorize', (req, res) => {
-  if (activeJob) return res.status(409).json({ error: 'Render already running' });
-
   const { geoFile, exposure, gamma, tempScale } = req.body;
   if (!geoFile) return res.status(400).json({ error: 'geoFile required' });
 
@@ -381,45 +647,31 @@ app.post('/api/colorize', (req, res) => {
   if (gamma     !== undefined) args.push('--gamma',      String(gamma));
   if (tempScale !== undefined) args.push('--temp-scale', String(tempScale));
 
-  broadcast({ type: 'start', args, resolution: 'recolor' });
-
   const binary = resolveBinary('cpu');
   if (!binary || !fs.existsSync(binary)) {
     return res.status(503).json({ error: 'No renderer binary found for colorize' });
   }
-  const proc = spawn(binary, args, { cwd: ROOT });
-  const job = { proc, heartbeat: null, startedAtSec: nowSeconds(), hasRealProgress: false };
-  activeJob = job;
-  startProgressHeartbeat(job);
-
-  proc.stdout.on('data', chunk => {
-    broadcast({ type: 'stdout', line: chunk.toString() });
+  const enqueued = enqueueJob({
+    kind: 'colorize',
+    binary,
+    args,
+    resolution: 'recolor',
+    backend: 'cpu',
+    chart: 'ks',
   });
-
-  proc.stderr.on('data', chunk => {
-    const raw = chunk.toString();
-    const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
-    if (match) {
-      job.hasRealProgress = true;
-      broadcast({ type: 'progress', pct: parseInt(match[1]), elapsed: parseFloat(match[2]), eta: parseFloat(match[3]) });
-    }
+  const queuePosition = activeJob && activeJob.id === enqueued.id
+    ? 0
+    : queuedJobs.findIndex(j => j.id === enqueued.id) + 1;
+  res.json({
+    status: queuePosition === 0 ? 'started' : 'queued',
+    jobId: enqueued.id,
+    queuePosition,
+    args,
   });
-
-  proc.on('close', code => {
-    stopProgressHeartbeat(job);
-    const outFile = latestOutputFile();
-
-    broadcast({ type: 'done', code, file: outFile });
-    activeJob = null;
-  });
-
-  res.json({ status: 'started', args });
 });
 
 // ── POST /api/render ──────────────────────────────────────────
 app.post('/api/render', (req, res) => {
-  if (activeJob) return res.status(409).json({ error: 'Render already running' });
-
   const p = req.body;
   const binary = resolveBinary(p.backend || 'cpu');
   if (!fs.existsSync(binary)) return res.status(503).json({ error: `Binary not found: ${binary}` });
@@ -547,50 +799,87 @@ app.post('/api/render', (req, res) => {
     args.push('--geo-file', geoPath);
   }
 
-  broadcast({ type: 'start', args, resolution: res_key });
-
-  const proc = spawn(binary, args, { cwd: ROOT });
-  const job = { proc, heartbeat: null, startedAtSec: nowSeconds(), hasRealProgress: false };
-  activeJob = job;
-  startProgressHeartbeat(job);
-
-  proc.stdout.on('data', chunk => {
-    const line = chunk.toString();
-    // Parse progress line from stderr (progress bar writes to stderr)
-    broadcast({ type: 'stdout', line });
+  const enqueued = enqueueJob({
+    kind: 'render',
+    binary,
+    args,
+    resolution: res_key,
+    backend: String(p.backend || 'cpu'),
+    chart: p.integration_chart === 'bl' ? 'bl' : 'ks',
   });
-
-  proc.stderr.on('data', chunk => {
-    const raw = chunk.toString();
-    // Extract percentage from progress bar
-    const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
-    if (match) {
-      job.hasRealProgress = true;
-      broadcast({
-        type: 'progress',
-        pct: parseInt(match[1]),
-        elapsed: parseFloat(match[2]),
-        eta: parseFloat(match[3]),
-      });
-    }
+  const queuePosition = activeJob && activeJob.id === enqueued.id
+    ? 0
+    : queuedJobs.findIndex(j => j.id === enqueued.id) + 1;
+  res.json({
+    status: queuePosition === 0 ? 'started' : 'queued',
+    jobId: enqueued.id,
+    queuePosition,
+    args,
   });
-
-  proc.on('close', code => {
-    stopProgressHeartbeat(job);
-    const outFile = latestOutputFile();
-
-    broadcast({ type: 'done', code, file: outFile });
-    activeJob = null;
-  });
-
-  res.json({ status: 'started', args });
 });
 
 // ── POST /api/cancel ─────────────────────────────────────────
 app.post('/api/cancel', (req, res) => {
-  if (!activeJob) return res.status(404).json({ error: 'No active render' });
-  activeJob.proc.kill('SIGTERM');
-  res.json({ status: 'cancelled' });
+  const wantedId = Number(req.body?.jobId);
+  const hasId = Number.isFinite(wantedId);
+
+  if (hasId) {
+    if (activeJob && activeJob.id === wantedId) {
+      activeJob.cancelRequested = true;
+      activeJob.proc?.kill('SIGTERM');
+      return res.json({ status: 'cancelling', jobId: wantedId, active: true });
+    }
+    const idx = queuedJobs.findIndex(j => j.id === wantedId);
+    if (idx >= 0) {
+      const [removed] = queuedJobs.splice(idx, 1);
+      removed.status = 'cancelled';
+      removed.finishedAt = new Date().toISOString();
+      removed.code = null;
+      rememberRecentJob(removed);
+      broadcastQueueSnapshot();
+      return res.json({ status: 'cancelled', jobId: wantedId, active: false });
+    }
+    return res.status(404).json({ error: `Job ${wantedId} not found` });
+  }
+
+  if (activeJob) {
+    activeJob.cancelRequested = true;
+    activeJob.proc?.kill('SIGTERM');
+    return res.json({ status: 'cancelling', jobId: activeJob.id, active: true });
+  }
+  if (queuedJobs.length > 0) {
+    const removed = queuedJobs.shift();
+    removed.status = 'cancelled';
+    removed.finishedAt = new Date().toISOString();
+    removed.code = null;
+    rememberRecentJob(removed);
+    broadcastQueueSnapshot();
+    return res.json({ status: 'cancelled', jobId: removed.id, active: false });
+  }
+  return res.status(404).json({ error: 'No active or queued jobs' });
+});
+
+// ── POST /api/queue/reorder ───────────────────────────────────
+app.post('/api/queue/reorder', (req, res) => {
+  const jobId = Number(req.body?.jobId);
+  const direction = String(req.body?.direction || '').toLowerCase();
+  if (!Number.isFinite(jobId)) {
+    return res.status(400).json({ error: 'jobId required' });
+  }
+  if (direction !== 'up' && direction !== 'down') {
+    return res.status(400).json({ error: 'direction must be up or down' });
+  }
+  const idx = queuedJobs.findIndex(j => j.id === jobId);
+  if (idx < 0) return res.status(404).json({ error: `Job ${jobId} not found in queue` });
+  const newIdx = direction === 'up' ? idx - 1 : idx + 1;
+  if (newIdx < 0 || newIdx >= queuedJobs.length) {
+    return res.json({ status: 'noop', jobId, direction });
+  }
+  const tmp = queuedJobs[idx];
+  queuedJobs[idx] = queuedJobs[newIdx];
+  queuedJobs[newIdx] = tmp;
+  broadcastQueueSnapshot();
+  return res.json({ status: 'ok', jobId, direction });
 });
 
 // ── Start ─────────────────────────────────────────────────────
