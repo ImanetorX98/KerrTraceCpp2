@@ -9,7 +9,7 @@
     <div class="header-side">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.8 — Wormhole</div>
+        <div><strong>Version</strong> v0.2.9 — Wormhole</div>
         <div><strong>Layout</strong> {{ isMobileView() ? 'Smartphone' : 'Desktop' }}</div>
       </div>
       <span class="status-chip" [class]="status()">
@@ -191,6 +191,11 @@
                     [class.active]="params.integration_chart === 'ks'"
                     (click)="params.integration_chart = 'ks'">
               Kerr-Schild (KS)
+            </button>
+            <button class="backend-btn"
+                    [class.active]="params.integration_chart === 'gks'"
+                    (click)="params.integration_chart = 'gks'">
+              Generalized KS (GKS)
             </button>
             <button class="backend-btn"
                     [class.active]="params.integration_chart === 'bl'"
@@ -408,6 +413,22 @@
       <div class="panel anim-panel" style="margin-bottom:14px" *ngIf="params.anim">
         <h2>Animation</h2>
 
+        <div class="anim-preset-row">
+          <button class="backend-btn"
+                  [class.active]="params.scene_mode === 'black_hole'"
+                  (click)="applyAnimationPreset('black_hole')">
+            Black Hole preset
+          </button>
+          <button class="backend-btn"
+                  [class.active]="params.scene_mode === 'wormhole'"
+                  (click)="applyAnimationPreset('wormhole')">
+            Wormhole preset
+          </button>
+        </div>
+        <div class="section-hint" style="margin-top:6px">
+          Il preset wormhole disattiva lo sweep di <i>a/M</i> e mantiene il passaggio camera nel tunnel.
+        </div>
+
         <!-- Timing -->
         <div class="anim-section-label">Timing</div>
         <div class="param-row">
@@ -447,48 +468,48 @@
           Set start → end for each param to animate
         </div>
 
-        <div class="anim-sweep-item">
+        <div class="anim-sweep-item" *ngIf="params.scene_mode === 'black_hole'">
           <div class="anim-sweep-item-label">Spin <i>a/M</i></div>
           <div class="anim-sweep-inputs">
-            <num-input [(value)]="params.anim_a_start" [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_a_start" [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3" style="flex:1"></num-input>
             <span class="anim-arrow">→</span>
-            <num-input [(value)]="params.anim_a_end" [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_a_end" [min]="-1" [max]="0.9999" [step]="0.001" [decimals]="3" style="flex:1"></num-input>
           </div>
         </div>
 
         <div class="anim-sweep-item">
           <div class="anim-sweep-item-label">Inclination θ</div>
           <div class="anim-sweep-inputs">
-            <num-input [(value)]="params.anim_theta_start" [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_theta_start" [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°" style="flex:1"></num-input>
             <span class="anim-arrow">→</span>
-            <num-input [(value)]="params.anim_theta_end" [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_theta_end" [min]="1" [max]="89" [step]="1" [decimals]="0" unit="°" style="flex:1"></num-input>
           </div>
         </div>
 
         <div class="anim-sweep-item">
           <div class="anim-sweep-item-label">Azimuth φ</div>
           <div class="anim-sweep-inputs">
-            <num-input [(value)]="params.anim_phi_start" [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_phi_start" [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°" style="flex:1"></num-input>
             <span class="anim-arrow">→</span>
-            <num-input [(value)]="params.anim_phi_end" [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_phi_end" [min]="-360" [max]="360" [step]="5" [decimals]="0" unit="°" style="flex:1"></num-input>
           </div>
         </div>
 
         <div class="anim-sweep-item">
           <div class="anim-sweep-item-label"><i>r</i><sub>obs</sub></div>
           <div class="anim-sweep-inputs">
-            <num-input [(value)]="params.anim_r_start" [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_r_start" [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M" style="flex:1"></num-input>
             <span class="anim-arrow">→</span>
-            <num-input [(value)]="params.anim_r_end" [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_r_end" [min]="5" [max]="500" [step]="1" [decimals]="0" unit="M" style="flex:1"></num-input>
           </div>
         </div>
 
-        <div class="anim-sweep-item">
+        <div class="anim-sweep-item" *ngIf="params.scene_mode === 'black_hole'">
           <div class="anim-sweep-item-label">Disk r<sub>out</sub></div>
           <div class="anim-sweep-inputs">
-            <num-input [(value)]="params.anim_disk_start" [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_disk_start" [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M" style="flex:1"></num-input>
             <span class="anim-arrow">→</span>
-            <num-input [(value)]="params.anim_disk_end" [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M" style="flex:1"></num-input>
+            <num-input class="anim-sweep-input" [(value)]="params.anim_disk_end" [min]="6" [max]="60" [step]="0.5" [decimals]="1" unit="M" style="flex:1"></num-input>
           </div>
         </div>
       </div>
@@ -640,7 +661,12 @@
           </div>
           <div class="job-progress-row">
             <span>{{active.progressPct ?? 0 | number:'1.0-0'}}%</span>
-            <span>{{fmtClock(active.elapsedSec ?? 0)}} elapsed</span>
+            <span>{{fmtClock(active.elapsedSec ?? 0)}} elapsed · ETA {{fmtClock((active.etaSmoothedSec ?? active.etaSec ?? 0))}}</span>
+          </div>
+          <div class="job-stats-row" *ngIf="(active.pixelCount ?? 0) > 0">
+            <span>{{fmtInt(active.donePixels ?? 0)}} / {{fmtInt(active.pixelCount ?? 0)}} px</span>
+            <span>{{fmtRate(active.throughputPixPerSec ?? 0)}} px/s</span>
+            <span>{{fmtRate(active.throughputRaysPerSec ?? 0)}} rays/s</span>
           </div>
           <mat-progress-bar mode="determinate" [value]="active.progressPct ?? 0"></mat-progress-bar>
         </div>
@@ -667,6 +693,10 @@
             <span class="job-badge" [ngClass]="queueStatusClass(rj.status)">{{queueStatusLabel(rj.status)}}</span>
             <span class="job-id">#{{rj.id}}</span>
             <span class="job-meta">{{rj.resolution}} · {{rj.backend | uppercase}}</span>
+            <div style="display:flex;gap:4px">
+              <button class="backend-btn" (click)="retryRecentJob(rj.id)">Retry</button>
+              <button class="backend-btn" (click)="duplicateRecentJob(rj.id)">Duplicate</button>
+            </div>
           </div>
           <div class="job-warn" *ngIf="rj.fallbackUsed">Fallback rilevato</div>
         </div>

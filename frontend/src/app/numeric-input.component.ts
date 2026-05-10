@@ -40,11 +40,13 @@ import { FormsModule } from '@angular/forms';
   styles: [`
     :host {
       display: inline-flex;
+      min-width: 0;
     }
 
     :host([style*="flex:1"]),
     :host([style*="flex: 1"]) {
-      flex: 1;
+      flex: 1 1 0;
+      min-width: 0;
     }
 
     .ni-wrap {
@@ -57,6 +59,7 @@ import { FormsModule } from '@angular/forms';
       overflow: hidden;
       background: #0e0e0e;
       width: 100%;
+      min-width: 0;
     }
 
     .ni-btn {
@@ -93,7 +96,7 @@ import { FormsModule } from '@angular/forms';
 
     .ni-val {
       flex: 1;
-      min-width: 64px;
+      min-width: 0;
       text-align: center;
       font-size: 13px;
       font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
@@ -125,7 +128,7 @@ import { FormsModule } from '@angular/forms';
 
     .ni-edit {
       flex: 1;
-      min-width: 64px;
+      min-width: 0;
       height: 100%;
       background: #111;
       border: none;

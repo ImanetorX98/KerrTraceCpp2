@@ -172,7 +172,7 @@ struct BackgroundImage {
 
 // ── Geodesic trace helpers ────────────────────────────────────
 enum class Outcome { ESCAPED, DISK_HIT, HORIZON, ESCAPED_B };
-enum class CoordinateChart { KS, BL };
+enum class CoordinateChart { KS, BL, GKS };
 enum class RaySolverMode { STANDARD, SEMI_ANALYTIC, ELLIPTIC_CLOSED };
 enum class IntersectionMode { LINEAR, HERMITE };
 enum class EllipticFallbackReason : uint8_t {
@@ -195,6 +195,38 @@ struct IntegratorControls {
     double step_init = 1.0;
     double tol       = 1e-7;
 };
+
+static const char* chart_label(CoordinateChart chart) {
+    switch (chart) {
+        case CoordinateChart::KS:  return "KS";
+        case CoordinateChart::BL:  return "BL";
+        case CoordinateChart::GKS: return "GKS";
+    }
+    return "BL";
+}
+
+static const char* chart_tag(CoordinateChart chart) {
+    switch (chart) {
+        case CoordinateChart::KS:  return "ks";
+        case CoordinateChart::BL:  return "bl";
+        case CoordinateChart::GKS: return "gks";
+    }
+    return "bl";
+}
+
+static CoordinateChart resolve_runtime_chart_cpu(CoordinateChart requested, double Lam, bool use_bundles) {
+    if (requested == CoordinateChart::GKS) {
+        if (use_bundles) return CoordinateChart::BL;
+        return (std::abs(Lam) <= 1e-15) ? CoordinateChart::KS : CoordinateChart::BL;
+    }
+    return requested;
+}
+
+static CoordinateChart resolve_runtime_chart_gpu(CoordinateChart requested, double Lam) {
+    if (requested == CoordinateChart::GKS)
+        return (std::abs(Lam) <= 1e-15) ? CoordinateChart::KS : CoordinateChart::BL;
+    return requested;
+}
 
 static const char* solver_mode_name(RaySolverMode mode) {
     switch (mode) {
@@ -277,7 +309,8 @@ static SolverSelection select_solver_mode(
 
 #if defined(USE_METAL)
 static bool metal_solver_supported(RaySolverMode mode, CoordinateChart chart, double Q_bh, double Lam) {
-    if (mode == RaySolverMode::STANDARD) return true;
+    if (mode == RaySolverMode::STANDARD)
+        return std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15;
     if (mode == RaySolverMode::SEMI_ANALYTIC)
         return chart == CoordinateChart::BL && std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15;
     if (mode == RaySolverMode::ELLIPTIC_CLOSED)
@@ -2029,27 +2062,50 @@ static std::vector<GeoPixel> trace_geodesics(
     if (fp.wormhole)
         return trace_geodesics_wormhole(W, H, fp, ctl, pixel_offset_x, pixel_offset_y, meta_out);
 
+    bool eff_use_bundles = use_bundles;
+    if (chart == CoordinateChart::GKS && eff_use_bundles && std::abs(Lam) > 1e-15) {
+        static bool warned_gks_disable_bundles = false;
+        if (!warned_gks_disable_bundles) {
+            std::cerr << "Info: GKS + Lambda != 0 currently disables ray bundles; using single-ray core.\n";
+            warned_gks_disable_bundles = true;
+        }
+        eff_use_bundles = false;
+    }
+
     KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
-    CoordinateChart eff_chart = chart;
-    if (eff_chart == CoordinateChart::KS && std::abs(Lam) > 1e-15) {
+    CoordinateChart eff_chart = resolve_runtime_chart_cpu(chart, Lam, eff_use_bundles);
+    if (chart == CoordinateChart::GKS) {
+        if (eff_use_bundles) {
+            static bool warned_gks_bundle = false;
+            if (!warned_gks_bundle) {
+                std::cerr << "Info: GKS + ray bundles currently use BL core on CPU.\n";
+                warned_gks_bundle = true;
+            }
+        } else if (std::abs(Lam) > 1e-15) {
+            static bool warned_gks_lambda = false;
+            if (!warned_gks_lambda) {
+                std::cerr << "Info: GKS selected BL core for Lambda != 0.\n";
+                warned_gks_lambda = true;
+            }
+        }
+    }
+    if (chart == CoordinateChart::KS && eff_chart == CoordinateChart::BL && std::abs(Lam) > 1e-15) {
         static bool warned_lam_ks = false;
         if (!warned_lam_ks) {
             std::cerr << "Info: KS chart currently supports Lambda=0 only; falling back to BL.\n";
             warned_lam_ks = true;
         }
-        eff_chart = CoordinateChart::BL;
     }
-    if (use_bundles && eff_chart == CoordinateChart::KS) {
+    if (chart == CoordinateChart::KS && eff_use_bundles && eff_chart == CoordinateChart::BL) {
         static bool warned_bundle_ks = false;
         if (!warned_bundle_ks) {
             std::cerr << "Info: Ray bundles currently run in BL chart; falling back to BL for --bundles.\n";
             warned_bundle_ks = true;
         }
-        eff_chart = CoordinateChart::BL;
     }
 
     const SolverSelection solver_sel = select_solver_mode(
-        solver_mode, use_bundles, eff_chart, Q_bh, Lam);
+        solver_mode, eff_use_bundles, eff_chart, Q_bh, Lam);
     if (solver_sel.fallback) {
         static bool warned_solver_fallback = false;
         if (!warned_solver_fallback) {
@@ -2067,7 +2123,7 @@ static std::vector<GeoPixel> trace_geodesics(
         }
     }
     const bool track_elliptic_fallbacks =
-        (!use_bundles && solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED);
+        (!eff_use_bundles && solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED);
     constexpr size_t elliptic_reason_count =
         static_cast<size_t>(EllipticFallbackReason::COUNT);
     std::array<std::atomic<uint64_t>, elliptic_reason_count> elliptic_fallback_by_reason{};
@@ -2098,7 +2154,7 @@ static std::vector<GeoPixel> trace_geodesics(
     auto trace_row = [&](int py) {
         for (int px_=0; px_<W; ++px_) {
             GeoPixel& pix = geo[py*W+px_];
-            if (use_bundles) {
+            if (eff_use_bundles) {
                 auto res = trace_bundle(px_, py, cam, g, r_disk_in, r_disk_out, r_escape,
                                         ctl.max_steps, ctl.step_init, ctl.tol,
                                         pixel_offset_x, pixel_offset_y);
@@ -2327,13 +2383,14 @@ static std::vector<RGB> render_image(
     (void)elliptic_fallback_black;
     (void)anti_fireflies;
 #if defined(USE_METAL)
+    const CoordinateChart chart_gpu = resolve_runtime_chart_gpu(chart, Lam);
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-    const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
-                              (chart == CoordinateChart::KS && ks_chart_supported);
+    const bool gpu_chart_ok = (chart_gpu == CoordinateChart::BL) ||
+                              (chart_gpu == CoordinateChart::KS && ks_chart_supported);
     const SolverSelection gpu_solver_sel = select_solver_mode(
-        solver_mode, use_bundles, chart, Q_bh, Lam);
+        solver_mode, use_bundles, chart_gpu, Q_bh, Lam);
     const RaySolverMode gpu_solver_mode = gpu_solver_sel.effective;
-    const bool solver_gpu_supported = metal_solver_supported(gpu_solver_mode, chart, Q_bh, Lam);
+    const bool solver_gpu_supported = metal_solver_supported(gpu_solver_mode, chart_gpu, Q_bh, Lam);
     const bool bundle_gpu_supported =
         use_bundles &&
         gpu_chart_ok &&
@@ -2353,7 +2410,7 @@ static std::vector<RGB> render_image(
         KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
                          (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
         CameraParams_C cpc{(float)cam.r_obs,(float)cam.theta_obs,(float)cam.phi_obs,(float)cam.fov_h,
-                           W,H,(chart==CoordinateChart::KS)?1:0,metal_solver_mode_code(gpu_solver_mode),
+                           W,H,(chart_gpu==CoordinateChart::KS)?1:0,metal_solver_mode_code(gpu_solver_mode),
                            (intg==Integrator::DOPRI5)?1:0,
                            use_bundles ? 1 : 0,
                            metal_kernel_mode_code(static_cast<MetalKernelMode>(metal_kernel_mode)),
@@ -2369,6 +2426,20 @@ static std::vector<RGB> render_image(
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
         auto px32 = metal_render(kpc, cpc, bg_ptr, bg_w, bg_h);
+        bool has_non_black = false;
+        for (uint32_t px : px32) {
+            if ((px & 0x00FFFFFFu) != 0u) {
+                has_non_black = true;
+                break;
+            }
+        }
+        if (!has_non_black) {
+            static bool warned_metal_black_frame = false;
+            if (!warned_metal_black_frame) {
+                std::cerr << "Info: Metal produced an all-black frame; using CPU fallback.\n";
+                warned_metal_black_frame = true;
+            }
+        } else {
         std::vector<RGB> image(W*H);
         for (int i=0;i<W*H;++i) {
             image[i].r=(px32[i])    &0xFF;
@@ -2376,6 +2447,7 @@ static std::vector<RGB> render_image(
             image[i].b=(px32[i]>>16)&0xFF;
         }
         return image;
+        }
     }
 
     static bool warned_metal_fallback = false;
@@ -2387,16 +2459,19 @@ static std::vector<RGB> render_image(
                           << " using CPU fallback (double precision).\n";
                 warned_metal_fp64_fallback = true;
             }
-        } else if (use_bundles && !gpu_chart_ok && chart == CoordinateChart::KS)
+        } else if (use_bundles && !gpu_chart_ok && chart_gpu == CoordinateChart::KS)
             std::cerr << "Info: Metal ray bundles on KS currently support Lambda=0 only; using CPU fallback for --bundles.\n";
         else if (use_bundles && gpu_solver_mode != RaySolverMode::STANDARD)
             std::cerr << "Info: Metal ray bundles currently support standard solver only; using CPU fallback for --bundles.\n";
         else if (use_bundles)
             std::cerr << "Info: Metal ray bundles fallback to CPU for this configuration.\n";
+        else if (gpu_solver_mode == RaySolverMode::STANDARD &&
+                 (std::abs(Q_bh) > 1e-15 || std::abs(Lam) > 1e-15))
+            std::cerr << "Info: Metal standard kernel currently supports Kerr only (Q=0, Lambda=0); using CPU fallback.\n";
         else if (!solver_gpu_supported)
             std::cerr << "Info: solver mode '" << solver_mode_name(gpu_solver_mode)
                       << "' on Metal is not available for this chart/metric; using CPU fallback.\n";
-        else if (chart == CoordinateChart::KS && !ks_chart_supported)
+        else if (chart_gpu == CoordinateChart::KS && !ks_chart_supported)
             std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
         else
             std::cerr << "Info: Metal backend using CPU fallback.\n";
@@ -2424,16 +2499,18 @@ static std::vector<RGB> render_image(
                      "Use --gpu-fp64 for strict capability checking/reporting.\n";
         warned_cuda_fp64_default = true;
     }
+    const CoordinateChart chart_gpu = resolve_runtime_chart_gpu(chart, Lam);
+    const bool gpu_metric_ok = (std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15);
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-    const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
-                              (chart == CoordinateChart::KS && ks_chart_supported);
-    if (!use_bundles && solver_mode == RaySolverMode::STANDARD && gpu_chart_ok && !fp.wormhole) {
+    const bool gpu_chart_ok = (chart_gpu == CoordinateChart::BL) ||
+                              (chart_gpu == CoordinateChart::KS && ks_chart_supported);
+    if (!use_bundles && solver_mode == RaySolverMode::STANDARD && gpu_chart_ok && gpu_metric_ok && !fp.wormhole) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
         KNdSParams_CUDA kpcuda{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,fp.disk_out};
         CameraParams_CUDA cpcuda{cam.r_obs,cam.theta_obs,cam.phi_obs,cam.fov_h,
-                                 W,H,(chart==CoordinateChart::KS)?1:0};
+                                 W,H,(chart_gpu==CoordinateChart::KS)?1:0};
         auto px32 = cuda_render(kpcuda, cpcuda, gpu_fp64);
         std::vector<RGB> image(W*H);
         for (int i=0;i<W*H;++i) {
@@ -2451,7 +2528,9 @@ static std::vector<RGB> render_image(
         else if (solver_mode != RaySolverMode::STANDARD)
             std::cerr << "Info: solver mode '" << solver_mode_name(solver_mode)
                       << "' on CUDA currently falls back to CPU.\n";
-        else if (chart == CoordinateChart::KS && !ks_chart_supported)
+        else if (!gpu_metric_ok)
+            std::cerr << "Info: CUDA standard kernel currently supports Kerr only (Q=0, Lambda=0); using CPU fallback.\n";
+        else if (chart_gpu == CoordinateChart::KS && !ks_chart_supported)
             std::cerr << "Info: KS chart on GPU currently supports Lambda=0 only; using CPU fallback.\n";
         else
             std::cerr << "Info: CUDA backend using CPU fallback.\n";
@@ -2605,10 +2684,12 @@ int main(int argc, char** argv) {
             gpu_fp64 = false;
         if (arg=="--bl")       chart=CoordinateChart::BL;
         if (arg=="--ks")       chart=CoordinateChart::KS;
+        if (arg=="--gks")      chart=CoordinateChart::GKS;
         if (arg=="--chart" && i+1<argc) {
             const std::string c = argv[++i];
             if (c=="bl" || c=="BL") chart=CoordinateChart::BL;
             else if (c=="ks" || c=="KS") chart=CoordinateChart::KS;
+            else if (c=="gks" || c=="GKS") chart=CoordinateChart::GKS;
         }
         if (arg=="--preview")  preview=true;
         if (arg=="--hd")       hd_preview=true;
@@ -2705,6 +2786,11 @@ int main(int argc, char** argv) {
     // ── Derived constants ────────────────────────────────────
     const double M_bh=1.0;
     const double Q_bh=arg_Q, Lam=arg_Lam;
+    if (chart == CoordinateChart::GKS && use_bundles && std::abs(Lam) > 1e-15) {
+        std::cerr << "Info: GKS + Lambda != 0 disables ray bundles in this build; running single-ray mode.\n";
+        use_bundles = false;
+        anti_fireflies = false;
+    }
 
     const int W = custom_w ? custom_w : res_4k ? 3840 : res_2k ? 2560
                 : res_720p ? 1280 : hd_preview ? 854 : preview ? 480 : 1920;
@@ -2759,26 +2845,26 @@ int main(int argc, char** argv) {
     };
 
     auto effective_chart_for_naming = [&](CoordinateChart requested)->CoordinateChart {
-        CoordinateChart eff = requested;
+        CoordinateChart eff = resolve_runtime_chart_gpu(requested, Lam);
         if (eff == CoordinateChart::KS && std::abs(Lam) > 1e-15)
             eff = CoordinateChart::BL;
         return eff;
     };
-    auto chart_tag = [](CoordinateChart c)->const char* {
-        return (c == CoordinateChart::KS) ? "ks" : "bl";
-    };
     auto integration_mode_tag = [&]()->std::string {
         const CoordinateChart eff_chart = effective_chart_for_naming(chart);
+        const char* out_chart_tag = (chart == CoordinateChart::GKS)
+            ? chart_tag(CoordinateChart::GKS)
+            : chart_tag(eff_chart);
         const SolverSelection sel = select_solver_mode(
             solver_mode, use_bundles, eff_chart, Q_bh, Lam);
 
         if (use_bundles)
-            return std::string(chart_tag(eff_chart)) + "-ray-bundle";
+            return std::string(out_chart_tag) + "-ray-bundle";
 
         if (sel.effective == RaySolverMode::SEMI_ANALYTIC)
-            return std::string(chart_tag(eff_chart)) + "-semi-analytic";
+            return std::string(out_chart_tag) + "-semi-analytic";
         if (sel.effective == RaySolverMode::ELLIPTIC_CLOSED) {
-            std::string tag = std::string(chart_tag(eff_chart)) + "-elliptic-closed";
+            std::string tag = std::string(out_chart_tag) + "-elliptic-closed";
             if (elliptic_fallback_black) tag += "-fallback-black";
             return tag;
         }
@@ -2804,17 +2890,18 @@ int main(int argc, char** argv) {
         const char* intg_tag = (ks_uses_rk4 || intg == Integrator::RK4_DOUBLING)
             ? "rk4"
             : "dopri5";
-        return std::string(chart_tag(eff_chart)) + "-standard-" + intg_tag;
+        return std::string(out_chart_tag) + "-standard-" + intg_tag;
     };
     auto backend_mode_tag = [&]()->const char* {
 #if defined(USE_METAL)
+        const CoordinateChart eff_chart = effective_chart_for_naming(chart);
         const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-        const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
-                                  (chart == CoordinateChart::KS && ks_chart_supported);
+        const bool gpu_chart_ok = (eff_chart == CoordinateChart::BL) ||
+                                  (eff_chart == CoordinateChart::KS && ks_chart_supported);
         const SolverSelection gpu_solver_sel = select_solver_mode(
-            solver_mode, use_bundles, chart, Q_bh, Lam);
+            solver_mode, use_bundles, eff_chart, Q_bh, Lam);
         const RaySolverMode gpu_solver_mode = gpu_solver_sel.effective;
-        const bool solver_gpu_supported = metal_solver_supported(gpu_solver_mode, chart, Q_bh, Lam);
+        const bool solver_gpu_supported = metal_solver_supported(gpu_solver_mode, eff_chart, Q_bh, Lam);
         const bool bundle_gpu_supported =
             use_bundles &&
             gpu_chart_ok &&
@@ -2828,9 +2915,10 @@ int main(int argc, char** argv) {
         const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported);
         return can_use_gpu ? "gpu-metal" : "cpu";
 #elif defined(USE_CUDA)
+        const CoordinateChart eff_chart = effective_chart_for_naming(chart);
         const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-        const bool gpu_chart_ok = (chart == CoordinateChart::BL) ||
-                                  (chart == CoordinateChart::KS && ks_chart_supported);
+        const bool gpu_chart_ok = (eff_chart == CoordinateChart::BL) ||
+                                  (eff_chart == CoordinateChart::KS && ks_chart_supported);
         const bool cuda_gpu_supported =
             !use_bundles &&
             solver_mode == RaySolverMode::STANDARD &&
@@ -2871,7 +2959,7 @@ int main(int argc, char** argv) {
                       << "  r_ISCO=" << g_info.r_isco() << "\n";
         }
         std::cout << "Mode: " << (fp.wormhole?"wormhole":use_bundles?"ray bundles":"single ray")
-                  << "  chart=" << (fp.wormhole?"wormhole":chart==CoordinateChart::KS?"KS":"BL")
+                  << "  chart=" << (fp.wormhole ? "wormhole" : chart_label(chart))
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
                   << "  " << (fp.wormhole?"rk4-adaptive":solver_mode_name(solver_mode))
                   << "  backend=" << (fp.wormhole?"cpu":backend_tag.c_str())

@@ -621,6 +621,15 @@ html, body {
   color: #7f7f7f;
 }
 
+.job-stats-row {
+  margin: 0 0 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 10px;
+  color: #686868;
+}
+
 .job-list-title {
   margin: 10px 0 6px;
   font-size: 10px;
@@ -865,6 +874,14 @@ html, body {
 // ── Animation panel ────────────────────────────────────────────
 .anim-panel {
   border-color: #1e1e1e;
+  overflow: hidden;
+}
+
+.anim-preset-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
 }
 
 .anim-section-label {
@@ -892,9 +909,17 @@ html, body {
 }
 
 .anim-sweep-inputs {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.anim-sweep-inputs .anim-sweep-input {
+  width: 100%;
+  min-width: 0;
 }
 
 .anim-arrow {

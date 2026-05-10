@@ -22,6 +22,7 @@ const BINARY_METAL_LEGACY = path.join(ROOT, 'build', 'kerr_tracer_metal');
 const BINARY_CUDA  = path.join(ROOT, 'build', 'kerr_tracer_cuda');
 const OUT_DIR      = path.join(ROOT, 'out');
 const THUMB_DIR    = path.join(OUT_DIR, '.thumbs');
+const QUEUE_STATE_FILE = path.join(OUT_DIR, '.queue_state.json');
 const ASSETS_DIR   = path.join(ROOT, 'assets', 'backgrounds');
 const DEFAULT_BACKGROUND = 'sfondo5.jpg';
 
@@ -70,9 +71,7 @@ const DEFAULT_DISK_OUT = 12;
 app.use(cors());
 app.use(express.json());
 app.use('/renders', express.static(OUT_DIR));
-if (!fs.existsSync(THUMB_DIR)) {
-  fs.mkdirSync(THUMB_DIR, { recursive: true });
-}
+fs.mkdirSync(THUMB_DIR, { recursive: true });
 
 // ── Render queue state ────────────────────────────────────────
 let activeJob = null;
@@ -80,9 +79,236 @@ let queuedJobs = [];
 let recentJobs = [];
 let nextJobId = 1;
 const MAX_RECENT_JOBS = 80;
+const QUEUE_STATE_VERSION = 1;
 
 function nowSeconds() {
   return Date.now() / 1000;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function readArgValue(args, flag) {
+  const idx = Array.isArray(args) ? args.indexOf(flag) : -1;
+  if (idx < 0 || idx + 1 >= args.length) return null;
+  return args[idx + 1];
+}
+
+function derivePixelCount(resolution, args) {
+  if (resolution === 'custom') {
+    const idx = Array.isArray(args) ? args.indexOf('--custom-res') : -1;
+    if (idx >= 0 && idx + 2 < args.length) {
+      const w = safeNumber(args[idx + 1], 0);
+      const h = safeNumber(args[idx + 2], 0);
+      if (w > 0 && h > 0) return Math.floor(w * h);
+    }
+  }
+  const dim = RESOLUTIONS[resolution] || RESOLUTIONS['1080p'];
+  return Math.floor(dim.w * dim.h);
+}
+
+function deriveCameraSpp(args) {
+  const val = safeNumber(readArgValue(args, '--camera-spp'), 1);
+  return Math.max(1, Math.floor(val));
+}
+
+function attachRenderMetrics(job) {
+  if (!job || job.kind !== 'render') return;
+  const pixelCount = derivePixelCount(job.resolution, job.args);
+  const spp = deriveCameraSpp(job.args);
+  const rayCount = pixelCount * spp;
+  job.pixelCount = pixelCount;
+  job.cameraSpp = spp;
+  job.rayCount = rayCount;
+  if (!Number.isFinite(job.donePixels)) job.donePixels = 0;
+  if (!Number.isFinite(job.doneRays)) job.doneRays = 0;
+  if (!Number.isFinite(job.throughputPixPerSec)) job.throughputPixPerSec = 0;
+  if (!Number.isFinite(job.throughputRaysPerSec)) job.throughputRaysPerSec = 0;
+  if (!Number.isFinite(job.etaSmoothedSec)) job.etaSmoothedSec = 0;
+}
+
+function smoothValue(prev, next, alpha = 0.25) {
+  if (!Number.isFinite(next) || next < 0) return Number.isFinite(prev) ? prev : 0;
+  if (!Number.isFinite(prev) || prev <= 0) return next;
+  return alpha * next + (1 - alpha) * prev;
+}
+
+function updateDerivedProgress(job, pct, elapsed, etaRaw) {
+  if (!job) return;
+  const clampedPct = Math.max(0, Math.min(100, safeNumber(pct, 0)));
+  const elapsedSafe = Math.max(0, safeNumber(elapsed, 0));
+  const etaSafe = Math.max(0, safeNumber(etaRaw, 0));
+
+  job.progressPct = clampedPct;
+  job.elapsedSec = elapsedSafe;
+  job.etaSec = etaSafe;
+
+  if (!Number.isFinite(job.pixelCount) || job.pixelCount <= 0) return;
+  const donePixels = (job.pixelCount * clampedPct) / 100.0;
+  const doneRays = (job.rayCount * clampedPct) / 100.0;
+  const instPixPerSec = elapsedSafe > 0 ? (donePixels / elapsedSafe) : 0;
+  const instRaysPerSec = elapsedSafe > 0 ? (doneRays / elapsedSafe) : 0;
+
+  job.donePixels = donePixels;
+  job.doneRays = doneRays;
+  job.throughputPixPerSec = smoothValue(job.throughputPixPerSec, instPixPerSec, 0.2);
+  job.throughputRaysPerSec = smoothValue(job.throughputRaysPerSec, instRaysPerSec, 0.2);
+  job.etaSmoothedSec = smoothValue(job.etaSmoothedSec, etaSafe, 0.3);
+}
+
+function cloneTextArray(arr, maxItems) {
+  if (!Array.isArray(arr)) return [];
+  const cleaned = arr
+    .map(v => String(v || '').trim())
+    .filter(Boolean);
+  if (!Number.isFinite(maxItems) || maxItems <= 0) return cleaned;
+  return cleaned.slice(-maxItems);
+}
+
+function buildTimestampCompact() {
+  return new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 15);
+}
+
+function makeGeoFilePath() {
+  return path.join(OUT_DIR, `geo_${buildTimestampCompact()}.kgeo`);
+}
+
+function rewriteCloneArgs(kind, args) {
+  if (!Array.isArray(args)) return [];
+  let out = args.slice();
+  if (kind === 'render' && !out.includes('--anim')) {
+    out = stripArgWithValue(out, '--geo-file');
+    out.push('--geo-file', makeGeoFilePath());
+  }
+  return out;
+}
+
+function serializeJobForState(job) {
+  if (!job) return null;
+  return {
+    id: safeNumber(job.id, 0),
+    kind: job.kind === 'colorize' ? 'colorize' : 'render',
+    status: String(job.status || 'queued'),
+    resolution: String(job.resolution || 'unknown'),
+    backend: String(job.backend || 'cpu'),
+    chart: String(job.chart || 'ks'),
+    binary: typeof job.binary === 'string' ? job.binary : '',
+    args: Array.isArray(job.args) ? job.args.map(v => String(v)) : [],
+    createdAt: job.createdAt || nowIso(),
+    startedAt: job.startedAt || null,
+    finishedAt: job.finishedAt || null,
+    progressPct: safeNumber(job.progressPct, 0),
+    elapsedSec: safeNumber(job.elapsedSec, 0),
+    etaSec: safeNumber(job.etaSec, 0),
+    etaSmoothedSec: safeNumber(job.etaSmoothedSec, 0),
+    throughputPixPerSec: safeNumber(job.throughputPixPerSec, 0),
+    throughputRaysPerSec: safeNumber(job.throughputRaysPerSec, 0),
+    pixelCount: safeNumber(job.pixelCount, 0),
+    rayCount: safeNumber(job.rayCount, 0),
+    cameraSpp: safeNumber(job.cameraSpp, 1),
+    donePixels: safeNumber(job.donePixels, 0),
+    doneRays: safeNumber(job.doneRays, 0),
+    code: job.code ?? null,
+    outputFile: job.outputFile || null,
+    previewFile: job.previewFile || null,
+    fallbackUsed: !!job.fallbackUsed,
+    warnings: cloneTextArray(job.warnings, 40),
+    logsTail: cloneTextArray(job.logsTail, 80),
+  };
+}
+
+function hydrateJobFromState(raw, defaultStatus = 'queued') {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = safeNumber(raw.id, 0);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  const kind = raw.kind === 'colorize' ? 'colorize' : 'render';
+  const backend = String(raw.backend || 'cpu');
+  let binary = typeof raw.binary === 'string' ? raw.binary : '';
+  if (!binary || !fs.existsSync(binary)) {
+    binary = resolveBinary(backend);
+  }
+  if (!binary || !fs.existsSync(binary)) return null;
+
+  const job = {
+    id: Math.floor(id),
+    kind,
+    status: String(raw.status || defaultStatus),
+    resolution: String(raw.resolution || 'unknown'),
+    backend,
+    chart: String(raw.chart || 'ks'),
+    binary,
+    args: Array.isArray(raw.args) ? raw.args.map(v => String(v)) : [],
+    createdAt: raw.createdAt || nowIso(),
+    startedAt: raw.startedAt || null,
+    finishedAt: raw.finishedAt || null,
+    progressPct: safeNumber(raw.progressPct, 0),
+    elapsedSec: safeNumber(raw.elapsedSec, 0),
+    etaSec: safeNumber(raw.etaSec, 0),
+    etaSmoothedSec: safeNumber(raw.etaSmoothedSec, 0),
+    throughputPixPerSec: safeNumber(raw.throughputPixPerSec, 0),
+    throughputRaysPerSec: safeNumber(raw.throughputRaysPerSec, 0),
+    pixelCount: safeNumber(raw.pixelCount, 0),
+    rayCount: safeNumber(raw.rayCount, 0),
+    cameraSpp: Math.max(1, Math.floor(safeNumber(raw.cameraSpp, 1))),
+    donePixels: safeNumber(raw.donePixels, 0),
+    doneRays: safeNumber(raw.doneRays, 0),
+    code: raw.code ?? null,
+    outputFile: raw.outputFile || null,
+    previewFile: raw.previewFile || null,
+    fallbackUsed: !!raw.fallbackUsed,
+    warnings: cloneTextArray(raw.warnings, 40),
+    logsTail: cloneTextArray(raw.logsTail, 80),
+  };
+  if (job.kind === 'render' && (!Number.isFinite(job.pixelCount) || job.pixelCount <= 0)) {
+    attachRenderMetrics(job);
+  }
+  return job;
+}
+
+function persistQueueState() {
+  const payload = {
+    version: QUEUE_STATE_VERSION,
+    savedAt: nowIso(),
+    nextJobId,
+    active: activeJob ? serializeJobForState(activeJob) : null,
+    queued: queuedJobs.map(j => serializeJobForState(j)).filter(Boolean),
+    recent: recentJobs.map(j => serializeJobForState(j)).filter(Boolean),
+  };
+  try {
+    fs.writeFileSync(QUEUE_STATE_FILE, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  } catch (err) {
+    console.warn(`[queue] cannot persist state: ${err.message}`);
+  }
+}
+
+function loadQueueState() {
+  if (!fs.existsSync(QUEUE_STATE_FILE)) return;
+  try {
+    const raw = JSON.parse(fs.readFileSync(QUEUE_STATE_FILE, 'utf8'));
+    const queued = Array.isArray(raw?.queued) ? raw.queued.map(v => hydrateJobFromState(v, 'queued')).filter(Boolean) : [];
+    const recent = Array.isArray(raw?.recent) ? raw.recent.map(v => hydrateJobFromState(v, 'done')).filter(Boolean) : [];
+    const restoredActive = hydrateJobFromState(raw?.active, 'running');
+    queuedJobs = queued.map(j => ({ ...j, status: 'queued' }));
+    recentJobs = recent.slice(0, MAX_RECENT_JOBS);
+    if (restoredActive) {
+      restoredActive.status = 'cancelled';
+      restoredActive.finishedAt = nowIso();
+      restoredActive.code = null;
+      restoredActive.warnings = [...(restoredActive.warnings || []), 'Recovered after restart: previous active job marked as cancelled'];
+      rememberRecentJob(restoredActive);
+    }
+    const maxSeenId = [0, ...queuedJobs.map(j => j.id), ...recentJobs.map(j => j.id)].reduce((acc, v) => Math.max(acc, safeNumber(v, 0)), 0);
+    const loadedNext = Math.floor(safeNumber(raw?.nextJobId, 1));
+    nextJobId = Math.max(maxSeenId + 1, loadedNext, 1);
+  } catch (err) {
+    console.warn(`[queue] cannot load state file: ${err.message}`);
+  }
 }
 
 function startProgressHeartbeat(job) {
@@ -95,7 +321,18 @@ function startProgressHeartbeat(job) {
     const elapsed = Math.max(0, nowSeconds() - job.startedAtSec);
     job.elapsedSec = elapsed;
     // Heartbeat progress: elapsed-only update (UI can show indeterminate bar).
-    broadcast({ type: 'progress', elapsed, jobId: job.id });
+    broadcast({
+      type: 'progress',
+      elapsed,
+      etaSmoothed: job.etaSmoothedSec || 0,
+      throughputPixPerSec: job.throughputPixPerSec || 0,
+      throughputRaysPerSec: job.throughputRaysPerSec || 0,
+      pixelCount: job.pixelCount || 0,
+      rayCount: job.rayCount || 0,
+      donePixels: job.donePixels || 0,
+      doneRays: job.doneRays || 0,
+      jobId: job.id,
+    });
     broadcastQueueSnapshot();
   }, 1000);
 }
@@ -131,6 +368,14 @@ function buildQueueSnapshot() {
     progressPct: Number.isFinite(j.progressPct) ? j.progressPct : 0,
     elapsedSec: Number.isFinite(j.elapsedSec) ? j.elapsedSec : 0,
     etaSec: Number.isFinite(j.etaSec) ? j.etaSec : 0,
+    etaSmoothedSec: Number.isFinite(j.etaSmoothedSec) ? j.etaSmoothedSec : 0,
+    throughputPixPerSec: Number.isFinite(j.throughputPixPerSec) ? j.throughputPixPerSec : 0,
+    throughputRaysPerSec: Number.isFinite(j.throughputRaysPerSec) ? j.throughputRaysPerSec : 0,
+    pixelCount: Number.isFinite(j.pixelCount) ? j.pixelCount : 0,
+    rayCount: Number.isFinite(j.rayCount) ? j.rayCount : 0,
+    cameraSpp: Number.isFinite(j.cameraSpp) ? j.cameraSpp : 1,
+    donePixels: Number.isFinite(j.donePixels) ? j.donePixels : 0,
+    doneRays: Number.isFinite(j.doneRays) ? j.doneRays : 0,
     code: j.code ?? null,
     outputFile: j.outputFile || null,
     previewFile: j.previewFile || null,
@@ -160,6 +405,7 @@ function rememberRecentJob(job) {
   if (recentJobs.length > MAX_RECENT_JOBS) {
     recentJobs = recentJobs.slice(0, MAX_RECENT_JOBS);
   }
+  persistQueueState();
 }
 
 function extractSavedFileFromStdoutChunk(chunkText) {
@@ -226,6 +472,7 @@ function runAuxPreviewJob(job) {
       }
       broadcast({ type: 'job_preview', jobId: job.id, file: job.previewFile });
       broadcastQueueSnapshot();
+      persistQueueState();
     }
   });
   p.on('error', () => {
@@ -237,6 +484,7 @@ function startNextQueuedJob() {
   if (activeJob || queuedJobs.length === 0) return;
   const job = queuedJobs.shift();
   if (!job) return;
+  attachRenderMetrics(job);
 
   job.status = 'running';
   job.startedAt = new Date().toISOString();
@@ -245,6 +493,11 @@ function startNextQueuedJob() {
   job.progressPct = 0;
   job.elapsedSec = 0;
   job.etaSec = 0;
+  job.etaSmoothedSec = 0;
+  job.throughputPixPerSec = 0;
+  job.throughputRaysPerSec = 0;
+  job.donePixels = 0;
+  job.doneRays = 0;
   job.logsTail = [];
   job.warnings = [];
   job.fallbackUsed = false;
@@ -256,6 +509,7 @@ function startNextQueuedJob() {
 
   broadcast({ type: 'start', args: job.args, resolution: job.resolution, jobId: job.id });
   broadcastQueueSnapshot();
+  persistQueueState();
   runAuxPreviewJob(job);
 
   proc.stdout.on('data', chunk => {
@@ -277,17 +531,28 @@ function startNextQueuedJob() {
     const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
     if (match) {
       job.hasRealProgress = true;
-      job.progressPct = parseInt(match[1], 10);
-      job.elapsedSec = parseFloat(match[2]);
-      job.etaSec = parseFloat(match[3]);
+      updateDerivedProgress(
+        job,
+        parseInt(match[1], 10),
+        parseFloat(match[2]),
+        parseFloat(match[3])
+      );
       broadcast({
         type: 'progress',
         pct: job.progressPct,
         elapsed: job.elapsedSec,
         eta: job.etaSec,
+        etaSmoothed: job.etaSmoothedSec,
+        throughputPixPerSec: job.throughputPixPerSec,
+        throughputRaysPerSec: job.throughputRaysPerSec,
+        pixelCount: job.pixelCount,
+        rayCount: job.rayCount,
+        donePixels: job.donePixels,
+        doneRays: job.doneRays,
         jobId: job.id,
       });
       broadcastQueueSnapshot();
+      persistQueueState();
     }
     markFallbackFromLine(job, raw);
     const tail = tailLines(raw, 12);
@@ -309,6 +574,7 @@ function startNextQueuedJob() {
 
     broadcast({ type: 'done', code, file: job.outputFile || null, jobId: job.id });
     activeJob = null;
+    persistQueueState();
     broadcastQueueSnapshot();
     startNextQueuedJob();
   });
@@ -327,10 +593,44 @@ function enqueueJob(job) {
     warnings: [],
     fallbackUsed: false,
   };
+  attachRenderMetrics(next);
   queuedJobs.push(next);
+  persistQueueState();
   broadcastQueueSnapshot();
   startNextQueuedJob();
   return next;
+}
+
+function findRecentJobById(jobId) {
+  return recentJobs.find(j => j.id === jobId) || null;
+}
+
+function enqueueFromRecentJobId(jobId) {
+  const source = findRecentJobById(jobId);
+  if (!source) {
+    return { error: `Recent job ${jobId} not found`, code: 404 };
+  }
+  const backend = String(source.backend || 'cpu');
+  const binary = (typeof source.binary === 'string' && fs.existsSync(source.binary))
+    ? source.binary
+    : resolveBinary(backend);
+  if (!binary || !fs.existsSync(binary)) {
+    return { error: `Binary unavailable for backend ${backend}`, code: 503 };
+  }
+  const args = rewriteCloneArgs(source.kind, source.args);
+  if (!Array.isArray(args) || args.length === 0) {
+    return { error: `Recent job ${jobId} has no reproducible arguments`, code: 400 };
+  }
+  const enqueued = enqueueJob({
+    kind: source.kind === 'colorize' ? 'colorize' : 'render',
+    binary,
+    args,
+    resolution: source.resolution || 'unknown',
+    backend,
+    chart: source.chart || 'ks',
+    clonedFromId: source.id,
+  });
+  return { enqueued, source };
 }
 
 function latestOutputFile() {
@@ -380,7 +680,8 @@ function parseRenderMeta(fileName) {
   else if (lower.includes('_cpu_') || lower.endsWith('_cpu.png') || lower.includes('_cpu-')) backend = 'cpu';
 
   let chart = 'unknown';
-  if (lower.includes('_ks-') || lower.includes('_ks_')) chart = 'ks';
+  if (lower.includes('_gks-') || lower.includes('_gks_')) chart = 'gks';
+  else if (lower.includes('_ks-') || lower.includes('_ks_')) chart = 'ks';
   else if (lower.includes('_bl-') || lower.includes('_bl_')) chart = 'bl';
 
   let rayMode = 'single_ray';
@@ -470,6 +771,8 @@ function ensureRenderThumbnail(sourceFilePath, sourceName, widthPx) {
   }
   return null;
 }
+
+loadQueueState();
 
 // ── WebSocket ─────────────────────────────────────────────────
 wss.on('connection', ws => {
@@ -723,6 +1026,7 @@ app.post('/api/render', (req, res) => {
   }
   args.push('--solver-mode', solverMode);
   if (p.integration_chart === 'bl') args.push('--bl');
+  else if (p.integration_chart === 'gks') args.push('--gks');
   else args.push('--ks');
   // Keep disk-ray intersection on Hermite by default for smoother event localization.
   args.push('--intersection-hermite');
@@ -805,7 +1109,7 @@ app.post('/api/render', (req, res) => {
     args,
     resolution: res_key,
     backend: String(p.backend || 'cpu'),
-    chart: p.integration_chart === 'bl' ? 'bl' : 'ks',
+    chart: p.integration_chart === 'bl' ? 'bl' : (p.integration_chart === 'gks' ? 'gks' : 'ks'),
   });
   const queuePosition = activeJob && activeJob.id === enqueued.id
     ? 0
@@ -827,6 +1131,7 @@ app.post('/api/cancel', (req, res) => {
     if (activeJob && activeJob.id === wantedId) {
       activeJob.cancelRequested = true;
       activeJob.proc?.kill('SIGTERM');
+      persistQueueState();
       return res.json({ status: 'cancelling', jobId: wantedId, active: true });
     }
     const idx = queuedJobs.findIndex(j => j.id === wantedId);
@@ -836,6 +1141,7 @@ app.post('/api/cancel', (req, res) => {
       removed.finishedAt = new Date().toISOString();
       removed.code = null;
       rememberRecentJob(removed);
+      persistQueueState();
       broadcastQueueSnapshot();
       return res.json({ status: 'cancelled', jobId: wantedId, active: false });
     }
@@ -845,6 +1151,7 @@ app.post('/api/cancel', (req, res) => {
   if (activeJob) {
     activeJob.cancelRequested = true;
     activeJob.proc?.kill('SIGTERM');
+    persistQueueState();
     return res.json({ status: 'cancelling', jobId: activeJob.id, active: true });
   }
   if (queuedJobs.length > 0) {
@@ -853,6 +1160,7 @@ app.post('/api/cancel', (req, res) => {
     removed.finishedAt = new Date().toISOString();
     removed.code = null;
     rememberRecentJob(removed);
+    persistQueueState();
     broadcastQueueSnapshot();
     return res.json({ status: 'cancelled', jobId: removed.id, active: false });
   }
@@ -878,8 +1186,55 @@ app.post('/api/queue/reorder', (req, res) => {
   const tmp = queuedJobs[idx];
   queuedJobs[idx] = queuedJobs[newIdx];
   queuedJobs[newIdx] = tmp;
+  persistQueueState();
   broadcastQueueSnapshot();
   return res.json({ status: 'ok', jobId, direction });
+});
+
+// ── POST /api/queue/retry ─────────────────────────────────────
+app.post('/api/queue/retry', (req, res) => {
+  const jobId = Number(req.body?.jobId);
+  if (!Number.isFinite(jobId)) {
+    return res.status(400).json({ error: 'jobId required' });
+  }
+  const result = enqueueFromRecentJobId(jobId);
+  if (result.error) {
+    return res.status(result.code || 400).json({ error: result.error });
+  }
+  const enqueued = result.enqueued;
+  const queuePosition = activeJob && activeJob.id === enqueued.id
+    ? 0
+    : queuedJobs.findIndex(j => j.id === enqueued.id) + 1;
+  return res.json({
+    status: queuePosition === 0 ? 'started' : 'queued',
+    action: 'retry',
+    sourceJobId: jobId,
+    jobId: enqueued.id,
+    queuePosition,
+  });
+});
+
+// ── POST /api/queue/duplicate ─────────────────────────────────
+app.post('/api/queue/duplicate', (req, res) => {
+  const jobId = Number(req.body?.jobId);
+  if (!Number.isFinite(jobId)) {
+    return res.status(400).json({ error: 'jobId required' });
+  }
+  const result = enqueueFromRecentJobId(jobId);
+  if (result.error) {
+    return res.status(result.code || 400).json({ error: result.error });
+  }
+  const enqueued = result.enqueued;
+  const queuePosition = activeJob && activeJob.id === enqueued.id
+    ? 0
+    : queuedJobs.findIndex(j => j.id === enqueued.id) + 1;
+  return res.json({
+    status: queuePosition === 0 ? 'started' : 'queued',
+    action: 'duplicate',
+    sourceJobId: jobId,
+    jobId: enqueued.id,
+    queuePosition,
+  });
 });
 
 // ── Start ─────────────────────────────────────────────────────

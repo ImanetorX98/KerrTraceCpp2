@@ -16,7 +16,7 @@ export interface RenderParams {
   fov: number;
   // Options
   backend: string;
-  integration_chart: 'ks' | 'bl';
+  integration_chart: 'ks' | 'bl' | 'gks';
   solver_mode: 'standard' | 'semi_analytic' | 'elliptic_closed';
   semi_analytic: boolean;
   bundles: boolean;
@@ -66,13 +66,21 @@ export interface QueueJobState {
   status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
   resolution: string;
   backend: string;
-  chart: 'ks' | 'bl' | 'unknown';
+  chart: 'ks' | 'bl' | 'gks' | 'unknown';
   createdAt: string;
   startedAt?: string | null;
   finishedAt?: string | null;
   progressPct?: number;
   elapsedSec?: number;
   etaSec?: number;
+  etaSmoothedSec?: number;
+  throughputPixPerSec?: number;
+  throughputRaysPerSec?: number;
+  pixelCount?: number;
+  rayCount?: number;
+  cameraSpp?: number;
+  donePixels?: number;
+  doneRays?: number;
   code?: number | null;
   outputFile?: string | null;
   previewFile?: string | null;
@@ -94,6 +102,13 @@ export interface WsMessage {
   pct?: number;
   elapsed?: number;
   eta?: number;
+  etaSmoothed?: number;
+  throughputPixPerSec?: number;
+  throughputRaysPerSec?: number;
+  pixelCount?: number;
+  rayCount?: number;
+  donePixels?: number;
+  doneRays?: number;
   code?: number;
   file?: string;
   line?: string;
@@ -115,7 +130,7 @@ export interface RenderFile {
 export interface RenderFileMeta {
   resolution: string;
   backend: 'cpu' | 'metal' | 'cuda' | 'unknown';
-  chart: 'ks' | 'bl' | 'unknown';
+  chart: 'ks' | 'bl' | 'gks' | 'unknown';
   rayMode?: 'single_ray' | 'ray_bundle';
   solver?: 'standard' | 'semi_analytic' | 'elliptic_closed';
 }
@@ -123,7 +138,7 @@ export interface RenderFileMeta {
 export interface RenderMeta extends RenderFile {
   resolution: string;
   backend: 'cpu' | 'metal' | 'cuda' | 'unknown';
-  chart: 'ks' | 'bl' | 'unknown';
+  chart: 'ks' | 'bl' | 'gks' | 'unknown';
 }
 
 export interface GeoFile {
@@ -255,6 +270,14 @@ export class RenderService {
 
   reorderQueue(jobId: number, direction: 'up' | 'down') {
     return this.http.post<{ status: string }>('/api/queue/reorder', { jobId, direction });
+  }
+
+  retryRecentJob(jobId: number) {
+    return this.http.post<{ status: string; action: 'retry'; jobId?: number; queuePosition?: number }>('/api/queue/retry', { jobId });
+  }
+
+  duplicateRecentJob(jobId: number) {
+    return this.http.post<{ status: string; action: 'duplicate'; jobId?: number; queuePosition?: number }>('/api/queue/duplicate', { jobId });
   }
 
   getGeoFiles() {

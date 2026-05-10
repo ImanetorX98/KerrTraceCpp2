@@ -25,7 +25,7 @@ import {
 interface RenderMetaLite {
   resolution: string;
   backend: 'cpu' | 'metal' | 'cuda' | 'unknown';
-  chart: 'ks' | 'bl' | 'unknown';
+  chart: 'ks' | 'bl' | 'gks' | 'unknown';
 }
 
 interface SavedPreset {
@@ -50,7 +50,7 @@ export class App implements OnInit, OnDestroy {
   readonly supersamplingLevels = [1, 2, 3, 4, 6, 8, 12, 16];
   readonly historyResolutionOptions = ['all', '144p', '256p', '480p', '512p', '720p', '1080p', '2K', '4K', 'custom'];
   readonly historyBackendOptions = ['all', 'cpu', 'metal', 'cuda'];
-  readonly historyChartOptions = ['all', 'ks', 'bl'];
+  readonly historyChartOptions = ['all', 'ks', 'gks', 'bl'];
   readonly historyTypeOptions = [
     'all',
     'single_ray',
@@ -233,7 +233,9 @@ export class App implements OnInit, OnDestroy {
           if (typeof msg.elapsed === 'number') {
             this.elapsed.set(msg.elapsed);
           }
-          if (typeof msg.eta === 'number') {
+          if (typeof msg.etaSmoothed === 'number') {
+            this.eta.set(msg.etaSmoothed);
+          } else if (typeof msg.eta === 'number') {
             this.eta.set(msg.eta);
           }
           break;
@@ -293,6 +295,50 @@ export class App implements OnInit, OnDestroy {
   setSceneMode(mode: 'black_hole' | 'wormhole') {
     this.params.scene_mode = mode;
     this.params.wormhole = (mode === 'wormhole');
+  }
+
+  applyAnimationPreset(mode: 'black_hole' | 'wormhole') {
+    this.params.anim = true;
+    this.setSceneMode(mode);
+
+    if (mode === 'black_hole') {
+      this.params.anim_frames = 180;
+      this.params.anim_fps = 30;
+      this.params.anim_crf = 18;
+      this.params.anim_orbits = 1;
+      this.params.anim_ease = true;
+      this.params.anim_a_start = 0.7;
+      this.params.anim_a_end = 0.7;
+      this.params.anim_theta_start = 80;
+      this.params.anim_theta_end = 80;
+      this.params.anim_phi_start = 0;
+      this.params.anim_phi_end = 360;
+      this.params.anim_r_start = 60;
+      this.params.anim_r_end = 60;
+      this.params.anim_disk_start = 12;
+      this.params.anim_disk_end = 12;
+      return;
+    }
+
+    // Wormhole preset: no spin sweep, camera-forward pass with moderate pan.
+    this.params.wh_rho = 1.0;
+    this.params.wh_M_lens = 1.0;
+    this.params.wh_a_tunnel = 0.01;
+    this.params.anim_frames = 220;
+    this.params.anim_fps = 30;
+    this.params.anim_crf = 18;
+    this.params.anim_orbits = 0.5;
+    this.params.anim_ease = true;
+    this.params.anim_a_start = this.params.a;
+    this.params.anim_a_end = this.params.a;
+    this.params.anim_theta_start = 78;
+    this.params.anim_theta_end = 78;
+    this.params.anim_phi_start = -40;
+    this.params.anim_phi_end = 40;
+    this.params.anim_r_start = 60;
+    this.params.anim_r_end = 20;
+    this.params.anim_disk_start = this.params.disk_out;
+    this.params.anim_disk_end = this.params.disk_out;
   }
 
   toggleBundles() {
@@ -616,7 +662,8 @@ export class App implements OnInit, OnDestroy {
     else if (lower.includes('_cpu_') || lower.endsWith('_cpu.png') || lower.includes('_cpu-')) backend = 'cpu';
 
     let chart: RenderMetaLite['chart'] = 'unknown';
-    if (lower.includes('_ks-') || lower.includes('_ks_')) chart = 'ks';
+    if (lower.includes('_gks-') || lower.includes('_gks_')) chart = 'gks';
+    else if (lower.includes('_ks-') || lower.includes('_ks_')) chart = 'ks';
     else if (lower.includes('_bl-') || lower.includes('_bl_')) chart = 'bl';
 
     return { resolution, backend, chart };
@@ -659,6 +706,26 @@ export class App implements OnInit, OnDestroy {
   moveQueuedJob(jobId: number, direction: 'up' | 'down') {
     this.svc.reorderQueue(jobId, direction).subscribe({
       next: () => this.loadQueueState(),
+      error: err => console.error(err),
+    });
+  }
+
+  retryRecentJob(jobId: number) {
+    this.svc.retryRecentJob(jobId).subscribe({
+      next: rsp => {
+        this.logLines.update(l => [...l.slice(-49), `Retry queued #${rsp.jobId ?? '?'} from recent #${jobId}`]);
+        this.loadQueueState();
+      },
+      error: err => console.error(err),
+    });
+  }
+
+  duplicateRecentJob(jobId: number) {
+    this.svc.duplicateRecentJob(jobId).subscribe({
+      next: rsp => {
+        this.logLines.update(l => [...l.slice(-49), `Duplicate queued #${rsp.jobId ?? '?'} from recent #${jobId}`]);
+        this.loadQueueState();
+      },
       error: err => console.error(err),
     });
   }
@@ -771,5 +838,10 @@ export class App implements OnInit, OnDestroy {
 
   fmtInt(v: number): string {
     return new Intl.NumberFormat('it-IT').format(Math.floor(v));
+  }
+
+  fmtRate(v: number): string {
+    if (!Number.isFinite(v) || v <= 0) return '0';
+    return new Intl.NumberFormat('it-IT', { maximumFractionDigits: 0 }).format(v);
   }
 }
