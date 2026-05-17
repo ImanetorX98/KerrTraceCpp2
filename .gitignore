@@ -25,3 +25,4 @@ frontend/.angular/
 .vscode/
 .idea/
 *.swp
+.worktrees/
