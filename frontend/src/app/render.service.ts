@@ -29,10 +29,28 @@ export interface RenderParams {
   camera_spp: number;
   background: string;
   // Disk palette
-  disk_palette: 'blackbody' | 'interstellar';
+  disk_palette: 'blackbody' | 'stratified' | 'interstellar';
+  disk_brightness: number;
+  disk_opacity: number;
   disk_rings: number;
   disk_sectors: number;
   disk_sigma: number;
+  disk_hue_offset: number;
+  interstellar_omega0: number;
+  interstellar_p: number;
+  interstellar_inner_falloff_scale: number;
+  interstellar_band_strength: number;
+  interstellar_band_frequency: number;
+  interstellar_band_warp: number;
+  interstellar_turbulence_strength: number;
+  interstellar_hdr_intensity: number;
+  interstellar_softness_in_scale: number;
+  interstellar_softness_out_scale: number;
+  interstellar_edge_transparency: number;
+  interstellar_time: number;
+  interstellar_outer_r: number;
+  interstellar_outer_g: number;
+  interstellar_outer_b: number;
   // Scene mode
   scene_mode: 'black_hole' | 'wormhole';
   // Wormhole (DNEG metric)

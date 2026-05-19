@@ -66,7 +66,7 @@ export class App implements OnInit, OnDestroy {
   // ── Render parameters ─────────────────────────────────────────
   params: RenderParams = {
     resolution: '720p',
-    a: 0.7,
+    a: 0.5,
     q: 0.0,
     lambda: 0.0,
     disk_out: 12,
@@ -85,13 +85,31 @@ export class App implements OnInit, OnDestroy {
     max_steps: 60000,
     step_init: 1.0,
     integrator_tol: 2e-5,
-    camera_spp: 2,
+    camera_spp: 1,
     background: 'black.png',
     scene_mode: 'black_hole',
     disk_palette: 'blackbody',
+    disk_brightness: 1.0,
+    disk_opacity: 1.0,
     disk_rings: 7,
     disk_sectors: 14,
     disk_sigma: 0.5,
+    disk_hue_offset: 0.0,
+    interstellar_omega0: 1.0,
+    interstellar_p: 2.2,
+    interstellar_inner_falloff_scale: 0.7,
+    interstellar_band_strength: 0.18,
+    interstellar_band_frequency: 20.0,
+    interstellar_band_warp: 2.0,
+    interstellar_turbulence_strength: 1.0,
+    interstellar_hdr_intensity: 4.0,
+    interstellar_softness_in_scale: 0.08,
+    interstellar_softness_out_scale: 0.15,
+    interstellar_edge_transparency: 0.02,
+    interstellar_time: 0.0,
+    interstellar_outer_r: 0.16,
+    interstellar_outer_g: 0.045,
+    interstellar_outer_b: 0.018,
     wormhole: false,
     wh_rho: 1.0,
     wh_M_lens: 1.0,
@@ -103,8 +121,8 @@ export class App implements OnInit, OnDestroy {
     anim_crf: 18,
     anim_orbits: 1,
     anim_ease: true,
-    anim_a_start: 0.7,
-    anim_a_end: 0.7,
+    anim_a_start: 0.5,
+    anim_a_end: 0.5,
     anim_theta_start: 80,
     anim_theta_end: 80,
     anim_phi_start: 0,
@@ -174,6 +192,7 @@ export class App implements OnInit, OnDestroy {
 
   private sub: Subscription | null = null;
   private statusPollTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly chartEpsilon = 1e-12;
 
   constructor(readonly svc: RenderService) {}
 
@@ -187,6 +206,7 @@ export class App implements OnInit, OnDestroy {
   }
 
   ngOnInit() {
+    this.syncIntegrationChartForMetric(true);
     this.updateViewportFlag();
     this.loadPresets();
     this.svc.getInfo().subscribe(info => {
@@ -295,6 +315,9 @@ export class App implements OnInit, OnDestroy {
   setSceneMode(mode: 'black_hole' | 'wormhole') {
     this.params.scene_mode = mode;
     this.params.wormhole = (mode === 'wormhole');
+    if (mode === 'black_hole') {
+      this.syncIntegrationChartForMetric(true);
+    }
   }
 
   applyAnimationPreset(mode: 'black_hole' | 'wormhole') {
@@ -365,8 +388,7 @@ export class App implements OnInit, OnDestroy {
   }
 
   isEllipticClosedAvailable(): boolean {
-    const eps = 1e-12;
-    return Math.abs(this.params.q) <= eps && Math.abs(this.params.lambda) <= eps;
+    return Math.abs(this.params.q) <= this.chartEpsilon && Math.abs(this.params.lambda) <= this.chartEpsilon;
   }
 
   setCharge(v: number) {
@@ -379,9 +401,27 @@ export class App implements OnInit, OnDestroy {
     this.enforceSolverConstraints();
   }
 
+  selectIntegrationChart(chart: 'ks' | 'gks' | 'bl') {
+    this.params.integration_chart = chart;
+    this.enforceSolverConstraints();
+  }
+
   private enforceSolverConstraints() {
+    this.syncIntegrationChartForMetric(true);
     if (!this.isEllipticClosedAvailable() && this.params.solver_mode === 'elliptic_closed') {
       this.params.solver_mode = 'standard';
+    }
+  }
+
+  private expectedIntegrationChartForMetric(): 'ks' | 'gks' {
+    return this.isEllipticClosedAvailable() ? 'ks' : 'gks';
+  }
+
+  private syncIntegrationChartForMetric(force = false) {
+    if (this.params.scene_mode !== 'black_hole') return;
+    const expected = this.expectedIntegrationChartForMetric();
+    if (force || this.params.integration_chart === 'ks' || this.params.integration_chart === 'gks') {
+      this.params.integration_chart = expected;
     }
   }
 

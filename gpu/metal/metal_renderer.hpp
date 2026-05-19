@@ -33,6 +33,26 @@ struct CameraParams_C {
     float integrator_tol; // adaptive integrator tolerance
     float pixel_offset_x; // subpixel X offset in pixel units
     float pixel_offset_y; // subpixel Y offset in pixel units
+    float exposure; // tonemap exposure
+    float gamma; // tonemap gamma
+    float disk_brightness; // common disk brightness multiplier
+    float disk_opacity; // common disk opacity [0,1] shared by all palettes
+    int   disk_palette; // 0=blackbody, 1=stratified, 2=interstellar
+    float interstellar_omega0;
+    float interstellar_p;
+    float interstellar_inner_falloff_scale;
+    float interstellar_band_strength;
+    float interstellar_band_frequency;
+    float interstellar_band_warp;
+    float interstellar_turbulence_strength;
+    float interstellar_hdr_intensity;
+    float interstellar_softness_in_scale;
+    float interstellar_softness_out_scale;
+    float interstellar_edge_transparency;
+    float interstellar_outer_r;
+    float interstellar_outer_g;
+    float interstellar_outer_b;
+    float interstellar_time;
 };
 
 /// Renders the image on the default Metal GPU device.

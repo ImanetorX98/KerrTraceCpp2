@@ -8,6 +8,8 @@
 #import <Metal/Metal.h>
 #include "metal_renderer.hpp"
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -231,6 +233,11 @@ std::vector<uint32_t> metal_render(
         }
     }
 
+    const size_t total_tiles = tiles.size();
+    size_t done_tiles = 0;
+    const long long total_pixels = (long long)cp.width * cp.height;
+    const auto t0 = std::chrono::steady_clock::now();
+
     for (size_t i = 0; i < tiles.size();) {
         const Tile t = tiles[i];
         const RenderParams_C rp{
@@ -264,6 +271,26 @@ std::vector<uint32_t> metal_render(
 
         if (cmd.status == MTLCommandBufferStatusCompleted) {
             ++i;
+            ++done_tiles;
+            // Emit progress in the same format the CPU renderer uses so the
+            // server and frontend can track it.
+            if (total_tiles > 0) {
+                const int pct = (int)(done_tiles * 100 / total_tiles);
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double>(now - t0).count();
+                const double eta = (done_tiles < total_tiles && elapsed > 0.0)
+                    ? elapsed * (double)(total_tiles - done_tiles) / (double)done_tiles
+                    : 0.0;
+                // Build a fixed-width bar (40 chars)
+                const int bar_fill = (int)(pct * 40 / 100);
+                char bar[41];
+                for (int b = 0; b < 40; ++b) bar[b] = (b < bar_fill) ? '#' : '-';
+                bar[40] = '\0';
+                fprintf(stderr, "\r[%s] %3d%%  %.1fs elapsed, %.1fs ETA   ",
+                        bar, pct, elapsed, eta);
+                fflush(stderr);
+                if (done_tiles == total_tiles) fprintf(stderr, "\n");
+            }
             continue;
         }
 

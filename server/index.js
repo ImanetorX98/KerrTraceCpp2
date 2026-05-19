@@ -18,6 +18,7 @@ const wss    = new WebSocket.Server({ server, path: '/ws' });
 const ROOT         = path.resolve(__dirname, '..');
 const BINARY_MAIN  = path.join(ROOT, 'build', 'kerr_tracer');
 const BINARY_CPU_ONLY = path.join(ROOT, 'build_cpu', 'kerr_tracer');
+const BINARY_METAL_CPU = path.join(ROOT, 'build_cpu', 'kerr_tracer_metal');
 const BINARY_METAL_LEGACY = path.join(ROOT, 'build', 'kerr_tracer_metal');
 const BINARY_CUDA  = path.join(ROOT, 'build', 'kerr_tracer_cuda');
 const OUT_DIR      = path.join(ROOT, 'out');
@@ -35,8 +36,8 @@ function firstExisting(paths) {
 
 // Prefer dedicated CPU build when available.
 const BINARY_CPU = firstExisting([BINARY_CPU_ONLY, BINARY_MAIN]);
-// Prefer unified up-to-date build for Metal; legacy target is fallback only.
-const BINARY_METAL = firstExisting([BINARY_MAIN, BINARY_METAL_LEGACY]);
+// Prefer Metal binary built in build_cpu (kept most up-to-date in this workflow).
+const BINARY_METAL = firstExisting([BINARY_METAL_CPU, BINARY_MAIN, BINARY_METAL_LEGACY]);
 
 function resolveBinary(backend) {
   if (backend === 'metal' && BINARY_METAL) return BINARY_METAL;
@@ -425,16 +426,59 @@ function markFallbackFromLine(job, line) {
   }
 }
 
-function stripArgWithValue(args, flag) {
+function stripArgWithValue(args, flag, valueCount = 1) {
+  const skip = Math.max(0, Math.floor(Number(valueCount) || 0));
   const out = [];
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === flag) {
-      i += 1;
+      i += skip;
       continue;
     }
     out.push(args[i]);
   }
   return out;
+}
+
+function parseProgressFromChunk(job, chunkText) {
+  if (!job || !chunkText) return;
+  // Render progress is printed with carriage-return updates; chunks can split
+  // in the middle of a progress line. Keep a rolling buffer and parse matches
+  // across chunk boundaries.
+  const prev = typeof job.stderrCarry === 'string' ? job.stderrCarry : '';
+  const merged = `${prev}${String(chunkText)}`;
+  job.stderrCarry = merged.slice(-1024);
+
+  const progressRe = /\]\s+(\d+)%\s+([\d.]+)s elapsed,\s+([\d.]+)s ETA/g;
+  let m;
+  let last = null;
+  while ((m = progressRe.exec(merged)) !== null) {
+    last = m;
+  }
+  if (!last) return;
+
+  job.hasRealProgress = true;
+  updateDerivedProgress(
+    job,
+    parseInt(last[1], 10),
+    parseFloat(last[2]),
+    parseFloat(last[3])
+  );
+  broadcast({
+    type: 'progress',
+    pct: job.progressPct,
+    elapsed: job.elapsedSec,
+    eta: job.etaSec,
+    etaSmoothed: job.etaSmoothedSec,
+    throughputPixPerSec: job.throughputPixPerSec,
+    throughputRaysPerSec: job.throughputRaysPerSec,
+    pixelCount: job.pixelCount,
+    rayCount: job.rayCount,
+    donePixels: job.donePixels,
+    doneRays: job.doneRays,
+    jobId: job.id,
+  });
+  broadcastQueueSnapshot();
+  persistQueueState();
 }
 
 function runAuxPreviewJob(job) {
@@ -445,12 +489,18 @@ function runAuxPreviewJob(job) {
   ['--4k', '--2k', '--720p', '--hd', '--preview'].forEach(flag => {
     previewArgs = previewArgs.filter(a => a !== flag);
   });
-  previewArgs = stripArgWithValue(previewArgs, '--custom-res');
+  previewArgs = stripArgWithValue(previewArgs, '--custom-res', 2);
   previewArgs = stripArgWithValue(previewArgs, '--camera-spp');
   previewArgs = stripArgWithValue(previewArgs, '--geo-file');
+  // Strip bundle-mode flags from the aux preview: it runs single-ray for instant feedback.
+  previewArgs = previewArgs.filter(a => a !== '--bundles' && a !== '--anti-fireflies');
   previewArgs.push('--preview', '--camera-spp', '1');
 
   const p = spawn(job.binary, previewArgs, { cwd: ROOT });
+  job.previewProc = p;
+  p.on('close', () => {
+    if (job.previewProc === p) job.previewProc = null;
+  });
   p.stdout.on('data', chunk => {
     const line = chunk.toString();
     const saved = extractSavedFileFromStdoutChunk(line);
@@ -476,6 +526,7 @@ function runAuxPreviewJob(job) {
     }
   });
   p.on('error', () => {
+    if (job.previewProc === p) job.previewProc = null;
     // Non-blocking helper process: ignore errors.
   });
 }
@@ -501,6 +552,8 @@ function startNextQueuedJob() {
   job.logsTail = [];
   job.warnings = [];
   job.fallbackUsed = false;
+  job.stderrCarry = '';
+  job.previewProc = null;
 
   const proc = spawn(job.binary, job.args, { cwd: ROOT });
   job.proc = proc;
@@ -514,6 +567,7 @@ function startNextQueuedJob() {
 
   proc.stdout.on('data', chunk => {
     const line = chunk.toString();
+    parseProgressFromChunk(job, line);
     broadcast({ type: 'stdout', line, jobId: job.id });
     const saved = extractSavedFileFromStdoutChunk(line);
     if (saved) {
@@ -528,32 +582,7 @@ function startNextQueuedJob() {
 
   proc.stderr.on('data', chunk => {
     const raw = chunk.toString();
-    const match = raw.match(/\]\s+(\d+)%\s+([\d.]+)s elapsed.*?([\d.]+)s ETA/);
-    if (match) {
-      job.hasRealProgress = true;
-      updateDerivedProgress(
-        job,
-        parseInt(match[1], 10),
-        parseFloat(match[2]),
-        parseFloat(match[3])
-      );
-      broadcast({
-        type: 'progress',
-        pct: job.progressPct,
-        elapsed: job.elapsedSec,
-        eta: job.etaSec,
-        etaSmoothed: job.etaSmoothedSec,
-        throughputPixPerSec: job.throughputPixPerSec,
-        throughputRaysPerSec: job.throughputRaysPerSec,
-        pixelCount: job.pixelCount,
-        rayCount: job.rayCount,
-        donePixels: job.donePixels,
-        doneRays: job.doneRays,
-        jobId: job.id,
-      });
-      broadcastQueueSnapshot();
-      persistQueueState();
-    }
+    parseProgressFromChunk(job, raw);
     markFallbackFromLine(job, raw);
     const tail = tailLines(raw, 12);
     if (tail.length > 0) {
@@ -567,6 +596,10 @@ function startNextQueuedJob() {
     job.finishedAt = new Date().toISOString();
     job.code = code;
     job.status = wasCancelled ? 'cancelled' : (code === 0 ? 'done' : 'failed');
+    if (job.previewProc && !job.previewProc.killed) {
+      try { job.previewProc.kill('SIGTERM'); } catch {}
+    }
+    job.previewProc = null;
     if (!job.outputFile && code === 0) {
       job.outputFile = latestOutputFile();
     }
@@ -1072,12 +1105,99 @@ app.post('/api/render', (req, res) => {
     }
   }
 
+  if (p.disk_brightness !== undefined) {
+    const v = Number(p.disk_brightness);
+    if (Number.isFinite(v)) args.push('--disk-brightness', String(Math.max(0, v)));
+  }
+  if (p.disk_opacity !== undefined) {
+    const v = Number(p.disk_opacity);
+    if (Number.isFinite(v)) args.push('--disk-opacity', String(Math.max(0, Math.min(1, v))));
+  }
+
   // Disk palette
-  if (p.disk_palette === 'interstellar') {
+  const paletteMode = typeof p.disk_palette === 'string' ? p.disk_palette : 'blackbody';
+  if (paletteMode === 'stratified') {
+    args.push('--disk-stratified');
+    if (p.disk_rings !== undefined) {
+      const v = Math.min(32, Math.max(1, Math.floor(Number(p.disk_rings))));
+      args.push('--disk-rings', String(v));
+    }
+    if (p.disk_sectors !== undefined) {
+      const v = Math.min(256, Math.max(1, Math.floor(Number(p.disk_sectors))));
+      args.push('--disk-sectors', String(v));
+    }
+    if (p.disk_sigma !== undefined) {
+      const v = Math.max(0.01, Number(p.disk_sigma));
+      args.push('--disk-sigma', String(v));
+    }
+    if (p.disk_hue_offset !== undefined) {
+      const v = Number(p.disk_hue_offset);
+      if (Number.isFinite(v)) args.push('--disk-hue-offset', String(v));
+    }
+  } else if (paletteMode === 'interstellar') {
     args.push('--disk-interstellar');
-    if (p.disk_rings   !== undefined) args.push('--disk-rings',   String(Math.min(32,  Math.max(1, Math.floor(Number(p.disk_rings))))));
-    if (p.disk_sectors !== undefined) args.push('--disk-sectors', String(Math.min(256, Math.max(1, Math.floor(Number(p.disk_sectors))))));
-    if (p.disk_sigma   !== undefined) args.push('--disk-sigma',   String(Math.max(0.01, Number(p.disk_sigma))));
+    if (p.interstellar_omega0 !== undefined) {
+      const v = Number(p.interstellar_omega0);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-omega0', String(v));
+    }
+    if (p.interstellar_p !== undefined) {
+      const v = Number(p.interstellar_p);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-p', String(v));
+    }
+    if (p.interstellar_inner_falloff_scale !== undefined) {
+      const v = Number(p.interstellar_inner_falloff_scale);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-inner-falloff', String(v));
+    }
+    if (p.interstellar_band_strength !== undefined) {
+      const v = Number(p.interstellar_band_strength);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-band-strength', String(v));
+    }
+    if (p.interstellar_band_frequency !== undefined) {
+      const v = Number(p.interstellar_band_frequency);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-band-frequency', String(v));
+    }
+    if (p.interstellar_band_warp !== undefined) {
+      const v = Number(p.interstellar_band_warp);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-band-warp', String(v));
+    }
+    if (p.interstellar_turbulence_strength !== undefined) {
+      const v = Number(p.interstellar_turbulence_strength);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-turbulence', String(v));
+    }
+    if (p.interstellar_hdr_intensity !== undefined) {
+      const v = Number(p.interstellar_hdr_intensity);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-hdr', String(v));
+    }
+    if (p.interstellar_softness_in_scale !== undefined) {
+      const v = Number(p.interstellar_softness_in_scale);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-softness-in', String(v));
+    }
+    if (p.interstellar_softness_out_scale !== undefined) {
+      const v = Number(p.interstellar_softness_out_scale);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-softness-out', String(v));
+    }
+    if (p.interstellar_edge_transparency !== undefined) {
+      const v = Number(p.interstellar_edge_transparency);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-edge-transparency', String(v));
+    }
+    if (p.interstellar_outer_r !== undefined) {
+      const v = Number(p.interstellar_outer_r);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-outer-r', String(v));
+    }
+    if (p.interstellar_outer_g !== undefined) {
+      const v = Number(p.interstellar_outer_g);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-outer-g', String(v));
+    }
+    if (p.interstellar_outer_b !== undefined) {
+      const v = Number(p.interstellar_outer_b);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-outer-b', String(v));
+    }
+    if (p.interstellar_time !== undefined) {
+      const v = Number(p.interstellar_time);
+      if (Number.isFinite(v)) args.push('--disk-interstellar-time', String(v));
+    }
+  } else {
+    args.push('--disk-blackbody');
   }
 
   // Wormhole (DNEG metric)
@@ -1131,6 +1251,10 @@ app.post('/api/cancel', (req, res) => {
     if (activeJob && activeJob.id === wantedId) {
       activeJob.cancelRequested = true;
       activeJob.proc?.kill('SIGTERM');
+      if (activeJob.previewProc && !activeJob.previewProc.killed) {
+        try { activeJob.previewProc.kill('SIGTERM'); } catch {}
+      }
+      activeJob.previewProc = null;
       persistQueueState();
       return res.json({ status: 'cancelling', jobId: wantedId, active: true });
     }
@@ -1151,6 +1275,10 @@ app.post('/api/cancel', (req, res) => {
   if (activeJob) {
     activeJob.cancelRequested = true;
     activeJob.proc?.kill('SIGTERM');
+    if (activeJob.previewProc && !activeJob.previewProc.killed) {
+      try { activeJob.previewProc.kill('SIGTERM'); } catch {}
+    }
+    activeJob.previewProc = null;
     persistQueueState();
     return res.json({ status: 'cancelling', jobId: activeJob.id, active: true });
   }

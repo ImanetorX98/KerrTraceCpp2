@@ -111,8 +111,8 @@ where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
 - [ ] Carter constant `Q_c` for exact orbit classification
 - [ ] Analytical sub-steps via elliptic integrals (Gralla & Lupsasca 2019)
 - [ ] Thick disk / GRRMHD texture maps
-- [ ] Photon ring detection and sub-ring counting
-- [ ] Polarisation via parallel-transported polarisation vector
+- [ ] Photon ring detection and sub-ring counting ← **planned next** (n-counter on θ=π/2 crossings; store in GeoPixel._pad[2]; colorize per order)
+- [ ] Polarisation via parallel-transported polarisation vector ← **planned next** (Penrose-Walker κ conserved in Kerr; approx B from Connors, Stark & Piran 1980 — paper in NotebookLM; add pol_angle+pol_degree to GeoPixel, bump .kgeo version)
 - [ ] Spectral rendering (multi-band, synchrotron emission model)
 
 ### Phase 4 — Performance (TODO)

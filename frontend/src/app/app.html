@@ -9,7 +9,7 @@
     <div class="header-side">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.9 — Wormhole</div>
+        <div><strong>Version</strong> v0.2.10 — Metal progress + bundle fix</div>
         <div><strong>Layout</strong> {{ isMobileView() ? 'Smartphone' : 'Desktop' }}</div>
       </div>
       <span class="status-chip" [class]="status()">
@@ -189,19 +189,24 @@
           <div style="display:flex;gap:6px;flex-wrap:wrap">
             <button class="backend-btn"
                     [class.active]="params.integration_chart === 'ks'"
-                    (click)="params.integration_chart = 'ks'">
+                    (click)="selectIntegrationChart('ks')">
               Kerr-Schild (KS)
             </button>
             <button class="backend-btn"
                     [class.active]="params.integration_chart === 'gks'"
-                    (click)="params.integration_chart = 'gks'">
+                    (click)="selectIntegrationChart('gks')">
               Generalized KS (GKS)
             </button>
             <button class="backend-btn"
                     [class.active]="params.integration_chart === 'bl'"
-                    (click)="params.integration_chart = 'bl'">
+                    [disabled]="true"
+                    [matTooltip]="'Selezione automatica attiva: usa KS/GKS in base a Q e Λ'"
+                    (click)="selectIntegrationChart('bl')">
               Boyer-Lindquist (BL)
             </button>
+          </div>
+          <div style="margin-top:6px;color:#787c84;font-size:11px;line-height:1.35">
+            Auto chart: <b>KS</b> quando <code>Q=0</code> e <code>Λ=0</code>, altrimenti <b>GKS</b>.
           </div>
         </div>
 
@@ -342,16 +347,32 @@
         <ng-container *ngIf="params.scene_mode === 'black_hole'">
           <hr class="divider">
 
+          <div class="param-row" style="margin-bottom:10px">
+            <label>Disk brightness ×</label>
+            <num-input [(value)]="params.disk_brightness"
+                       [min]="0.0" [max]="100.0" [step]="0.1" [decimals]="2">
+            </num-input>
+          </div>
+          <div class="param-row" style="margin-bottom:10px">
+            <label>Disk opacity</label>
+            <num-input [(value)]="params.disk_opacity"
+                       [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="2">
+            </num-input>
+          </div>
+
           <h2>Disk palette</h2>
           <div style="display:flex;gap:6px;margin-bottom:10px">
             <button class="backend-btn"
                     [class.active]="params.disk_palette === 'blackbody'"
                     (click)="params.disk_palette = 'blackbody'">Blackbody</button>
             <button class="backend-btn"
+                    [class.active]="params.disk_palette === 'stratified'"
+                    (click)="params.disk_palette = 'stratified'">Stratificata</button>
+            <button class="backend-btn"
                     [class.active]="params.disk_palette === 'interstellar'"
                     (click)="params.disk_palette = 'interstellar'">Interstellar</button>
           </div>
-          <div *ngIf="params.disk_palette === 'interstellar'">
+          <div *ngIf="params.disk_palette === 'stratified'">
             <div class="param-row">
               <label>Rings</label>
               <num-input [(value)]="params.disk_rings"
@@ -368,6 +389,104 @@
               <label>Blend σ</label>
               <num-input [(value)]="params.disk_sigma"
                          [min]="0.1" [max]="2.0" [step]="0.05" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Hue offset</label>
+              <num-input [(value)]="params.disk_hue_offset"
+                         [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="2">
+              </num-input>
+            </div>
+          </div>
+          <div *ngIf="params.disk_palette === 'interstellar'">
+            <div class="param-row">
+              <label>Ω0</label>
+              <num-input [(value)]="params.interstellar_omega0"
+                         [min]="0.01" [max]="10.0" [step]="0.05" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>p (radial)</label>
+              <num-input [(value)]="params.interstellar_p"
+                         [min]="0.1" [max]="8.0" [step]="0.1" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Inner falloff</label>
+              <num-input [(value)]="params.interstellar_inner_falloff_scale"
+                         [min]="0.01" [max]="4.0" [step]="0.05" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Band strength</label>
+              <num-input [(value)]="params.interstellar_band_strength"
+                         [min]="0.0" [max]="2.0" [step]="0.01" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Band frequency</label>
+              <num-input [(value)]="params.interstellar_band_frequency"
+                         [min]="0.0" [max]="80.0" [step]="0.5" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Band warp</label>
+              <num-input [(value)]="params.interstellar_band_warp"
+                         [min]="0.0" [max]="10.0" [step]="0.1" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Turbulence</label>
+              <num-input [(value)]="params.interstellar_turbulence_strength"
+                         [min]="0.0" [max]="4.0" [step]="0.05" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>HDR intensity</label>
+              <num-input [(value)]="params.interstellar_hdr_intensity"
+                         [min]="0.0" [max]="100.0" [step]="0.1" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Softness in</label>
+              <num-input [(value)]="params.interstellar_softness_in_scale"
+                         [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Softness out</label>
+              <num-input [(value)]="params.interstellar_softness_out_scale"
+                         [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="2">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Edge transparency</label>
+              <num-input [(value)]="params.interstellar_edge_transparency"
+                         [min]="0.0" [max]="0.3" [step]="0.005" [decimals]="3">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Outer color R</label>
+              <num-input [(value)]="params.interstellar_outer_r"
+                         [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="3">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Outer color G</label>
+              <num-input [(value)]="params.interstellar_outer_g"
+                         [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="3">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Outer color B</label>
+              <num-input [(value)]="params.interstellar_outer_b"
+                         [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="3">
+              </num-input>
+            </div>
+            <div class="param-row">
+              <label>Time phase</label>
+              <num-input [(value)]="params.interstellar_time"
+                         [min]="-10000" [max]="10000" [step]="0.1" [decimals]="2">
               </num-input>
             </div>
           </div>
@@ -660,15 +779,26 @@
             <button class="backend-btn" (click)="cancelQueuedJob(active.id)">Cancel</button>
           </div>
           <div class="job-progress-row">
-            <span>{{active.progressPct ?? 0 | number:'1.0-0'}}%</span>
-            <span>{{fmtClock(active.elapsedSec ?? 0)}} elapsed · ETA {{fmtClock((active.etaSmoothedSec ?? active.etaSec ?? 0))}}</span>
+            <span *ngIf="(active.progressPct ?? 0) > 0; else queueProgressPending">
+              {{active.progressPct ?? 0 | number:'1.0-0'}}%
+            </span>
+            <ng-template #queueProgressPending>
+              <span>Calcolo iniziale...</span>
+            </ng-template>
+            <span *ngIf="(active.etaSmoothedSec ?? active.etaSec ?? 0) > 0; else queueEtaPending">
+              {{fmtClock(active.elapsedSec ?? 0)}} elapsed · ETA {{fmtClock((active.etaSmoothedSec ?? active.etaSec ?? 0))}}
+            </span>
+            <ng-template #queueEtaPending>
+              <span>{{fmtClock(active.elapsedSec ?? 0)}} elapsed</span>
+            </ng-template>
           </div>
           <div class="job-stats-row" *ngIf="(active.pixelCount ?? 0) > 0">
             <span>{{fmtInt(active.donePixels ?? 0)}} / {{fmtInt(active.pixelCount ?? 0)}} px</span>
             <span>{{fmtRate(active.throughputPixPerSec ?? 0)}} px/s</span>
             <span>{{fmtRate(active.throughputRaysPerSec ?? 0)}} rays/s</span>
           </div>
-          <mat-progress-bar mode="determinate" [value]="active.progressPct ?? 0"></mat-progress-bar>
+          <mat-progress-bar [mode]="(active.progressPct ?? 0) > 0 ? 'determinate' : 'indeterminate'"
+                            [value]="active.progressPct ?? 0"></mat-progress-bar>
         </div>
 
         <div class="job-empty" *ngIf="!queueActive()">Nessun job attivo.</div>

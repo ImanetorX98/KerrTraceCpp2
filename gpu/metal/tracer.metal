@@ -49,6 +49,26 @@ struct CameraParams {
     float integrator_tol; // adaptive integrator tolerance
     float pixel_offset_x; // subpixel X offset in pixel units
     float pixel_offset_y; // subpixel Y offset in pixel units
+    float exposure; // tonemap exposure
+    float gamma; // tonemap gamma
+    float disk_brightness; // common disk brightness multiplier
+    float disk_opacity; // common disk opacity [0,1] shared by all palettes
+    int   disk_palette; // 0=blackbody, 1=stratified, 2=interstellar
+    float interstellar_omega0;
+    float interstellar_p;
+    float interstellar_inner_falloff_scale;
+    float interstellar_band_strength;
+    float interstellar_band_frequency;
+    float interstellar_band_warp;
+    float interstellar_turbulence_strength;
+    float interstellar_hdr_intensity;
+    float interstellar_softness_in_scale;
+    float interstellar_softness_out_scale;
+    float interstellar_edge_transparency;
+    float interstellar_outer_r;
+    float interstellar_outer_g;
+    float interstellar_outer_b;
+    float interstellar_time;
 };
 
 struct RenderParams {
@@ -1591,17 +1611,172 @@ static uint32_t pack_abgr(float r, float g, float b) {
     return (0xFFu << 24) | (bb << 16) | (gg << 8) | rr;
 }
 
-static uint32_t disk_color_abgr(float r_hit, float redshift, float magnif,
-                                float M, float r_isco) {
+static inline float smoothstep_range_f(float edge0, float edge1, float x) {
+    if (edge1 <= edge0) return (x >= edge1) ? 1.0f : 0.0f;
+    const float t = clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static inline float fract01_f(float x) {
+    return x - floor(x);
+}
+
+static inline float hash2d_f(float x, float y, float seed) {
+    return fract01_f(sin(x * 127.1f + y * 311.7f + seed) * 43758.5453123f);
+}
+
+static float value_noise2d_f(float x, float y, float seed) {
+    const float ix = floor(x);
+    const float iy = floor(y);
+    const float fx = x - ix;
+    const float fy = y - iy;
+
+    const float ux = fx * fx * (3.0f - 2.0f * fx);
+    const float uy = fy * fy * (3.0f - 2.0f * fy);
+
+    const float n00 = hash2d_f(ix + 0.0f, iy + 0.0f, seed);
+    const float n10 = hash2d_f(ix + 1.0f, iy + 0.0f, seed);
+    const float n01 = hash2d_f(ix + 0.0f, iy + 1.0f, seed);
+    const float n11 = hash2d_f(ix + 1.0f, iy + 1.0f, seed);
+
+    const float nx0 = n00 + (n10 - n00) * ux;
+    const float nx1 = n01 + (n11 - n01) * ux;
+    return nx0 + (nx1 - nx0) * uy;
+}
+
+static float fbm2d_f(float x, float y, float seed, int octaves) {
+    float sum = 0.0f;
+    float amp = 0.5f;
+    float freq = 1.0f;
+    float norm = 0.0f;
+    for (int i = 0; i < octaves; ++i) {
+        sum += amp * value_noise2d_f(x * freq, y * freq, seed + 17.0f * float(i));
+        norm += amp;
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return (norm > 0.0f) ? (sum / norm) : 0.0f;
+}
+
+static float interstellar_disk_soft_mask_f(float r, float phi,
+                                           float r_in, float r_out,
+                                           CameraParams cp) {
+    constexpr float TWO_PI_F = 6.28318530717958647692f;
+    const float phi_norm = fract01_f(phi / TWO_PI_F);
+    const float t = cp.interstellar_time;
+
+    const float edgeInNoise = 2.0f * fbm2d_f(phi_norm * 3.0f, t * 0.10f, 11.0f, 4) - 1.0f;
+    const float edgeOutNoise = 2.0f * fbm2d_f(phi_norm * 2.0f, t * 0.07f, 29.0f, 4) - 1.0f;
+
+    const float rin_local = r_in * (1.0f + 0.03f * edgeInNoise);
+    const float rout_local = r_out * (1.0f + 0.06f * edgeOutNoise);
+    const float rout_safe = max(rout_local, rin_local + 1e-4f);
+
+    const float softness_in = max(1e-6f, cp.interstellar_softness_in_scale * r_in);
+    const float softness_out = max(1e-6f, cp.interstellar_softness_out_scale * r_out);
+
+    const float inner_mask = smoothstep_range_f(rin_local, rin_local + softness_in, r);
+    const float outer_mask = 1.0f - smoothstep_range_f(rout_safe - softness_out, rout_safe, r);
+    return clamp(inner_mask * outer_mask, 0.0f, 1.0f);
+}
+
+static inline bool global_disk_opacity_pass_through_f(float r_hit, float phi_hit,
+                                                       CameraParams cp) {
+    const float opacity = clamp(cp.disk_opacity, 0.0f, 1.0f);
+    if (opacity <= 1.0e-6f) return true;
+    if (opacity >= 1.0f - 1.0e-6f) return false;
+    const float phi_norm = fract01_f(phi_hit / (2.0f * M_PI_F));
+    const float r_term = log(max(r_hit, 1.0e-6f));
+    const float h = hash2d_f(r_term * 23.17f, phi_norm * 4096.0f, 97.0f);
+    return h > opacity;
+}
+
+static inline bool disk_tile_pass_through(float r_hit, float phi_hit,
+                                          float r_isco, float r_disk_out,
+                                          CameraParams cp) {
+    if (global_disk_opacity_pass_through_f(r_hit, phi_hit, cp)) return true;
+    if (cp.disk_palette == 2) {
+        const float mask = interstellar_disk_soft_mask_f(r_hit, phi_hit, r_isco, r_disk_out, cp);
+        if (mask < max(0.0f, cp.interstellar_edge_transparency)) return true;
+    }
+    return false;
+}
+
+static uint32_t disk_color_abgr(float r_hit, float phi_hit,
+                                float redshift, float magnif,
+                                float M, float r_isco, float r_disk_out,
+                                CameraParams cp) {
     const float red = clamp(redshift, 0.0f, 20.0f);
+    if (cp.disk_palette == 2) {
+        const float r_in = max(r_isco, 1e-6f);
+        const float r_out = max(r_disk_out, r_in + 1e-5f);
+        const float x = clamp((r_hit - r_in) / max(r_out - r_in, 1e-6f), 0.0f, 1.0f);
+        const float t = cp.interstellar_time;
+        const float omega = cp.interstellar_omega0 * pow(max(r_hit / r_in, 1e-6f), -1.5f);
+        const float phit = phi_hit - omega * t;
+        const float mask = interstellar_disk_soft_mask_f(r_hit, phi_hit, r_in, r_out, cp);
+        if (mask <= 1e-6f) return pack_abgr(0.0f, 0.0f, 0.0f);
+
+        const float p = max(0.1f, cp.interstellar_p);
+        const float inner_falloff = max(1e-6f, cp.interstellar_inner_falloff_scale * r_in);
+        const float radial = pow(max(r_hit / r_in, 1e-6f), -p);
+        const float inner_glow = exp(-(r_hit - r_in) / inner_falloff);
+        const float profile = radial * inner_glow;
+
+        const float n1 = 2.0f * fbm2d_f(r_hit * 1.2f, phit * 8.0f, 41.0f, 5) - 1.0f;
+        const float n2 = 2.0f * fbm2d_f(r_hit * 5.0f, phit * 25.0f + 2.0f * n1, 73.0f, 4) - 1.0f;
+        const float turbulence = 0.75f + cp.interstellar_turbulence_strength * (0.35f * n1 + 0.12f * n2);
+
+        const float bands = 1.0f + cp.interstellar_band_strength *
+            sin(cp.interstellar_band_frequency * log(max(r_hit / r_in, 1e-6f)) +
+                cp.interstellar_band_warp * n1);
+
+        const float inner_r = 1.0f, inner_g = 0.82f, inner_b = 0.45f;
+        const float mid_r = 1.0f, mid_g = 0.32f, mid_b = 0.06f;
+        const float out_r = clamp(cp.interstellar_outer_r, 0.0f, 1.0f);
+        const float out_g = clamp(cp.interstellar_outer_g, 0.0f, 1.0f);
+        const float out_b = clamp(cp.interstellar_outer_b, 0.0f, 1.0f);
+
+        const float t1 = smoothstep_range_f(0.08f, 0.38f, x);
+        float cr = inner_r + (mid_r - inner_r) * t1;
+        float cg = inner_g + (mid_g - inner_g) * t1;
+        float cb = inner_b + (mid_b - inner_b) * t1;
+        const float t2 = smoothstep_range_f(0.35f, 1.0f, x);
+        cr += (out_r - cr) * t2;
+        cg += (out_g - cg) * t2;
+        cb += (out_b - cb) * t2;
+
+        const float red_c = clamp(red, 0.1f, 10.0f);
+        const float receding_lift = 1.0f + 0.85f * clamp(1.0f - red_c, 0.0f, 1.0f);
+        const float lens = clamp(1.0f / max(magnif, 1e-6f), 0.05f, 5.0f);
+
+        float intensity = mask * profile * turbulence * bands;
+        intensity *= pow(red_c, 4.0f) * receding_lift;
+        intensity *= lens;
+        intensity *= max(0.0f, cp.interstellar_hdr_intensity);
+        intensity *= max(0.0f, cp.disk_brightness);
+        intensity = max(intensity, 0.0f);
+
+        const float exposure = max(cp.exposure, 0.0f);
+        const float gamma = max(cp.gamma, 1e-6f);
+        return pack_abgr(
+            tonemap_ch(cr * intensity, exposure, gamma),
+            tonemap_ch(cg * intensity, exposure, gamma),
+            tonemap_ch(cb * intensity, exposure, gamma)
+        );
+    }
+
     const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
     float I = page_thorne_norm(r_hit, r_isco);
     I *= doppler_intensity_scale(red);
     I *= clamp(1.0f / max(magnif, 1e-12f), 0.05f, 5.0f);
+    I *= max(0.0f, cp.disk_brightness);
     const float4 bb = blackbody_rgb(T);
-    const float rr = tonemap_ch(bb.r * I, 1.0f, 2.2f);
-    const float gg = tonemap_ch(bb.g * I, 1.0f, 2.2f);
-    const float bbv = tonemap_ch(bb.b * I, 1.0f, 2.2f);
+    const float exposure = max(cp.exposure, 0.0f);
+    const float gamma = max(cp.gamma, 1e-6f);
+    const float rr = tonemap_ch(bb.r * I, exposure, gamma);
+    const float gg = tonemap_ch(bb.g * I, exposure, gamma);
+    const float bbv = tonemap_ch(bb.b * I, exposure, gamma);
     return pack_abgr(rr, gg, bbv);
 }
 
@@ -1613,7 +1788,8 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
                                                       int integrator_mode,
                                                       int max_steps,
                                                       float step_init,
-                                                      float integrator_tol) {
+                                                      float integrator_tol,
+                                                      CameraParams cp_cfg) {
     RayTraceResultBL res{};
     res.outcome = 2;
     res.r_hit = 0.0f;
@@ -1723,15 +1899,20 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
                     intersection_mode, alpha)) {
                 const float r_hit = interp_scalar_mode_f(
                     prev_r, r, dr0, dr1, step_used, alpha, intersection_mode);
+                const float phi_hit = interp_scalar_mode_f(
+                    prev_phi, phi, dphi0, dphi1, step_used, alpha, intersection_mode);
                 if (r_hit >= r_isco && r_hit <= r_disk_out) {
+                    if (disk_tile_pass_through(r_hit, phi_hit, r_isco, r_disk_out, cp_cfg)) {
+                        // Keep tracing: this Interstellar tile is intentionally transparent.
+                    } else {
                     const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
 
                     res.r_hit = r_hit;
                     res.redshift = red;
-                    res.phi_hit = interp_scalar_mode_f(
-                        prev_phi, phi, dphi0, dphi1, step_used, alpha, intersection_mode);
+                    res.phi_hit = phi_hit;
                     best_alpha = alpha;
                     best_event = 1;
+                    }
                 }
             }
         }
@@ -1792,7 +1973,8 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                                                       int integrator_mode,
                                                       int max_steps,
                                                       float step_init,
-                                                      float integrator_tol) {
+                                                      float integrator_tol,
+                                                      CameraParams cp_cfg) {
     RayTraceResultBL res{};
     res.outcome = 2;
     res.r_hit = 0.0f;
@@ -1939,6 +2121,9 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                 float r_hit, th_hit, ph_hit;
                 KS_to_BL_spatial(Xh, Yh, Zh, a, r_hit, th_hit, ph_hit);
                 if (r_hit >= r_isco && r_hit <= r_disk_out) {
+                    if (disk_tile_pass_through(r_hit, ph_hit, r_isco, r_disk_out, cp_cfg)) {
+                        // Keep tracing: this Interstellar tile is intentionally transparent.
+                    } else {
                     float pr_hit, pth_hit, pphi_hit;
                     KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                       pr_hit, pth_hit, pphi_hit);
@@ -1949,6 +2134,7 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                     res.phi_hit = ph_hit;
                     best_alpha = alpha_evt;
                     best_event = 1;
+                    }
                 }
             }
         }
@@ -2011,19 +2197,20 @@ static RayTraceResultBL trace_standard_chart_from_angles(float alpha, float beta
                                                          int integrator_mode,
                                                          int max_steps,
                                                          float step_init,
-                                                         float integrator_tol) {
+                                                         float integrator_tol,
+                                                         CameraParams cp_cfg) {
     if (chart == 1 && abs(L) <= 1e-8f) {
         return trace_standard_ks_from_angles(alpha, beta, M, a, Q, L,
                                              r_obs, theta_obs, phi_obs,
                                              r_horizon, r_isco, r_disk_out,
                                              intersection_mode, integrator_mode,
-                                             max_steps, step_init, integrator_tol);
+                                             max_steps, step_init, integrator_tol, cp_cfg);
     }
     return trace_standard_bl_from_angles(alpha, beta, M, a, Q, L,
                                          r_obs, theta_obs, phi_obs,
                                          r_horizon, r_isco, r_disk_out,
                                          intersection_mode, integrator_mode,
-                                         max_steps, step_init, integrator_tol);
+                                         max_steps, step_init, integrator_tol, cp_cfg);
 }
 
 // ── Main compute implementation (shared by all entry kernels) ─
@@ -2063,7 +2250,7 @@ static inline void trace_pixel_impl(
             cp.r_obs, cp.theta_obs, cp.phi_obs,
             kp.r_horizon, kp.r_isco, kp.r_disk_out,
             cp.chart, cp.intersection_mode, cp.integrator_mode,
-            cp.max_steps, cp.step_init, cp.integrator_tol);
+            cp.max_steps, cp.step_init, cp.integrator_tol, cp);
 
         if (c.outcome == 0) {
             const float4 bgc = clamp(sample_background(bg_tex, bg_samp, c.theta_esc, c.phi_esc), 0.0f, 1.0f);
@@ -2084,25 +2271,25 @@ static inline void trace_pixel_impl(
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
                     cp.chart, cp.intersection_mode, cp.integrator_mode,
-                    cp.max_steps, cp.step_init, cp.integrator_tol);
+                    cp.max_steps, cp.step_init, cp.integrator_tol, cp);
                 const RayTraceResultBL am = trace_standard_chart_from_angles(
                     alpha - eps, beta, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
                     cp.chart, cp.intersection_mode, cp.integrator_mode,
-                    cp.max_steps, cp.step_init, cp.integrator_tol);
+                    cp.max_steps, cp.step_init, cp.integrator_tol, cp);
                 const RayTraceResultBL bp = trace_standard_chart_from_angles(
                     alpha, beta + eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
                     cp.chart, cp.intersection_mode, cp.integrator_mode,
-                    cp.max_steps, cp.step_init, cp.integrator_tol);
+                    cp.max_steps, cp.step_init, cp.integrator_tol, cp);
                 const RayTraceResultBL bm = trace_standard_chart_from_angles(
                     alpha, beta - eps, M, a, Q, L,
                     cp.r_obs, cp.theta_obs, cp.phi_obs,
                     kp.r_horizon, kp.r_isco, kp.r_disk_out,
                     cp.chart, cp.intersection_mode, cp.integrator_mode,
-                    cp.max_steps, cp.step_init, cp.integrator_tol);
+                    cp.max_steps, cp.step_init, cp.integrator_tol, cp);
 
                 if (ap.outcome == 1 && am.outcome == 1 && bp.outcome == 1 && bm.outcome == 1) {
                     const float dr_da = (ap.r_hit - am.r_hit) / (2.0f * eps);
@@ -2160,7 +2347,8 @@ static inline void trace_pixel_impl(
                 }
             }
 
-            colour = disk_color_abgr(shade_r_hit, shade_redshift, magnif, M, kp.r_isco);
+            colour = disk_color_abgr(shade_r_hit, c.phi_hit, shade_redshift, magnif,
+                                     M, kp.r_isco, kp.r_disk_out, cp);
             output[py * width + px] = colour;
             return;
         }
@@ -2280,26 +2468,16 @@ static inline void trace_pixel_impl(
                 cp.r_obs, cp.theta_obs, cp.phi_obs,
                 kp.r_horizon, kp.r_isco, kp.r_disk_out,
                 cp.chart, cp.intersection_mode, cp.integrator_mode,
-                cp.max_steps, cp.step_init, cp.integrator_tol);
+                cp.max_steps, cp.step_init, cp.integrator_tol, cp);
             if (verify.outcome == 2) {
                 output[py * width + px] = colour;
                 return;
             }
 
             const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L);
-
-            const float T = 6500.0f * sqrt(6.0f*M/r_hit_ell) * clamp(red, 0.2f, 5.0f);
-            float I = page_thorne_norm(r_hit_ell, kp.r_isco);
-            I *= doppler_intensity_scale(red);
-            float4 bb = blackbody_rgb(T);
-            float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
-                              tonemap_ch(bb.g * I, 1.0f, 2.2f),
-                              tonemap_ch(bb.b * I, 1.0f, 2.2f),
-                              1.0f);
-            colour = (0xFFu << 24)
-                   | (uint32_t(c.b*255.0f) << 16)
-                   | (uint32_t(c.g*255.0f) << 8)
-                   |  uint32_t(c.r*255.0f);
+            const float phi_hit_ell = (verify.outcome == 1) ? verify.phi_hit : cp.phi_obs;
+            colour = disk_color_abgr(r_hit_ell, phi_hit_ell, red, 1.0f,
+                                     M, kp.r_isco, kp.r_disk_out, cp);
             output[py * width + px] = colour;
             return;
         }
@@ -2417,21 +2595,15 @@ static inline void trace_pixel_impl(
                             alpha, 8, 7)) {
                         const float r_hit = hermite_interp_f(
                             s_prev.r, s.r, dr_prev, dr_now, step_used, alpha);
+                        const float phi_hit = interp_scalar_mode_f(
+                            s_prev.phi, s.phi, dphi_prev, dphi_now, step_used, alpha, cp.intersection_mode);
                         if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
+                            if (disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
+                                continue;
+                            }
                             const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
-
-                            const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
-                            float I = page_thorne_norm(r_hit, kp.r_isco);
-                            I *= doppler_intensity_scale(red);
-                            float4 bb = blackbody_rgb(T);
-                            float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
-                                              tonemap_ch(bb.g * I, 1.0f, 2.2f),
-                                              tonemap_ch(bb.b * I, 1.0f, 2.2f),
-                                              1.0f);
-                            colour = (0xFFu << 24)
-                                   | (uint32_t(c.b*255.0f) << 16)
-                                   | (uint32_t(c.g*255.0f) << 8)
-                                   |  uint32_t(c.r*255.0f);
+                            colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
+                                                     M, kp.r_isco, kp.r_disk_out, cp);
                             done = true;
                             break;
                         }
@@ -2534,23 +2706,16 @@ static inline void trace_pixel_impl(
                         float r_hit, th_hit, ph_hit;
                         KS_to_BL_spatial(Xh, Yh, Zh, a, r_hit, th_hit, ph_hit);
                         if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
+                            if (disk_tile_pass_through(r_hit, ph_hit, kp.r_isco, kp.r_disk_out, cp)) {
+                                // Keep tracing: this Interstellar tile is intentionally transparent.
+                                continue;
+                            }
                             float pr_hit, pth_hit, pphi_hit;
                             KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                               pr_hit, pth_hit, pphi_hit);
                             const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
-
-                            const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
-                            float I = page_thorne_norm(r_hit, kp.r_isco);
-                            I *= doppler_intensity_scale(red);
-                            float4 bb = blackbody_rgb(T);
-                            float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
-                                              tonemap_ch(bb.g * I, 1.0f, 2.2f),
-                                              tonemap_ch(bb.b * I, 1.0f, 2.2f),
-                                              1.0f);
-                            colour = (0xFFu << 24)
-                                   | (uint32_t(c.b*255.0f) << 16)
-                                   | (uint32_t(c.g*255.0f) << 8)
-                                   |  uint32_t(c.r*255.0f);
+                            colour = disk_color_abgr(r_hit, ph_hit, red, 1.0f,
+                                                     M, kp.r_isco, kp.r_disk_out, cp);
                             best_alpha = alpha;
                             best_event = 1;
                         }
@@ -2639,7 +2804,15 @@ static inline void trace_pixel_impl(
             float w = (abs(denom) > 1e-8f) ? (prev_cos / denom) : 0.5f;
             w = clamp(w, 0.0f, 1.0f);
             const float r_hit = prev_r + w*(r - prev_r);
+            const float phi_hit = prev_phi + w*(phi - prev_phi);
             if (!(r_hit >= kp.r_isco && r_hit <= kp.r_disk_out)) {
+                prev_cos = cos_th;
+                prev_r = r;
+                prev_theta = theta;
+                prev_phi = phi;
+                continue;
+            }
+            if (disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
                 prev_cos = cos_th;
                 prev_r = r;
                 prev_theta = theta;
@@ -2649,25 +2822,8 @@ static inline void trace_pixel_impl(
 
             // Disk hit
             const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
-
-            // Match CPU disk_colour():
-            //   T = 6500 * sqrt(6M/r) * clamp(red,0.2,5)
-            //   I = page_thorne_norm(r) * red^4
-            //   output = tonemap(blackbody(T) * I, exposure=1, gamma=2.2)
-            const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
-            float I = page_thorne_norm(r_hit, kp.r_isco);
-            I *= doppler_intensity_scale(red);
-            float4 bb = blackbody_rgb(T);
-            float4 c = float4(tonemap_ch(bb.r * I, 1.0f, 2.2f),
-                              tonemap_ch(bb.g * I, 1.0f, 2.2f),
-                              tonemap_ch(bb.b * I, 1.0f, 2.2f),
-                              1.0f);
-
-            // Pack as ABGR (Metal standard)
-            colour = (0xFFu << 24)
-                   | (uint32_t(c.b*255.0f) << 16)
-                   | (uint32_t(c.g*255.0f) << 8)
-                   |  uint32_t(c.r*255.0f);
+            colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
+                                     M, kp.r_isco, kp.r_disk_out, cp);
             break;
         }
         prev_cos = cos_th;

@@ -67,17 +67,36 @@ template<class T> static T clamp(T v, T lo, T hi) {
 struct RGB { uint8_t r, g, b; };
 
 // ── Colorization parameters (Phase 2 controls) ───────────────
-enum class DiskPalette { BLACKBODY, INTERSTELLAR };
+enum class DiskPalette { BLACKBODY, STRATIFIED, INTERSTELLAR };
 
 struct ColorParams {
     double exposure    = 1.0;   // intensity multiplier before tonemapping
     double gamma       = 2.2;   // gamma correction exponent
     double temp_scale  = 1.0;   // disk blackbody temperature scale
+    double disk_brightness = 1.0; // common accretion-disk brightness multiplier
+    double disk_opacity = 1.0; // common disk opacity [0,1], shared by all palettes
     DiskPalette palette    = DiskPalette::BLACKBODY;
-    int    disk_rings      = 7;    // number of radial rings in segmented mode
-    int    disk_sectors    = 14;   // number of azimuthal sectors
-    double disk_sigma      = 0.5;  // Gaussian blend width (in cell units)
+    int    disk_rings      = 7;    // number of radial rings in stratified mode
+    int    disk_sectors    = 14;   // number of azimuthal sectors in stratified mode
+    double disk_sigma      = 0.5;  // Gaussian blend width (in cell units) in stratified mode
     double disk_hue_offset = 0.0;  // hue offset added to each cell [0,1)
+
+    // Interstellar cinematic mode (artist-friendly controls)
+    double interstellar_omega0                = 1.0;
+    double interstellar_p                     = 2.2;
+    double interstellar_inner_falloff_scale   = 0.7;   // multiplied by r_in
+    double interstellar_band_strength         = 0.18;
+    double interstellar_band_frequency        = 20.0;
+    double interstellar_band_warp             = 2.0;
+    double interstellar_turbulence_strength   = 1.0;
+    double interstellar_hdr_intensity         = 4.0;
+    double interstellar_softness_in_scale     = 0.08;  // multiplied by r_in
+    double interstellar_softness_out_scale    = 0.15;  // multiplied by r_out
+    double interstellar_edge_transparency   = 0.02;  // mask cutoff: low-opacity edge rays pass through
+    double interstellar_outer_r               = 0.16;
+    double interstellar_outer_g               = 0.045;
+    double interstellar_outer_b               = 0.018;
+    double interstellar_time                  = 0.0;
 };
 
 // ── Per-pixel geodesic result (Phase 1 output) ───────────────
@@ -188,6 +207,7 @@ struct TraceResult {
     Outcome out; double r, redshift;
     double phi_disk=0.0;   // BL azimuthal angle at disk crossing (0 if not a disk hit)
     double theta_esc=0.0, phi_esc=0.0;
+    Outcome behind_out=Outcome::HORIZON; // event reached after disk hit when disk_opacity < 1
 };
 
 struct IntegratorControls {
@@ -195,6 +215,15 @@ struct IntegratorControls {
     double step_init = 1.0;
     double tol       = 1e-7;
 };
+
+// Forward declarations for stratified segmented disk pass-through logic.
+static double cell_hash(int cell_id, double salt_a, double salt_b);
+static bool stratified_disk_tile_transparent(double r, double phi,
+                                             double r_in, double r_out,
+                                             const ColorParams& cp);
+static double interstellar_disk_soft_mask(double r, double phi,
+                                          double r_in, double r_out,
+                                          const ColorParams& cp);
 
 static const char* chart_label(CoordinateChart chart) {
     switch (chart) {
@@ -373,11 +402,70 @@ static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& 
     return std::isfinite(red) ? red : 1.0;
 }
 
+// Continue tracing from an already-known state, but ignoring further disk hits.
+// Used for alpha-compositing behind a partially transparent disk.
+static TraceResult trace_terminal_no_disk(GeodesicState s, const KNdSMetric& g,
+                                          double r_escape,
+                                          Integrator intg,
+                                          IntegratorControls ctl) {
+    double dlam = std::max(ctl.step_init, 1e-10);
+    const double rh_cut = g.r_horizon() * 1.03;
+    Vec4d fsal = Vec4d::nan_init();
+    const int max_steps = std::max(1, ctl.max_steps);
+    for (int it = 0; it < max_steps; ++it) {
+        const GeodesicState s_prev = s;
+        int rejects = 0;
+        while (true) {
+            if (adaptive_step(g, s, dlam, intg, fsal, ctl.tol)) break;
+            if (!std::isfinite(dlam) || ++rejects > 64)
+                return {Outcome::ESCAPED, s.r, 1.0, 0.0, s.theta, s.phi};
+        }
+
+        double best_alpha = 2.0;
+        enum class TailEvent { NONE, HORIZON, ESCAPE };
+        TailEvent best_event = TailEvent::NONE;
+
+        const bool horizon_cross = ((s_prev.r > rh_cut) && (s.r <= rh_cut)) || (s.r <= rh_cut);
+        if (horizon_cross) {
+            const double denom_h = s_prev.r - s.r;
+            double alpha_h = (std::abs(denom_h) > 1e-12) ? ((s_prev.r - rh_cut) / denom_h) : 0.0;
+            alpha_h = clamp(alpha_h, 0.0, 1.0);
+            if (alpha_h < best_alpha) {
+                best_alpha = alpha_h;
+                best_event = TailEvent::HORIZON;
+            }
+        }
+
+        const bool escape_cross = ((s_prev.r < r_escape) && (s.r >= r_escape)) || (s.r >= r_escape);
+        if (escape_cross) {
+            const double denom_e = s.r - s_prev.r;
+            double alpha_e = (std::abs(denom_e) > 1e-12) ? ((r_escape - s_prev.r) / denom_e) : 1.0;
+            alpha_e = clamp(alpha_e, 0.0, 1.0);
+            if (alpha_e < best_alpha) {
+                best_alpha = alpha_e;
+                best_event = TailEvent::ESCAPE;
+            }
+        }
+
+        if (best_event == TailEvent::HORIZON) {
+            const double r_h = s_prev.r + best_alpha * (s.r - s_prev.r);
+            return {Outcome::HORIZON, r_h, 0.0};
+        }
+        if (best_event == TailEvent::ESCAPE) {
+            const double th_esc = s_prev.theta + best_alpha * (s.theta - s_prev.theta);
+            const double ph_esc = s_prev.phi   + best_alpha * (s.phi   - s_prev.phi);
+            return {Outcome::ESCAPED, r_escape, 1.0, 0.0, th_esc, ph_esc};
+        }
+    }
+    return {Outcome::ESCAPED, s.r, 1.0, 0.0, s.theta, s.phi};
+}
+
 static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                                 double r_disk_in, double r_disk_out,
                                 double r_escape,
                                 Integrator intg=Integrator::RK4_DOUBLING,
-                                const IntegratorControls& ctl = IntegratorControls{}) {
+                                const IntegratorControls& ctl = IntegratorControls{},
+                                const ColorParams* cp_ptr = nullptr) {
     double rh=g.r_horizon(), dlam=std::max(ctl.step_init, 1e-10);
     const double rh_cut = rh * 1.03;
     Vec4d fsal=Vec4d::nan_init();
@@ -419,11 +507,22 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                 const double r_hit = hermite_interp_scalar(
                     s_prev.r, s.r, dr0, dr1, step_used, alpha);
                 if (r_hit>=r_disk_in && r_hit<=r_disk_out) {
-                    disk_r_hit = r_hit;
-                    disk_redshift_hit = clamp(disk_redshift(r_hit, s.pt, s.pphi, g), 0.0, 20.0);
-                    disk_phi_hit = s_prev.phi + alpha * (s.phi - s_prev.phi);
-                    best_alpha = alpha;
-                    best_event = StepEvent::DISK;
+                    const double phi_hit = s_prev.phi + alpha * (s.phi - s_prev.phi);
+                    bool pass_through = false;
+                    if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
+                        pass_through = stratified_disk_tile_transparent(
+                            r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr);
+                    } else if (cp_ptr && cp_ptr->palette == DiskPalette::INTERSTELLAR) {
+                        pass_through = interstellar_disk_soft_mask(
+                            r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
+                    }
+                    if (!pass_through) {
+                        disk_r_hit = r_hit;
+                        disk_redshift_hit = clamp(disk_redshift(r_hit, s.pt, s.pphi, g), 0.0, 20.0);
+                        disk_phi_hit = phi_hit;
+                        best_alpha = alpha;
+                        best_event = StepEvent::DISK;
+                    }
                 }
             }
         }
@@ -451,7 +550,33 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
         }
 
         if (best_event == StepEvent::DISK) {
-            return {Outcome::DISK_HIT, disk_r_hit, disk_redshift_hit, disk_phi_hit};
+            TraceResult out{Outcome::DISK_HIT, disk_r_hit, disk_redshift_hit, disk_phi_hit};
+            const double alpha = clamp(best_alpha, 0.0, 1.0);
+            const double opacity = cp_ptr ? clamp(cp_ptr->disk_opacity, 0.0, 1.0) : 1.0;
+            if (opacity < (1.0 - 1e-9)) {
+                GeodesicState s_hit = s_prev;
+                s_hit.r      = s_prev.r      + alpha * (s.r      - s_prev.r);
+                s_hit.theta  = s_prev.theta  + alpha * (s.theta  - s_prev.theta);
+                s_hit.phi    = s_prev.phi    + alpha * (s.phi    - s_prev.phi);
+                s_hit.pr     = s_prev.pr     + alpha * (s.pr     - s_prev.pr);
+                s_hit.ptheta = s_prev.ptheta + alpha * (s.ptheta - s_prev.ptheta);
+                s_hit.pt     = s_prev.pt;
+                s_hit.pphi   = s_prev.pphi;
+
+                const double th_eps = 1e-6;
+                const double q_dir = (s.theta - s_prev.theta);
+                if (std::abs(s_hit.theta - M_PI/2.0) < 1e-5)
+                    s_hit.theta += (q_dir >= 0.0 ? th_eps : -th_eps);
+                s_hit.theta = clamp(s_hit.theta, th_eps, M_PI - th_eps);
+
+                IntegratorControls tail_ctl = ctl;
+                tail_ctl.step_init = std::max(1e-10, step_used * std::max(1e-3, 1.0 - alpha));
+                TraceResult behind = trace_terminal_no_disk(s_hit, g, r_escape, intg, tail_ctl);
+                out.behind_out = behind.out;
+                out.theta_esc = behind.theta_esc;
+                out.phi_esc = behind.phi_esc;
+            }
+            return out;
         }
         if (best_event == StepEvent::HORIZON) {
             const double r_h = s_prev.r + best_alpha * (s.r - s_prev.r);
@@ -610,10 +735,17 @@ static bool rk4_adaptive_separable_kerr(const SeparableKerrConsts& c, SeparableS
 static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMetric& g,
                                                double r_disk_in, double r_disk_out,
                                                double r_escape,
-                                               const IntegratorControls& ctl = IntegratorControls{}) {
+                                               const IntegratorControls& ctl = IntegratorControls{},
+                                               const ColorParams* cp_ptr = nullptr) {
+    if (cp_ptr && clamp(cp_ptr->disk_opacity, 0.0, 1.0) < (1.0 - 1e-9)) {
+        // Semi-analytic path currently does not carry post-disk continuation metadata
+        // required for alpha compositing; defer to standard BL tracer.
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
+    }
+
     SeparableKerrConsts c{};
     if (!init_separable_consts(s_bl, g, c))
-        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl);
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
 
     // Initial signs from BL canonical velocity directions.
     double dr0=0.0, dth0=0.0, dpr0=0.0, dpth0=0.0;
@@ -642,7 +774,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
             step_used = h;
             if (rk4_adaptive_separable_kerr(c, s, h, ctl.tol)) break;
             if (!std::isfinite(h) || ++rejects > 64)
-                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl);
+                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
         }
 
         // Keep theta in [0, pi].
@@ -676,7 +808,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
             double dr1=0.0, dth1=0.0, dphi1=0.0;
             if (!kerr_sep_rhs(c, s_prev, dr0, dth0, dphi0) ||
                 !kerr_sep_rhs(c, s,      dr1, dth1, dphi1)) {
-                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl);
+                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
             }
 
             double alpha = 0.0;
@@ -686,11 +818,22 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
                 const double r_hit = hermite_interp_scalar(
                     s_prev.r, s.r, dr0, dr1, step_used, alpha);
                 if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
-                    disk_r_hit = r_hit;
-                    disk_red_hit = clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g), 0.0, 20.0);
-                    disk_phi_hit = s_prev.phi + alpha * (s.phi - s_prev.phi);
-                    best_alpha = alpha;
-                    best_event = StepEvent::DISK;
+                    const double phi_hit = s_prev.phi + alpha * (s.phi - s_prev.phi);
+                    bool pass_through = false;
+                    if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
+                        pass_through = stratified_disk_tile_transparent(
+                            r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr);
+                    } else if (cp_ptr && cp_ptr->palette == DiskPalette::INTERSTELLAR) {
+                        pass_through = interstellar_disk_soft_mask(
+                            r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
+                    }
+                    if (!pass_through) {
+                        disk_r_hit = r_hit;
+                        disk_red_hit = clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g), 0.0, 20.0);
+                        disk_phi_hit = phi_hit;
+                        best_alpha = alpha;
+                        best_event = StepEvent::DISK;
+                    }
                 }
             }
         }
@@ -1256,7 +1399,8 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                                    double r_disk_in, double r_disk_out,
                                    double r_escape,
                                    Integrator intg,
-                                   const IntegratorControls& ctl = IntegratorControls{});
+                                   const IntegratorControls& ctl = IntegratorControls{},
+                                   const ColorParams* cp_ptr = nullptr);
 
 static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMetric& g,
                                                 double r_disk_in, double r_disk_out,
@@ -1264,13 +1408,14 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
                                                 EllipticFallbackReason* fallback_reason = nullptr,
                                                 CoordinateChart fallback_chart = CoordinateChart::BL,
                                                 Integrator intg = Integrator::RK4_DOUBLING,
-                                                const IntegratorControls& ctl = IntegratorControls{}) {
+                                                const IntegratorControls& ctl = IntegratorControls{},
+                                                const ColorParams* cp_ptr = nullptr) {
     if (fallback_reason) *fallback_reason = EllipticFallbackReason::NONE;
     auto fallback_trace = [&](EllipticFallbackReason reason) -> TraceResult {
         if (fallback_reason) *fallback_reason = reason;
         if (fallback_chart == CoordinateChart::KS)
-            return trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
-        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
+            return trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
     };
 
     SeparableKerrConsts c{};
@@ -1322,10 +1467,15 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
         // before any disk intersection, prefer horizon to avoid leakage
         // inside the black-hole silhouette.
         const TraceResult verify = (fallback_chart == CoordinateChart::KS)
-            ? trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl)
-            : trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
+            ? trace_single_ks(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr)
+            : trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
         if (verify.out == Outcome::HORIZON)
             return verify;
+
+        // Stratified/Interstellar and global opacity < 1 are phi-dependent; this
+        // direct branch does not compute phi_hit robustly, so defer to numerical trace.
+        if (cp_ptr && (cp_ptr->palette != DiskPalette::BLACKBODY || cp_ptr->disk_opacity < (1.0 - 1e-9)))
+            return fallback_trace(EllipticFallbackReason::DIRECT_OUTSIDE_DISK);
 
         return {Outcome::DISK_HIT, r_now,
                 clamp(disk_redshift(r_now, s_bl.pt, s_bl.pphi, g), 0.0, 20.0)};
@@ -1564,10 +1714,11 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                                    double r_disk_in, double r_disk_out,
                                    double r_escape,
                                    Integrator intg,
-                                   const IntegratorControls& ctl) {
+                                   const IntegratorControls& ctl,
+                                   const ColorParams* cp_ptr) {
     KSState s{};
     if (!init_ks_state(s_bl, g, s))
-        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
+        return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
 
     if (intg == Integrator::DOPRI5) {
         static bool warned_dopri5_ks = false;
@@ -1637,11 +1788,21 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                 KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
                 if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
                     const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
-                    disk_r_hit  = r_hit;
-                    disk_red_hit = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
-                    disk_phi_hit = ph_hit;
-                    best_alpha  = alpha;
-                    best_event  = StepEvent::DISK;
+                    bool pass_through = false;
+                    if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
+                        pass_through = stratified_disk_tile_transparent(
+                            r_hit, ph_hit, r_disk_in, r_disk_out, *cp_ptr);
+                    } else if (cp_ptr && cp_ptr->palette == DiskPalette::INTERSTELLAR) {
+                        pass_through = interstellar_disk_soft_mask(
+                            r_hit, ph_hit, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
+                    }
+                    if (!pass_through) {
+                        disk_r_hit  = r_hit;
+                        disk_red_hit = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
+                        disk_phi_hit = ph_hit;
+                        best_alpha  = alpha;
+                        best_event  = StepEvent::DISK;
+                    }
                 }
             }
         }
@@ -1669,7 +1830,34 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
         }
 
         if (best_event == StepEvent::DISK) {
-            return {Outcome::DISK_HIT, disk_r_hit, disk_red_hit, disk_phi_hit};
+            TraceResult out{Outcome::DISK_HIT, disk_r_hit, disk_red_hit, disk_phi_hit};
+            const double opacity = cp_ptr ? clamp(cp_ptr->disk_opacity, 0.0, 1.0) : 1.0;
+            if (opacity < (1.0 - 1e-9)) {
+                const double alpha = clamp(best_alpha, 0.0, 1.0);
+                const double Xh = s_prev.X + alpha * (s.X - s_prev.X);
+                const double Yh = s_prev.Y + alpha * (s.Y - s_prev.Y);
+                const double Zh = s_prev.Z + alpha * (s.Z - s_prev.Z);
+                const double pXh = s_prev.pX + alpha * (s.pX - s_prev.pX);
+                const double pYh = s_prev.pY + alpha * (s.pY - s_prev.pY);
+                const double pZh = s_prev.pZ + alpha * (s.pZ - s_prev.pZ);
+
+                double r_hit, th_hit, ph_hit;
+                KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
+                const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
+                GeodesicState s_hit{r_hit, th_hit, ph_hit, pbl[0], pbl[1], s_prev.pT, pbl[2]};
+                const double th_eps = 1e-6;
+                if (std::abs(s_hit.theta - M_PI/2.0) < 1e-5)
+                    s_hit.theta += ((s.Z - s_prev.Z) >= 0.0 ? th_eps : -th_eps);
+                s_hit.theta = clamp(s_hit.theta, th_eps, M_PI - th_eps);
+
+                IntegratorControls tail_ctl = ctl;
+                tail_ctl.step_init = std::max(1e-10, step_used * std::max(1e-3, 1.0 - alpha));
+                TraceResult behind = trace_terminal_no_disk(s_hit, g, r_escape, Integrator::RK4_DOUBLING, tail_ctl);
+                out.behind_out = behind.out;
+                out.theta_esc = behind.theta_esc;
+                out.phi_esc = behind.phi_esc;
+            }
+            return out;
         }
         if (best_event == StepEvent::HORIZON) {
             const double r_h = prev_r_ks + best_alpha * (r_now - prev_r_ks);
@@ -1746,16 +1934,65 @@ static double cell_hash(int cell_id, double salt_a, double salt_b) {
     return v - std::floor(v);
 }
 
-// Interstellar / accretion_warm disk coloring:
+// Returns true when the local segmented Interstellar disk cell blend is effectively
+// transparent (no opaque contribution). Used in Phase 1 to let rays pass through
+// those tiles and continue to background/horizon events.
+static bool stratified_disk_tile_transparent(double r, double phi,
+                                             double r_in, double r_out,
+                                             const ColorParams& cp) {
+    const int    NR    = cp.disk_rings   > 0 ? cp.disk_rings   : 1;
+    const int    NS    = cp.disk_sectors > 0 ? cp.disk_sectors : 1;
+    const double sigma = cp.disk_sigma   > 0 ? cp.disk_sigma   : 0.5;
+    const double span_r = std::max(r_out - r_in, 1e-12);
+
+    const double r_norm   = clamp((r - r_in) / span_r, 0.0, 1.0);
+    const double phi_wrap = std::fmod(phi, 2.0 * M_PI);
+    const double phi_norm = (phi_wrap < 0.0 ? phi_wrap + 2.0 * M_PI : phi_wrap) / (2.0 * M_PI);
+    const double ring_pos = r_norm * NR;
+    const double sec_pos  = phi_norm * NS;
+
+    const double inv2sig2 = 1.0 / (2.0 * sigma * sigma);
+    const int    SEARCH   = (int)std::ceil(3.0 * sigma) + 1;
+
+    double w_total = 0.0;
+    double w_opaque = 0.0;
+
+    for (int ri = -SEARCH; ri <= NR + SEARCH; ++ri) {
+        const double dr = ring_pos - (double)ri;
+        if (dr * dr * inv2sig2 > 16.0) continue;
+        const int ri_clamped = ri < 0 ? 0 : ri >= NR ? NR - 1 : ri;
+
+        for (int si_raw = -SEARCH; si_raw <= NS + SEARCH; ++si_raw) {
+            double ds = sec_pos - (double)si_raw;
+            ds = ds - std::floor((ds + NS * 0.5) / NS) * NS;
+            const double dist2 = dr * dr + ds * ds;
+            const double w = std::exp(-dist2 * inv2sig2);
+            if (w < 1e-6) continue;
+
+            const int si_clamped = ((si_raw % NS) + NS) % NS;
+            const int cell_id = ri_clamped * NS + si_clamped;
+            const double h3 = cell_hash(cell_id, 419.2, 371.9);
+
+            w_total += w;
+            if (h3 >= 0.30) w_opaque += w;
+        }
+    }
+
+    if (w_total < 1e-9) return true;
+    const double opacity = w_opaque / w_total;
+    return opacity < 1e-3;
+}
+
+// Stratified disk coloring (legacy "interstellar"):
 // n_rings concentric bands × n_sectors azimuthal slices, each assigned
 // a deterministic warm color (red/orange/yellow, some transparent).
 // Colors are Gaussian-blended across cell boundaries so there are no hard edges.
 // Physical modulation (redshift, Page-Thorne emissivity, magnification) applied on top.
-static RGB disk_colour_interstellar(double r, double phi,
-                                    double red, double magnif,
-                                    double r_in, double r_out,
-                                    double M, double r_isco,
-                                    const ColorParams& cp) {
+static RGB disk_colour_stratified(double r, double phi,
+                                  double red, double magnif,
+                                  double r_in, double r_out,
+                                  double M, double r_isco,
+                                  const ColorParams& cp) {
     const int    NR    = cp.disk_rings   > 0 ? cp.disk_rings   : 1;
     const int    NS    = cp.disk_sectors > 0 ? cp.disk_sectors : 1;
     const double sigma = cp.disk_sigma   > 0 ? cp.disk_sigma   : 0.5;
@@ -1820,12 +2057,154 @@ static RGB disk_colour_interstellar(double r, double phi,
     const double receding_lift = 1.0 + 0.85 * clamp(1.0 - red_c, 0.0, 1.0);
     I *= std::pow(red_c, 4.0) * receding_lift;
     I *= clamp(1.0 / magnif, 0.05, 5.0);
+    I *= std::max(0.0, cp.disk_brightness);
 
     const double norm = w_total * 255.0;
     return {
         (uint8_t)(tonemap(acc_r / norm * I, cp.exposure, cp.gamma) * 255),
         (uint8_t)(tonemap(acc_g / norm * I, cp.exposure, cp.gamma) * 255),
         (uint8_t)(tonemap(acc_b / norm * I, cp.exposure, cp.gamma) * 255)
+    };
+}
+
+static double smoothstep_range(double edge0, double edge1, double x) {
+    if (edge1 <= edge0) return (x >= edge1) ? 1.0 : 0.0;
+    const double t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+static double fract01(double x) {
+    return x - std::floor(x);
+}
+
+static double hash2d(double x, double y, double seed) {
+    return fract01(std::sin(x * 127.1 + y * 311.7 + seed) * 43758.5453123);
+}
+
+static double value_noise2d(double x, double y, double seed) {
+    const double ix = std::floor(x);
+    const double iy = std::floor(y);
+    const double fx = x - ix;
+    const double fy = y - iy;
+
+    const double ux = fx * fx * (3.0 - 2.0 * fx);
+    const double uy = fy * fy * (3.0 - 2.0 * fy);
+
+    const double n00 = hash2d(ix + 0.0, iy + 0.0, seed);
+    const double n10 = hash2d(ix + 1.0, iy + 0.0, seed);
+    const double n01 = hash2d(ix + 0.0, iy + 1.0, seed);
+    const double n11 = hash2d(ix + 1.0, iy + 1.0, seed);
+
+    const double nx0 = n00 + (n10 - n00) * ux;
+    const double nx1 = n01 + (n11 - n01) * ux;
+    return nx0 + (nx1 - nx0) * uy;
+}
+
+static double fbm2d(double x, double y, double seed, int octaves = 5) {
+    double sum = 0.0;
+    double amp = 0.5;
+    double freq = 1.0;
+    double norm = 0.0;
+    for (int i = 0; i < octaves; ++i) {
+        sum += amp * value_noise2d(x * freq, y * freq, seed + 17.0 * i);
+        norm += amp;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    return (norm > 0.0) ? (sum / norm) : 0.0;
+}
+
+static double interstellar_disk_soft_mask(double r, double phi,
+                                          double r_in, double r_out,
+                                          const ColorParams& cp) {
+    const double phi_norm = fract01(phi / (2.0 * M_PI));
+    const double t = cp.interstellar_time;
+
+    const double edgeInNoise = 2.0 * fbm2d(phi_norm * 3.0, t * 0.10, 11.0, 4) - 1.0;
+    const double edgeOutNoise = 2.0 * fbm2d(phi_norm * 2.0, t * 0.07, 29.0, 4) - 1.0;
+
+    const double rin_local = r_in * (1.0 + 0.03 * edgeInNoise);
+    const double rout_local = r_out * (1.0 + 0.06 * edgeOutNoise);
+    const double rout_safe = std::max(rout_local, rin_local + 1e-4);
+
+    const double softness_in = std::max(1e-6, cp.interstellar_softness_in_scale * r_in);
+    const double softness_out = std::max(1e-6, cp.interstellar_softness_out_scale * r_out);
+
+    const double inner_mask = smoothstep_range(rin_local, rin_local + softness_in, r);
+    const double outer_mask = 1.0 - smoothstep_range(rout_safe - softness_out, rout_safe, r);
+    return clamp(inner_mask * outer_mask, 0.0, 1.0);
+}
+
+// Interstellar cinematic disk coloring (artist-driven):
+// annulus mask + radial emissivity + differential rotation advection +
+// stretched turbulence + logarithmic radial bands + warm HDR palette.
+static RGB disk_colour_interstellar(double r, double phi,
+                                    double red, double magnif,
+                                    double r_in, double r_out,
+                                    double M, double r_isco,
+                                    const ColorParams& cp) {
+    (void)M;
+    (void)r_isco;
+
+    const double x = clamp((r - r_in) / std::max(r_out - r_in, 1e-12), 0.0, 1.0);
+    const double t = cp.interstellar_time;
+
+    const double omega0 = cp.interstellar_omega0;
+    const double omega = omega0 * std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -1.5);
+    const double phit = phi - omega * t;
+
+    const double mask = interstellar_disk_soft_mask(r, phi, r_in, r_out, cp);
+    if (mask <= 1e-6) return {0, 0, 0};
+
+    const double p = std::max(0.1, cp.interstellar_p);
+    const double inner_falloff = std::max(1e-6, cp.interstellar_inner_falloff_scale * r_in);
+    const double radial = std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -p);
+    const double inner_glow = std::exp(-(r - r_in) / inner_falloff);
+    const double profile = radial * inner_glow;
+
+    const double n1 = 2.0 * fbm2d(r * 1.2, phit * 8.0, 41.0, 5) - 1.0;
+    const double n2 = 2.0 * fbm2d(r * 5.0, phit * 25.0 + 2.0 * n1, 73.0, 4) - 1.0;
+    const double turb_str = cp.interstellar_turbulence_strength;
+    const double turbulence = 0.75 + turb_str * (0.35 * n1 + 0.12 * n2);
+
+    const double band_strength = cp.interstellar_band_strength;
+    const double band_frequency = cp.interstellar_band_frequency;
+    const double band_warp = cp.interstellar_band_warp;
+    const double bands = 1.0 + band_strength *
+        std::sin(band_frequency * std::log(std::max(r / std::max(r_in, 1e-12), 1e-6)) + band_warp * n1);
+
+    // Thermal palette: inner warm-white -> orange -> deep red/brown.
+    const double inner_r = 1.0, inner_g = 0.82, inner_b = 0.45;
+    const double mid_r   = 1.0, mid_g   = 0.32, mid_b   = 0.06;
+    const double out_r   = clamp(cp.interstellar_outer_r, 0.0, 1.0),
+                 out_g   = clamp(cp.interstellar_outer_g, 0.0, 1.0),
+                 out_b   = clamp(cp.interstellar_outer_b, 0.0, 1.0);
+
+    const double t1 = smoothstep_range(0.08, 0.38, x);
+    double cr = inner_r + (mid_r - inner_r) * t1;
+    double cg = inner_g + (mid_g - inner_g) * t1;
+    double cb = inner_b + (mid_b - inner_b) * t1;
+    const double t2 = smoothstep_range(0.35, 1.0, x);
+    cr += (out_r - cr) * t2;
+    cg += (out_g - cg) * t2;
+    cb += (out_b - cb) * t2;
+
+    // Doppler and lensing modulation to keep physical plausibility.
+    const double red_c = clamp(red, 0.1, 10.0);
+    const double receding_lift = 1.0 + 0.85 * clamp(1.0 - red_c, 0.0, 1.0);
+    const double lens = clamp(1.0 / std::max(magnif, 1e-6), 0.05, 5.0);
+
+    double intensity = mask * profile * turbulence * bands;
+    intensity *= std::pow(red_c, 4.0) * receding_lift;
+    intensity *= lens;
+    intensity *= cp.interstellar_hdr_intensity;
+    intensity *= std::max(0.0, cp.disk_brightness);
+    intensity = std::max(intensity, 0.0);
+
+    return {
+        (uint8_t)(tonemap(cr * intensity, cp.exposure, cp.gamma) * 255),
+        (uint8_t)(tonemap(cg * intensity, cp.exposure, cp.gamma) * 255),
+        (uint8_t)(tonemap(cb * intensity, cp.exposure, cp.gamma) * 255)
     };
 }
 
@@ -1840,6 +2219,7 @@ static RGB disk_colour(double r, double red, double magnif,
     const double receding_lift = 1.0 + 0.85 * clamp(1.0 - red_c, 0.0, 1.0);
     I *= std::pow(red_c, 4.0) * receding_lift;
     I *= clamp(1.0/magnif, 0.05, 5.0);
+    I *= std::max(0.0, cp.disk_brightness);
     auto c = blackbody(T);
     return {(uint8_t)(tonemap(c.r/255.0*I, cp.exposure, cp.gamma)*255),
             (uint8_t)(tonemap(c.g/255.0*I, cp.exposure, cp.gamma)*255),
@@ -1880,13 +2260,40 @@ static std::vector<RGB> colorize_buffer(
     for (int i = 0; i < W*H; ++i) {
         const GeoPixel& p = geo[i];
         if (p.outcome == 1) {
-            if (cp.palette == DiskPalette::INTERSTELLAR)
-                image[i] = disk_colour_interstellar(p.r, p.phi_disk,
+            RGB disk_col{};
+            if (cp.palette == DiskPalette::STRATIFIED) {
+                disk_col = disk_colour_stratified(p.r, p.phi_disk,
+                                                  p.redshift, p.magnif,
+                                                  r_disk_in, r_disk_out,
+                                                  M_bh, r_isco, cp);
+            } else if (cp.palette == DiskPalette::INTERSTELLAR) {
+                disk_col = disk_colour_interstellar(p.r, p.phi_disk,
                                                     p.redshift, p.magnif,
                                                     r_disk_in, r_disk_out,
                                                     M_bh, r_isco, cp);
-            else
-                image[i] = disk_colour(p.r, p.redshift, p.magnif, M_bh, r_isco, cp);
+            } else {
+                disk_col = disk_colour(p.r, p.redshift, p.magnif, M_bh, r_isco, cp);
+            }
+
+            const double alpha = clamp(cp.disk_opacity, 0.0, 1.0);
+            if (alpha >= 1.0 - 1e-9) {
+                image[i] = disk_col;
+            } else {
+                RGB behind{0,0,0};
+                const uint8_t behind_code = p._pad[1];
+                if (behind_code == 0) {
+                    if (!bg.px.empty()) behind = bg.sample(p.theta_esc, p.phi_esc);
+                } else if (behind_code == 3) {
+                    const BackgroundImage& bgB = (bg_b && !bg_b->px.empty()) ? *bg_b : bg;
+                    if (!bgB.px.empty()) behind = bgB.sample(p.theta_esc, p.phi_esc);
+                }
+                const double ia = 1.0 - alpha;
+                image[i] = {
+                    (uint8_t)clamp(alpha * disk_col.r + ia * behind.r, 0.0, 255.0),
+                    (uint8_t)clamp(alpha * disk_col.g + ia * behind.g, 0.0, 255.0),
+                    (uint8_t)clamp(alpha * disk_col.b + ia * behind.b, 0.0, 255.0),
+                };
+            }
         } else if (p.outcome == 3) {
             // Universe B — use secondary background if provided, else bg
             const BackgroundImage& bgB = (bg_b && !bg_b->px.empty()) ? *bg_b : bg;
@@ -2055,6 +2462,7 @@ static std::vector<GeoPixel> trace_geodesics(
     double pixel_offset_x,
     double pixel_offset_y,
     double M_bh, double Q_bh, double Lam,
+    const ColorParams* cp_ptr = nullptr,
     KGeoMeta* meta_out = nullptr,
     bool debug_elliptic = false)
 {
@@ -2165,6 +2573,7 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.phi_disk  = (float)res.phi_disk;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
+                pix._pad[1] = res.disk_hit ? 2 : 0;
             } else {
                 auto s   = cam.pixel_ray(px_, py, g, pixel_offset_x, pixel_offset_y);
                 TraceResult res{};
@@ -2172,7 +2581,7 @@ static std::vector<GeoPixel> trace_geodesics(
                     EllipticFallbackReason fb_reason = EllipticFallbackReason::NONE;
                     res = trace_single_elliptic_closed(
                         s, g, r_disk_in, r_disk_out, r_escape,
-                        &fb_reason, eff_chart, intg, ctl);
+                        &fb_reason, eff_chart, intg, ctl, cp_ptr);
                     if (debug_elliptic)
                         pix._pad[0] = static_cast<uint8_t>(fb_reason);
                     if (track_elliptic_fallbacks) {
@@ -2185,11 +2594,11 @@ static std::vector<GeoPixel> trace_geodesics(
                         }
                     }
                 } else if (eff_chart == CoordinateChart::KS) {
-                    res = trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
+                    res = trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
                 } else if (solver_sel.effective == RaySolverMode::SEMI_ANALYTIC) {
-                    res = trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape, ctl);
+                    res = trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape, ctl, cp_ptr);
                 } else {
-                    res = trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl);
+                    res = trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
                 }
                 pix.outcome   = (res.out==Outcome::DISK_HIT)  ? 1
                               : (res.out==Outcome::HORIZON)    ? 2
@@ -2200,9 +2609,15 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.phi_disk  = (float)res.phi_disk;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
+                if (res.out == Outcome::DISK_HIT) {
+                    pix._pad[1] = (res.behind_out == Outcome::ESCAPED_B) ? 3
+                                : (res.behind_out == Outcome::HORIZON)   ? 2 : 0;
+                } else {
+                    pix._pad[1] = 0;
+                }
             }
             if (!debug_elliptic) pix._pad[0]=0;
-            pix._pad[1]=pix._pad[2]=0;
+            pix._pad[2]=0;
         }
         int done = ++rows_done;
         if (done%4==0 || done==H) {
@@ -2401,7 +2816,18 @@ static std::vector<RGB> render_image(
         solver_gpu_supported;
     const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
     const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
-    const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported) && !fp.wormhole;
+    const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
+    const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported) && !fp.wormhole
+                          && !alpha_composite_cpu_only;
+
+    if (alpha_composite_cpu_only) {
+        static bool warned_alpha_composite_cpu = false;
+        if (!warned_alpha_composite_cpu) {
+            std::cerr << "Info: disk-opacity < 1 enables true alpha compositing behind the disk; "
+                         "using CPU path for parity.\n";
+            warned_alpha_composite_cpu = true;
+        }
+    }
 
     if (can_use_gpu) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
@@ -2421,7 +2847,27 @@ static std::vector<RGB> render_image(
                            (float)std::max(ctl.step_init, 1e-6),
                            (float)std::max(ctl.tol, 1e-9),
                            (float)pixel_offset_x,
-                           (float)pixel_offset_y};
+                           (float)pixel_offset_y,
+                           (float)cp.exposure,
+                           (float)cp.gamma,
+                           (float)cp.disk_brightness,
+                           (float)cp.disk_opacity,
+                           static_cast<int>(cp.palette),
+                           (float)cp.interstellar_omega0,
+                           (float)cp.interstellar_p,
+                           (float)cp.interstellar_inner_falloff_scale,
+                           (float)cp.interstellar_band_strength,
+                           (float)cp.interstellar_band_frequency,
+                           (float)cp.interstellar_band_warp,
+                           (float)cp.interstellar_turbulence_strength,
+                           (float)cp.interstellar_hdr_intensity,
+                           (float)cp.interstellar_softness_in_scale,
+                           (float)cp.interstellar_softness_out_scale,
+                           (float)cp.interstellar_edge_transparency,
+                           (float)cp.interstellar_outer_r,
+                           (float)cp.interstellar_outer_g,
+                           (float)cp.interstellar_outer_b,
+                           (float)cp.interstellar_time};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -2480,7 +2926,7 @@ static std::vector<RGB> render_image(
     KGeoMeta meta;
     auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, ctl,
                                pixel_offset_x, pixel_offset_y,
-                               M_bh, Q_bh, Lam, &meta, debug_elliptic);
+                               M_bh, Q_bh, Lam, &cp, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
                            meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
@@ -2539,7 +2985,7 @@ static std::vector<RGB> render_image(
     KGeoMeta meta;
     auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, ctl,
                                pixel_offset_x, pixel_offset_y,
-                               M_bh, Q_bh, Lam, &meta, debug_elliptic);
+                               M_bh, Q_bh, Lam, &cp, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
                            meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
@@ -2549,7 +2995,7 @@ static std::vector<RGB> render_image(
     KGeoMeta meta;
     auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg, ctl,
                                pixel_offset_x, pixel_offset_y,
-                               M_bh, Q_bh, Lam, &meta, debug_elliptic);
+                               M_bh, Q_bh, Lam, &cp, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
     return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
                            meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
@@ -2592,7 +3038,7 @@ int main(int argc, char** argv) {
     std::string bg_path;
 
     // ── Single-frame / base params ───────────────────────────
-    double arg_a=0.7, arg_disk_out=12.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
+    double arg_a=0.5, arg_disk_out=12.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
     double arg_Q=0.0, arg_Lam=0.0, arg_fov=30.0;
 
     // ── Wormhole params ───────────────────────────────────────
@@ -2604,6 +3050,27 @@ int main(int argc, char** argv) {
 
     // ── Colorization params ───────────────────────────────────
     ColorParams cp;  // defaults: exposure=1, gamma=2.2, temp_scale=1
+    double cli_disk_brightness = cp.disk_brightness;
+    double cli_disk_opacity    = cp.disk_opacity;
+    int    cli_disk_rings      = cp.disk_rings;
+    int    cli_disk_sectors    = cp.disk_sectors;
+    double cli_disk_sigma      = cp.disk_sigma;
+    double cli_disk_hue_offset = cp.disk_hue_offset;
+    double cli_interstellar_omega0              = cp.interstellar_omega0;
+    double cli_interstellar_p                   = cp.interstellar_p;
+    double cli_interstellar_inner_falloff_scale = cp.interstellar_inner_falloff_scale;
+    double cli_interstellar_band_strength       = cp.interstellar_band_strength;
+    double cli_interstellar_band_frequency      = cp.interstellar_band_frequency;
+    double cli_interstellar_band_warp           = cp.interstellar_band_warp;
+    double cli_interstellar_turbulence_strength = cp.interstellar_turbulence_strength;
+    double cli_interstellar_hdr_intensity       = cp.interstellar_hdr_intensity;
+    double cli_interstellar_softness_in_scale   = cp.interstellar_softness_in_scale;
+    double cli_interstellar_softness_out_scale  = cp.interstellar_softness_out_scale;
+    double cli_interstellar_edge_transparency = cp.interstellar_edge_transparency;
+    double cli_interstellar_outer_r             = cp.interstellar_outer_r;
+    double cli_interstellar_outer_g             = cp.interstellar_outer_g;
+    double cli_interstellar_outer_b             = cp.interstellar_outer_b;
+    double cli_interstellar_time                = cp.interstellar_time;
 
     // ── Two-phase modes ───────────────────────────────────────
     bool        geo_only    = false;
@@ -2715,12 +3182,30 @@ int main(int argc, char** argv) {
         if (arg=="--exposure"   && i+1<argc) cp.exposure   = std::stod(argv[++i]);
         if (arg=="--gamma"      && i+1<argc) cp.gamma      = std::stod(argv[++i]);
         if (arg=="--temp-scale" && i+1<argc) cp.temp_scale = std::stod(argv[++i]);
-        if (arg=="--disk-interstellar") cp.palette = DiskPalette::INTERSTELLAR;
+        if (arg=="--disk-brightness" && i+1<argc) cli_disk_brightness = std::stod(argv[++i]);
+        if (arg=="--disk-opacity" && i+1<argc) cli_disk_opacity = std::stod(argv[++i]);
         if (arg=="--disk-blackbody")    cp.palette = DiskPalette::BLACKBODY;
-        if (arg=="--disk-rings"      && i+1<argc) cp.disk_rings      = std::stoi(argv[++i]);
-        if (arg=="--disk-sectors"    && i+1<argc) cp.disk_sectors    = std::stoi(argv[++i]);
-        if (arg=="--disk-sigma"      && i+1<argc) cp.disk_sigma      = std::stod(argv[++i]);
-        if (arg=="--disk-hue-offset" && i+1<argc) cp.disk_hue_offset = std::stod(argv[++i]);
+        if (arg=="--disk-stratified")   cp.palette = DiskPalette::STRATIFIED;
+        if (arg=="--disk-interstellar") cp.palette = DiskPalette::INTERSTELLAR;
+        if (arg=="--disk-rings"      && i+1<argc) cli_disk_rings      = std::stoi(argv[++i]);
+        if (arg=="--disk-sectors"    && i+1<argc) cli_disk_sectors    = std::stoi(argv[++i]);
+        if (arg=="--disk-sigma"      && i+1<argc) cli_disk_sigma      = std::stod(argv[++i]);
+        if (arg=="--disk-hue-offset" && i+1<argc) cli_disk_hue_offset = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-omega0" && i+1<argc) cli_interstellar_omega0 = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-p" && i+1<argc) cli_interstellar_p = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-inner-falloff" && i+1<argc) cli_interstellar_inner_falloff_scale = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-band-strength" && i+1<argc) cli_interstellar_band_strength = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-band-frequency" && i+1<argc) cli_interstellar_band_frequency = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-band-warp" && i+1<argc) cli_interstellar_band_warp = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-turbulence" && i+1<argc) cli_interstellar_turbulence_strength = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-hdr" && i+1<argc) cli_interstellar_hdr_intensity = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-softness-in" && i+1<argc) cli_interstellar_softness_in_scale = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-softness-out" && i+1<argc) cli_interstellar_softness_out_scale = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-edge-transparency" && i+1<argc) cli_interstellar_edge_transparency = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-outer-r" && i+1<argc) cli_interstellar_outer_r = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-outer-g" && i+1<argc) cli_interstellar_outer_g = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-outer-b" && i+1<argc) cli_interstellar_outer_b = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-time" && i+1<argc) cli_interstellar_time = std::stod(argv[++i]);
 
         // Wormhole
         if (arg=="--wormhole")                   arg_wormhole = true;
@@ -2756,6 +3241,34 @@ int main(int argc, char** argv) {
         if (arg=="--a-end"          &&i+1<argc) anim_a_end          =std::stod(argv[++i]);
         if (arg=="--disk-out-start" &&i+1<argc) anim_disk_out_start =std::stod(argv[++i]);
         if (arg=="--disk-out-end"   &&i+1<argc) anim_disk_out_end   =std::stod(argv[++i]);
+    }
+
+    cp.disk_brightness = std::max(0.0, cli_disk_brightness);
+    cp.disk_opacity = clamp(cli_disk_opacity, 0.0, 1.0);
+
+    if (cp.palette == DiskPalette::STRATIFIED) {
+        cp.disk_rings = std::max(1, cli_disk_rings);
+        cp.disk_sectors = std::max(1, cli_disk_sectors);
+        cp.disk_sigma = std::max(0.01, cli_disk_sigma);
+        cp.disk_hue_offset = std::fmod(cli_disk_hue_offset, 1.0);
+        if (cp.disk_hue_offset < 0.0) cp.disk_hue_offset += 1.0;
+    }
+    if (cp.palette == DiskPalette::INTERSTELLAR) {
+        cp.interstellar_omega0 = std::max(1.0e-4, cli_interstellar_omega0);
+        cp.interstellar_p = std::max(0.1, cli_interstellar_p);
+        cp.interstellar_inner_falloff_scale = std::max(1.0e-4, cli_interstellar_inner_falloff_scale);
+        cp.interstellar_band_strength = std::max(0.0, cli_interstellar_band_strength);
+        cp.interstellar_band_frequency = std::max(0.0, cli_interstellar_band_frequency);
+        cp.interstellar_band_warp = std::max(0.0, cli_interstellar_band_warp);
+        cp.interstellar_turbulence_strength = std::max(0.0, cli_interstellar_turbulence_strength);
+        cp.interstellar_hdr_intensity = std::max(0.0, cli_interstellar_hdr_intensity);
+        cp.interstellar_softness_in_scale = std::max(0.0, cli_interstellar_softness_in_scale);
+        cp.interstellar_softness_out_scale = std::max(0.0, cli_interstellar_softness_out_scale);
+        cp.interstellar_edge_transparency = clamp(cli_interstellar_edge_transparency, 0.0, 1.0);
+        cp.interstellar_outer_r = clamp(cli_interstellar_outer_r, 0.0, 1.0);
+        cp.interstellar_outer_g = clamp(cli_interstellar_outer_g, 0.0, 1.0);
+        cp.interstellar_outer_b = clamp(cli_interstellar_outer_b, 0.0, 1.0);
+        cp.interstellar_time = cli_interstellar_time;
     }
 
     // ── Background ───────────────────────────────────────────
@@ -2820,7 +3333,8 @@ int main(int argc, char** argv) {
                   << "  a=" << meta.a_bh << "  r_isco=" << meta.r_isco << "\n"
                   << "ColorParams: exposure=" << cp.exposure
                   << " gamma=" << cp.gamma
-                  << " temp_scale=" << cp.temp_scale << "\n";
+                  << " temp_scale=" << cp.temp_scale
+                  << " disk_brightness=" << cp.disk_brightness << "\n";
 
         auto image = colorize_buffer(geo, gW, gH, cp, bg, meta.M_bh, meta.r_isco,
                                      meta.r_disk_in, meta.r_disk_out);
@@ -2884,7 +3398,8 @@ int main(int argc, char** argv) {
             !use_bundles &&
             gpu_chart_ok &&
             solver_gpu_supported;
-        const bool can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
+        const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
+        const bool can_use_gpu = (bundle_gpu_supported || single_ray_gpu_supported) && !alpha_composite_cpu_only;
         if (can_use_gpu) ks_uses_rk4 = false;
 #endif
         const char* intg_tag = (ks_uses_rk4 || intg == Integrator::RK4_DOUBLING)
@@ -2912,7 +3427,8 @@ int main(int argc, char** argv) {
             solver_gpu_supported;
         const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
         const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
-        const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported);
+        const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
+        const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported) && !alpha_composite_cpu_only;
         return can_use_gpu ? "gpu-metal" : "cpu";
 #elif defined(USE_CUDA)
         const CoordinateChart eff_chart = effective_chart_for_naming(chart);
@@ -2978,7 +3494,9 @@ int main(int argc, char** argv) {
                   << "  " << W << "x" << H << "\n"
                   << "ColorParams: exp=" << cp.exposure
                   << " γ=" << cp.gamma
-                  << " T×=" << cp.temp_scale << "\n";
+                  << " T×=" << cp.temp_scale
+                  << " diskB×=" << cp.disk_brightness
+                  << " diskOpacity=" << cp.disk_opacity << "\n";
 
         double t0=get_time();
 
@@ -2986,7 +3504,7 @@ int main(int argc, char** argv) {
             // Phase 1 only: trace and save .kgeo
             KGeoMeta meta;
             auto geo = trace_geodesics(W, H, fp, use_bundles, solver_mode, chart, intg,
-                                       int_ctl, 0.0, 0.0, M_bh, Q_bh, Lam, &meta);
+                                       int_ctl, 0.0, 0.0, M_bh, Q_bh, Lam, &cp, &meta);
             double elapsed=get_time()-t0;
             std::cout << "Trace: " << elapsed << "s  ("
                       << std::fixed << std::setprecision(1)
@@ -3076,7 +3594,7 @@ int main(int argc, char** argv) {
         std::cout<<"  phi:    "<<phi_start<<"° → "<<phi_end<<"°\n";
     std::cout<<"  r_obs:  "<<r_start<<" M → "<<r_end<<" M\n"
              <<"  a:      "<<a_start<<" → "<<a_end<<"\n"
-             <<"  exp="<<cp.exposure<<" γ="<<cp.gamma<<" T×="<<cp.temp_scale<<"\n"
+             <<"  exp="<<cp.exposure<<" γ="<<cp.gamma<<" T×="<<cp.temp_scale<<" diskB×="<<cp.disk_brightness<<"\n"
              <<"  output: "<<output_file<<"\n\n";
 
     double t_total=get_time();
