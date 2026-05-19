@@ -1896,8 +1896,16 @@ static RGB blackbody(double T) {
 
 static double page_thorne(double r, double r_isco) {
     if (r <= r_isco) return 0.0;
-    double x=std::sqrt(r_isco/r);
-    return (1.0-x)/(r*r*r);
+    double x = std::sqrt(r_isco / r);
+    double raw = (1.0 - x) / (r * r * r);
+    // Smooth Gaussian taper near ISCO (σ = 0.3·r_isco) to avoid the abrupt
+    // dark band that arises from the discontinuous derivative at r = r_isco.
+    // Physics: no emission below ISCO, but the thin-disk approximation breaks
+    // down near ISCO; a soft onset is a better model than a hard cutoff.
+    double dr   = r - r_isco;
+    double sigma = 0.3 * r_isco;
+    double taper = 1.0 - std::exp(-0.5 * (dr / sigma) * (dr / sigma));
+    return raw * taper;
 }
 
 // Reinhard tonemapping with variable gamma
