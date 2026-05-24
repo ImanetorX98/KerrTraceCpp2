@@ -42,6 +42,30 @@ __device__ double d_keplerian_omega(double r, double M, double a, double Q, doub
     return (fabs(den) > 1e-14) ? (s*sq/den) : 0.0;
 }
 
+__device__ void d_gLL(double r, double theta,
+                      double M, double a, double Q, double L,
+                      double gl[4][4]);
+
+__device__ double d_robust_disk_redshift(double r_hit,
+                                         double pt_cov,
+                                         double pphi_cov,
+                                         double M, double a, double Q, double L) {
+    // Frequency-shift factor used by colour pipeline.
+    constexpr double kRadicandFloor = 1.0e-8;
+    constexpr double kDenomFloor  = 1.0e-8;
+    constexpr double kRedMax  = 6.0;
+    const double Omega = d_keplerian_omega(r_hit, M, a, Q, L);
+    double gl2[4][4];
+    d_gLL(r_hit, M_PI/2.0, M, a, Q, L, gl2);
+    const double d2 = -(gl2[0][0] + 2.0*gl2[0][3]*Omega + gl2[3][3]*Omega*Omega);
+    const double ut = rsqrt(fmax(d2, kRadicandFloor));
+    const double denom = -(pt_cov * ut - pphi_cov * Omega * ut);
+    const double denom_safe = fmax(denom, kDenomFloor);
+    const double g_factor = (-pt_cov) / denom_safe;
+    if (!isfinite(g_factor)) return 1.0;
+    return fmax(0.0, fmin(kRedMax, g_factor));
+}
+
 __device__ void d_gUU(double r, double theta,
                       double M, double a, double Q, double L,
                       double gu[4][4]) {
@@ -463,13 +487,7 @@ __global__ void trace_kernel(uint32_t*              output,
                     double pr_hit, pth_hit, pphi_hit;
                     d_KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXhit, pYhit, pZhit,
                                         pr_hit, pth_hit, pphi_hit);
-                    double Omega=d_keplerian_omega(r_hit, M, a, Q, L);
-                    double b_=pphi_hit/(-pT);
-                    double gl2[4][4]; d_gLL(r_hit, M_PI/2.0, M, a, Q, L, gl2);
-                    double d2=-(gl2[0][0]+2.0*gl2[0][3]*Omega+gl2[3][3]*Omega*Omega);
-                    double dv=1.0-Omega*b_;
-                    double red=(d2>0.0&&fabs(dv)>1e-10)?sqrt(d2)/dv:1.0;
-                    red=fmax(0.0,fmin(20.0,red));
+                    double red=d_robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
 
                     double T0=2e6*pow(r_hit/(6.0*M),-0.75);
                     double T =T0*fmax(0.1,fmin(10.0,red));
@@ -525,17 +543,13 @@ __global__ void trace_kernel(uint32_t*              output,
                 continue;
             }
 
-            double Omega=d_keplerian_omega(r_hit, M, a, Q, L);
-            double b_=pphi/(-pt);
-            double gl2[4][4]; d_gLL(r_hit, M_PI/2.0, M, a, Q, L, gl2);
-            double d2=-(gl2[0][0]+2.0*gl2[0][3]*Omega+gl2[3][3]*Omega*Omega);
-            double dv=1.0-Omega*b_;
-            double red=(d2>0.0&&fabs(dv)>1e-10)?sqrt(d2)/dv:1.0;
-            red=fmax(0.0,fmin(20.0,red));
+            double red=d_robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
 
             double T0=2e6*pow(r_hit/(6.0*M),-0.75);
             double T =T0*fmax(0.1,fmin(10.0,red));
-            double I =fmax(0.0,fmin(2.5,pow(red,4.0)*pow(6.0*M/r_hit,3.0)));
+            const double red_c = fmax(0.01, fmin(10.0, red));
+            const double receding_lift = 1.0 + 0.85 * fmax(0.0, fmin(1.0, 1.0 - red_c));
+            double I =fmax(0.0,fmin(2.5,pow(red_c,4.0)*receding_lift*pow(6.0*M/r_hit,3.0)));
 
             uchar4 c=d_blackbody(T);
             double R=fmin(c.x*I/255.0,1.0)*255;

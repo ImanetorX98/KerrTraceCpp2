@@ -68,6 +68,7 @@ struct RGB { uint8_t r, g, b; };
 
 // ── Colorization parameters (Phase 2 controls) ───────────────
 enum class DiskPalette { BLACKBODY, STRATIFIED, INTERSTELLAR };
+enum class DiskRadialProfile { PAGE_THORNE, PHYSICAL_NT };
 
 struct ColorParams {
     double exposure    = 1.0;   // intensity multiplier before tonemapping
@@ -80,6 +81,19 @@ struct ColorParams {
     int    disk_sectors    = 14;   // number of azimuthal sectors in stratified mode
     double disk_sigma      = 0.5;  // Gaussian blend width (in cell units) in stratified mode
     double disk_hue_offset = 0.0;  // hue offset added to each cell [0,1)
+    DiskRadialProfile radial_profile = DiskRadialProfile::PAGE_THORNE;
+    bool   radial_term_zero_torque = true;   // (1 - sqrt(r_isco/r))
+    bool   radial_term_r3_decay = true;      // 1/r^3
+    bool   radial_term_relativistic = true;  // sqrt(C/A), Physical NT proxy only
+    bool   radial_term_b_denom = true;       // 1/B, Physical NT proxy only
+    bool   page_thorne_gaussian_taper = false; // optional ad-hoc inner taper near ISCO
+    double page_thorne_taper_sigma_scale = 0.3; // sigma = scale * r_isco when taper is enabled
+    bool   nt_gaussian_taper = false;       // same Gaussian taper applied to NT profile
+    double nt_taper_sigma_scale = 0.8;      // wider default than PT (0.3)
+    bool   planck_emission = false;          // weight intensity by Planck B(T,550nm)/B(T_ref,550nm)
+    double inner_emission_floor = 0.0; // optional normalized flux floor at ISCO (0=off)
+    double inner_emission_floor_width = 0.25; // floor fade width as fraction of (r_out-r_in)
+    bool   doppler_enabled = true; // relativistic Doppler boosting toggle
 
     // Interstellar cinematic mode (artist-friendly controls)
     double interstellar_omega0                = 1.0;
@@ -97,6 +111,12 @@ struct ColorParams {
     double interstellar_outer_g               = 0.045;
     double interstellar_outer_b               = 0.018;
     double interstellar_time                  = 0.0;
+    double interstellar_inner_taper_scale     = 0.15; // Gaussian rise from inner edge: σ = scale * r_in
+    // General radial ring taper: multiplies intensity by exp(-|r-r0|/sigma) [all palettes]
+    bool   radial_ring_taper          = false;
+    bool   radial_ring_taper_use_isco = false; // if true, r0 = r_ISCO at render time
+    double radial_ring_taper_r0       = 6.0;   // center radius [M] (ignored when use_isco)
+    double radial_ring_taper_sigma    = 2.0;   // falloff width [M]
 };
 
 // ── Per-pixel geodesic result (Phase 1 output) ───────────────
@@ -241,6 +261,14 @@ static const char* chart_tag(CoordinateChart chart) {
         case CoordinateChart::GKS: return "gks";
     }
     return "bl";
+}
+
+static const char* disk_radial_profile_name(DiskRadialProfile profile) {
+    switch (profile) {
+        case DiskRadialProfile::PHYSICAL_NT: return "physical_nt";
+        case DiskRadialProfile::PAGE_THORNE:
+        default: return "page_thorne";
+    }
 }
 
 static CoordinateChart resolve_runtime_chart_cpu(CoordinateChart requested, double Lam, bool use_bundles) {
@@ -389,17 +417,33 @@ static const char* metal_kernel_mode_name(MetalKernelMode mode) {
 #endif
 
 static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& g) {
+    // Frequency-shift factor used by colour pipeline.
+    constexpr double kRadicandFloor = 1.0e-8;
+    constexpr double kDenomFloor = 1.0e-8;
+    constexpr double kGMax = 6.0;
     double Omega = g.keplerian_omega(r);
-    double b     = -pphi / (-pt);
     double gLL[4][4]; g.covariant_BL(r, M_PI/2.0, gLL);
-    double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
-    if (d2 <= 0.0) return 1.0;
-    // Numerical robustness: around caustics and grazing hits the Doppler denominator
-    // can flip sign due to interpolation noise, producing spurious black seams.
-    const double dv = std::abs(1.0 - Omega*b);
-    if (dv < 1e-8) return 20.0;
-    const double red = std::sqrt(d2) / dv;
-    return std::isfinite(red) ? red : 1.0;
+    const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
+    const double ut = 1.0 / std::sqrt(std::max(d2, kRadicandFloor));
+    // For covariant momenta (p_t, p_phi), disk-frame denominator is
+    // -u^t (p_t + Omega p_phi) = u^t (E - Omega L), with E = -p_t.
+    const double denom = -(pt * ut + pphi * Omega * ut);
+    const double denom_safe = std::max(denom, kDenomFloor);
+    const double g_factor = (-pt) / denom_safe;
+    if (!std::isfinite(g_factor)) return 1.0;
+    return clamp(g_factor, 0.0, kGMax);
+}
+
+static double doppler_luma_scale_inverted(double redshift) {
+    // keplerian_omega uses Omega<0 for a>0 so the raw g factor is <1 on the
+    // approaching side (left for a>0) and >1 on the receding side.
+    // Mirror around g=1 to restore physical brightness: approaching → bright left.
+    const double red_c = clamp(2.0 - redshift, 0.01, 10.0);
+    return std::pow(red_c, 4.0);
+}
+
+static inline double doppler_luma_scale(double redshift, const ColorParams& cp) {
+    return cp.doppler_enabled ? doppler_luma_scale_inverted(redshift) : 1.0;
 }
 
 // Continue tracing from an already-known state, but ignoring further disk hits.
@@ -1894,18 +1938,101 @@ static RGB blackbody(double T) {
             (uint8_t)(clamp(B,0.0,1.0)*255)};
 }
 
-static double page_thorne(double r, double r_isco) {
+static double page_thorne_flux_raw(double r, double r_isco,
+                                   const ColorParams& cp) {
     if (r <= r_isco) return 0.0;
-    double x = std::sqrt(r_isco / r);
-    double raw = (1.0 - x) / (r * r * r);
-    // Smooth Gaussian taper near ISCO (σ = 0.3·r_isco) to avoid the abrupt
-    // dark band that arises from the discontinuous derivative at r = r_isco.
-    // Physics: no emission below ISCO, but the thin-disk approximation breaks
-    // down near ISCO; a soft onset is a better model than a hard cutoff.
-    double dr   = r - r_isco;
-    double sigma = 0.3 * r_isco;
-    double taper = 1.0 - std::exp(-0.5 * (dr / sigma) * (dr / sigma));
-    return raw * taper;
+    const double x = std::sqrt(r_isco / r);
+    const double zero_torque = cp.radial_term_zero_torque
+        ? clamp(1.0 - x, 0.0, 1.0)
+        : 1.0;
+    const double r3_decay = cp.radial_term_r3_decay
+        ? (1.0 / std::max(r * r * r, 1.0e-12))
+        : 1.0;
+    double flux = zero_torque * r3_decay;
+    if (cp.page_thorne_gaussian_taper) {
+        const double dr = std::max(0.0, r - r_isco);
+        const double sigma = std::max(1.0e-6, cp.page_thorne_taper_sigma_scale * r_isco);
+        const double taper = 1.0 - std::exp(-0.5 * (dr / sigma) * (dr / sigma));
+        flux *= taper;
+    }
+    return std::max(0.0, flux);
+}
+
+static double physical_nt_flux_proxy_raw(double r, double r_isco, double a,
+                                         const ColorParams& cp) {
+    if (r <= r_isco) return 0.0;
+    const double r_safe = std::max(r, r_isco * 1.0005);
+    const double r2 = r_safe * r_safe;
+    const double r3 = r2 * r_safe;
+    const double r32 = std::max(r_safe * std::sqrt(std::max(r_safe, 1.0e-12)), 1.0e-12);
+    const double a2 = a * a;
+
+    const double A = 1.0 - 2.0 / std::max(r_safe, 1.0e-12) + a2 / std::max(r2, 1.0e-12);
+    const double B = 1.0 - 3.0 / std::max(r_safe, 1.0e-12) + 2.0 * a / r32;
+    const double C = 1.0 - 4.0 * a / r32 + 3.0 * a2 / std::max(r2, 1.0e-12);
+
+    const double zero_torque = cp.radial_term_zero_torque
+        ? clamp(1.0 - std::sqrt(clamp(r_isco / std::max(r_safe, 1.0e-12), 0.0, 1.0)), 0.0, 1.0)
+        : 1.0;
+    const double relativistic = cp.radial_term_relativistic
+        ? std::sqrt(clamp(C / std::max(A, 1.0e-6), 0.02, 50.0))
+        : 1.0;
+    const double inv_r3 = cp.radial_term_r3_decay
+        ? (1.0 / std::max(r3, 1.0e-12))
+        : 1.0;
+    const double inv_B = cp.radial_term_b_denom
+        ? (1.0 / std::max(B, 0.02))
+        : 1.0;
+    double flux = zero_torque * relativistic * inv_r3 * inv_B;
+    if (cp.nt_gaussian_taper) {
+        const double dr = std::max(0.0, r_safe - r_isco);
+        const double sigma = std::max(1.0e-6, cp.nt_taper_sigma_scale * r_isco);
+        const double taper = 1.0 - std::exp(-0.5 * (dr / sigma) * (dr / sigma));
+        flux *= taper;
+    }
+    return std::max(0.0, flux);
+}
+
+static double disk_flux_raw(double r, double r_isco, double a, const ColorParams& cp) {
+    if (cp.radial_profile == DiskRadialProfile::PHYSICAL_NT)
+        return physical_nt_flux_proxy_raw(r, r_isco, a, cp);
+    return page_thorne_flux_raw(r, r_isco, cp);
+}
+
+static double inner_emission_floor_value(double r,
+                                         double r_in,
+                                         double r_out,
+                                         const ColorParams& cp) {
+    const double floor0 = std::max(0.0, cp.inner_emission_floor);
+    if (floor0 <= 0.0) return 0.0;
+    const double span = std::max(r_out - r_in, 1.0e-12);
+    const double width = std::max(1.0e-6, cp.inner_emission_floor_width * span);
+    const double t = std::max(0.0, (r - r_in) / width);
+    // Smoothly fades the floor away from ISCO to avoid a hard luminous ring.
+    return floor0 * std::exp(-t * t);
+}
+
+static double disk_flux_reference(double r_isco, double r_disk_out, double a,
+                                  const ColorParams& cp) {
+    if (cp.radial_profile == DiskRadialProfile::PHYSICAL_NT) {
+        const double rin = std::max(1.0e-6, r_isco * 1.0005);
+        const double rout = std::max(r_disk_out, rin + 1.0e-3);
+        const int n = 1024;
+        double peak = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double t = (double(i) + 0.5) / double(n);
+            const double r = rin + (rout - rin) * t;
+            const double f = disk_flux_raw(r, r_isco, a, cp);
+            if (f > 0.0 && std::isfinite(f) && f > peak) peak = f;
+        }
+        if (std::isfinite(peak) && peak > 0.0) return peak;
+        const double fallback = disk_flux_raw(std::max(rin, 1.5 * r_isco), r_isco, a, cp);
+        return (std::isfinite(fallback) && fallback > 0.0) ? fallback : 1.0;
+    }
+
+    const double r_peak = 3.0 * r_isco;
+    const double pt_peak = page_thorne_flux_raw(r_peak, r_isco, cp);
+    return (std::isfinite(pt_peak) && pt_peak > 0.0) ? pt_peak : 1.0;
 }
 
 // Reinhard tonemapping with variable gamma
@@ -1995,12 +2122,14 @@ static bool stratified_disk_tile_transparent(double r, double phi,
 // n_rings concentric bands × n_sectors azimuthal slices, each assigned
 // a deterministic warm color (red/orange/yellow, some transparent).
 // Colors are Gaussian-blended across cell boundaries so there are no hard edges.
-// Physical modulation (redshift, Page-Thorne emissivity, magnification) applied on top.
+// Physical modulation (redshift, selected radial emissivity profile, magnification) applied on top.
 static RGB disk_colour_stratified(double r, double phi,
                                   double red, double magnif,
                                   double r_in, double r_out,
-                                  double M, double r_isco,
-                                  const ColorParams& cp) {
+                                  double M, double a, double r_isco,
+                                  const ColorParams& cp,
+                                  double flux_ref) {
+    (void)M;
     const int    NR    = cp.disk_rings   > 0 ? cp.disk_rings   : 1;
     const int    NS    = cp.disk_sectors > 0 ? cp.disk_sectors : 1;
     const double sigma = cp.disk_sigma   > 0 ? cp.disk_sigma   : 0.5;
@@ -2057,13 +2186,11 @@ static RGB disk_colour_stratified(double r, double phi,
     if (w_total < 1e-6) return {0, 0, 0};  // transparent region
 
     // Physical intensity modulation (same as blackbody path)
-    const double pt_norm = page_thorne(r, r_isco);
-    const double r_peak  = 3.0 * r_isco;
-    const double pt_peak = page_thorne(r_peak, r_isco);
-    double I = (pt_peak > 0.0) ? pt_norm / pt_peak : 0.0;
-    const double red_c = clamp(red, 0.1, 10.0);
-    const double receding_lift = 1.0 + 0.85 * clamp(1.0 - red_c, 0.0, 1.0);
-    I *= std::pow(red_c, 4.0) * receding_lift;
+    const double flux = disk_flux_raw(r, r_isco, a, cp);
+    const double safe_ref = std::max(1.0e-12, flux_ref);
+    double I = flux / safe_ref;
+    I = std::max(I, inner_emission_floor_value(r, r_isco, r_out, cp));
+    I *= doppler_luma_scale(red, cp);
     I *= clamp(1.0 / magnif, 0.05, 5.0);
     I *= std::max(0.0, cp.disk_brightness);
 
@@ -2197,16 +2324,24 @@ static RGB disk_colour_interstellar(double r, double phi,
     cg += (out_g - cg) * t2;
     cb += (out_b - cb) * t2;
 
-    // Doppler and lensing modulation to keep physical plausibility.
-    const double red_c = clamp(red, 0.1, 10.0);
-    const double receding_lift = 1.0 + 0.85 * clamp(1.0 - red_c, 0.0, 1.0);
     const double lens = clamp(1.0 / std::max(magnif, 1e-6), 0.05, 5.0);
 
-    double intensity = mask * profile * turbulence * bands;
-    intensity *= std::pow(red_c, 4.0) * receding_lift;
+    // Gaussian taper from inner edge to suppress bright ring at r_in.
+    const double inner_taper_sigma = std::max(1e-6, cp.interstellar_inner_taper_scale * r_in);
+    const double dr_in = std::max(0.0, r - r_in);
+    const double inner_taper = 1.0 - std::exp(-0.5 * (dr_in / inner_taper_sigma) * (dr_in / inner_taper_sigma));
+
+    double intensity = mask * profile * turbulence * bands * inner_taper;
+    // doppler_luma_scale_inverted already mirrors red → pass raw red, not 2-red.
+    intensity *= doppler_luma_scale(red, cp);
     intensity *= lens;
     intensity *= cp.interstellar_hdr_intensity;
     intensity *= std::max(0.0, cp.disk_brightness);
+    if (cp.radial_ring_taper) {
+        const double r0  = cp.radial_ring_taper_use_isco ? r_isco : cp.radial_ring_taper_r0;
+        const double sig = std::max(1e-6, cp.radial_ring_taper_sigma);
+        intensity *= std::exp(-std::abs(r - r0) / sig);
+    }
     intensity = std::max(intensity, 0.0);
 
     return {
@@ -2217,17 +2352,38 @@ static RGB disk_colour_interstellar(double r, double phi,
 }
 
 static RGB disk_colour(double r, double red, double magnif,
-                       double M, double r_isco, const ColorParams& cp) {
-    double T = 6500.0 * cp.temp_scale * std::sqrt(6.0*M/r) * clamp(red, 0.2, 5.0);
-    double pt_norm = page_thorne(r, r_isco);
-    double r_peak  = 3.0*r_isco;
-    double pt_peak = page_thorne(r_peak, r_isco);
-    double I = (pt_peak > 0.0) ? pt_norm/pt_peak : 0.0;
-    const double red_c = clamp(red, 0.1, 10.0);
-    const double receding_lift = 1.0 + 0.85 * clamp(1.0 - red_c, 0.0, 1.0);
-    I *= std::pow(red_c, 4.0) * receding_lift;
+                       double M, double a, double r_isco, double r_disk_out,
+                       const ColorParams& cp,
+                       double flux_ref) {
+    // keplerian_omega convention: Omega<0 for a>0, so raw g<1 on approaching side.
+    // Mirror g around 1 to get the physically observed shift (same as doppler_luma_scale).
+    const double red_phys = clamp(2.0 - red, 0.2, 5.0);
+    double T = 6500.0 * cp.temp_scale * std::sqrt(6.0*M/r) * red_phys;
+    const double flux = disk_flux_raw(r, r_isco, a, cp);
+    const double safe_ref = std::max(1.0e-12, flux_ref);
+    double I = flux / safe_ref;
+    I = std::max(I, inner_emission_floor_value(r, r_isco, r_disk_out, cp));
+    I *= doppler_luma_scale(red, cp);
     I *= clamp(1.0/magnif, 0.05, 5.0);
     I *= std::max(0.0, cp.disk_brightness);
+    if (cp.planck_emission && T > 0.0) {
+        // Weight intensity by Planck B(T,λ=550nm) / B(T_ref,λ=550nm).
+        // hc/kλ for λ=550nm ≈ 26145 K.  Hotter regions brightened, cooler suppressed.
+        const double hc_kl = 26145.0;
+        auto b_planck = [&](double t) -> double {
+            const double x = hc_kl / std::max(t, 200.0);
+            return 1.0 / std::expm1(std::min(x, 700.0));
+        };
+        const double T_ref_planck = std::max(200.0, 6500.0 * cp.temp_scale);
+        const double b_ref = b_planck(T_ref_planck);
+        if (b_ref > 1.0e-30)
+            I *= std::max(0.0, b_planck(T) / b_ref);
+    }
+    if (cp.radial_ring_taper) {
+        const double r0  = cp.radial_ring_taper_use_isco ? r_isco : cp.radial_ring_taper_r0;
+        const double sig = std::max(1e-6, cp.radial_ring_taper_sigma);
+        I *= std::exp(-std::abs(r - r0) / sig);
+    }
     auto c = blackbody(T);
     return {(uint8_t)(tonemap(c.r/255.0*I, cp.exposure, cp.gamma)*255),
             (uint8_t)(tonemap(c.g/255.0*I, cp.exposure, cp.gamma)*255),
@@ -2239,12 +2395,13 @@ static std::vector<RGB> colorize_buffer(
     const std::vector<GeoPixel>& geo, int W, int H,
     const ColorParams& cp,
     const BackgroundImage& bg,
-    double M_bh, double r_isco,
+    double M_bh, double a_bh, double r_isco,
     double r_disk_in, double r_disk_out,
     bool debug_elliptic = false,
     const BackgroundImage* bg_b = nullptr)  // Universe B background (wormhole)
 {
     std::vector<RGB> image(W*H, {0,0,0});
+    const double flux_ref = disk_flux_reference(r_isco, r_disk_out, a_bh, cp);
 
     if (debug_elliptic) {
         // Color by elliptic solver tag stored in _pad[0]:
@@ -2273,14 +2430,15 @@ static std::vector<RGB> colorize_buffer(
                 disk_col = disk_colour_stratified(p.r, p.phi_disk,
                                                   p.redshift, p.magnif,
                                                   r_disk_in, r_disk_out,
-                                                  M_bh, r_isco, cp);
+                                                  M_bh, a_bh, r_isco, cp, flux_ref);
             } else if (cp.palette == DiskPalette::INTERSTELLAR) {
                 disk_col = disk_colour_interstellar(p.r, p.phi_disk,
                                                     p.redshift, p.magnif,
                                                     r_disk_in, r_disk_out,
                                                     M_bh, r_isco, cp);
             } else {
-                disk_col = disk_colour(p.r, p.redshift, p.magnif, M_bh, r_isco, cp);
+                disk_col = disk_colour(p.r, p.redshift, p.magnif,
+                                       M_bh, a_bh, r_isco, r_disk_out, cp, flux_ref);
             }
 
             const double alpha = clamp(cp.disk_opacity, 0.0, 1.0);
@@ -2840,6 +2998,7 @@ static std::vector<RGB> render_image(
     if (can_use_gpu) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
+        const double flux_ref = disk_flux_reference(r_isco, fp.disk_out, fp.a, cp);
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
         KNdSParams_C kpc{(float)M_bh,(float)fp.a,(float)Q_bh,(float)Lam,
                          (float)g.r_horizon(),(float)r_isco,(float)fp.disk_out};
@@ -2861,6 +3020,7 @@ static std::vector<RGB> render_image(
                            (float)cp.disk_brightness,
                            (float)cp.disk_opacity,
                            static_cast<int>(cp.palette),
+                           static_cast<int>(cp.radial_profile),
                            (float)cp.interstellar_omega0,
                            (float)cp.interstellar_p,
                            (float)cp.interstellar_inner_falloff_scale,
@@ -2875,7 +3035,17 @@ static std::vector<RGB> render_image(
                            (float)cp.interstellar_outer_r,
                            (float)cp.interstellar_outer_g,
                            (float)cp.interstellar_outer_b,
-                           (float)cp.interstellar_time};
+                           (float)cp.interstellar_time,
+                           cp.page_thorne_gaussian_taper ? 1 : 0,
+                           (float)cp.page_thorne_taper_sigma_scale,
+                           (float)flux_ref,
+                           (float)cp.inner_emission_floor,
+                           (float)cp.inner_emission_floor_width,
+                           cp.doppler_enabled ? 1 : 0,
+                           cp.radial_term_zero_torque ? 1 : 0,
+                           cp.radial_term_r3_decay ? 1 : 0,
+                           cp.radial_term_relativistic ? 1 : 0,
+                           cp.radial_term_b_denom ? 1 : 0};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -2936,7 +3106,7 @@ static std::vector<RGB> render_image(
                                pixel_offset_x, pixel_offset_y,
                                M_bh, Q_bh, Lam, &cp, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, fp.a, meta.r_isco,
                            meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
 
 #elif defined(USE_CUDA)
@@ -2995,7 +3165,7 @@ static std::vector<RGB> render_image(
                                pixel_offset_x, pixel_offset_y,
                                M_bh, Q_bh, Lam, &cp, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, fp.a, meta.r_isco,
                            meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
 
 #else
@@ -3005,7 +3175,7 @@ static std::vector<RGB> render_image(
                                pixel_offset_x, pixel_offset_y,
                                M_bh, Q_bh, Lam, &cp, &meta, debug_elliptic);
     if (geo_out) *geo_out = geo;
-    return colorize_buffer(geo, W, H, cp, bg, M_bh, meta.r_isco,
+    return colorize_buffer(geo, W, H, cp, bg, M_bh, fp.a, meta.r_isco,
                            meta.r_disk_in, meta.r_disk_out, debug_elliptic, bg_b);
 #endif
 }
@@ -3064,6 +3234,7 @@ int main(int argc, char** argv) {
     int    cli_disk_sectors    = cp.disk_sectors;
     double cli_disk_sigma      = cp.disk_sigma;
     double cli_disk_hue_offset = cp.disk_hue_offset;
+    DiskRadialProfile cli_disk_radial_profile = cp.radial_profile;
     double cli_interstellar_omega0              = cp.interstellar_omega0;
     double cli_interstellar_p                   = cp.interstellar_p;
     double cli_interstellar_inner_falloff_scale = cp.interstellar_inner_falloff_scale;
@@ -3079,6 +3250,18 @@ int main(int argc, char** argv) {
     double cli_interstellar_outer_g             = cp.interstellar_outer_g;
     double cli_interstellar_outer_b             = cp.interstellar_outer_b;
     double cli_interstellar_time                = cp.interstellar_time;
+    bool   cli_pt_gaussian_taper                = cp.page_thorne_gaussian_taper;
+    double cli_pt_taper_sigma_scale             = cp.page_thorne_taper_sigma_scale;
+    bool   cli_nt_gaussian_taper                = cp.nt_gaussian_taper;
+    double cli_nt_taper_sigma_scale             = cp.nt_taper_sigma_scale;
+    bool   cli_planck_emission                  = cp.planck_emission;
+    double cli_inner_emission_floor             = cp.inner_emission_floor;
+    double cli_inner_emission_floor_width       = cp.inner_emission_floor_width;
+    bool   cli_doppler_enabled                  = cp.doppler_enabled;
+    bool   cli_radial_term_zero_torque          = cp.radial_term_zero_torque;
+    bool   cli_radial_term_r3_decay             = cp.radial_term_r3_decay;
+    bool   cli_radial_term_relativistic         = cp.radial_term_relativistic;
+    bool   cli_radial_term_b_denom              = cp.radial_term_b_denom;
 
     // ── Two-phase modes ───────────────────────────────────────
     bool        geo_only    = false;
@@ -3195,6 +3378,17 @@ int main(int argc, char** argv) {
         if (arg=="--disk-blackbody")    cp.palette = DiskPalette::BLACKBODY;
         if (arg=="--disk-stratified")   cp.palette = DiskPalette::STRATIFIED;
         if (arg=="--disk-interstellar") cp.palette = DiskPalette::INTERSTELLAR;
+        if (arg=="--disk-radial-profile" && i+1<argc) {
+            const std::string mode = argv[++i];
+            if (mode=="physical_nt" || mode=="physical-nt" || mode=="nt")
+                cli_disk_radial_profile = DiskRadialProfile::PHYSICAL_NT;
+            else
+                cli_disk_radial_profile = DiskRadialProfile::PAGE_THORNE;
+        }
+        if (arg=="--disk-profile-physical-nt" || arg=="--disk-physical-nt")
+            cli_disk_radial_profile = DiskRadialProfile::PHYSICAL_NT;
+        if (arg=="--disk-profile-page-thorne" || arg=="--disk-page-thorne")
+            cli_disk_radial_profile = DiskRadialProfile::PAGE_THORNE;
         if (arg=="--disk-rings"      && i+1<argc) cli_disk_rings      = std::stoi(argv[++i]);
         if (arg=="--disk-sectors"    && i+1<argc) cli_disk_sectors    = std::stoi(argv[++i]);
         if (arg=="--disk-sigma"      && i+1<argc) cli_disk_sigma      = std::stod(argv[++i]);
@@ -3214,6 +3408,50 @@ int main(int argc, char** argv) {
         if (arg=="--disk-interstellar-outer-g" && i+1<argc) cli_interstellar_outer_g = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-outer-b" && i+1<argc) cli_interstellar_outer_b = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-time" && i+1<argc) cli_interstellar_time = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-inner-taper" && i+1<argc) cp.interstellar_inner_taper_scale = std::max(1e-6, std::stod(argv[++i]));
+        if (arg=="--disk-pt-gaussian-taper" || arg=="--pt-gaussian-taper")
+            cli_pt_gaussian_taper = true;
+        if (arg=="--disk-no-pt-gaussian-taper" || arg=="--no-pt-gaussian-taper")
+            cli_pt_gaussian_taper = false;
+        if ((arg=="--disk-pt-taper-sigma-scale" || arg=="--pt-taper-sigma-scale") && i+1<argc)
+            cli_pt_taper_sigma_scale = std::stod(argv[++i]);
+        if (arg=="--disk-inner-emission-floor" && i+1<argc)
+            cli_inner_emission_floor = std::stod(argv[++i]);
+        if (arg=="--disk-inner-emission-floor-width" && i+1<argc)
+            cli_inner_emission_floor_width = std::stod(argv[++i]);
+        if (arg=="--no-doppler") cli_doppler_enabled = false;
+        if (arg=="--doppler") cli_doppler_enabled = true;
+        if (arg=="--no-radial-term-zero-torque" || arg=="--no-radial-zero-torque")
+            cli_radial_term_zero_torque = false;
+        if (arg=="--radial-term-zero-torque" || arg=="--radial-zero-torque")
+            cli_radial_term_zero_torque = true;
+        if (arg=="--no-radial-term-r3" || arg=="--no-radial-r3")
+            cli_radial_term_r3_decay = false;
+        if (arg=="--radial-term-r3" || arg=="--radial-r3")
+            cli_radial_term_r3_decay = true;
+        if (arg=="--no-radial-term-relativistic" || arg=="--no-radial-relativistic")
+            cli_radial_term_relativistic = false;
+        if (arg=="--radial-term-relativistic" || arg=="--radial-relativistic")
+            cli_radial_term_relativistic = true;
+        if (arg=="--no-radial-term-b-denom" || arg=="--no-radial-b-denom")
+            cli_radial_term_b_denom = false;
+        if (arg=="--radial-term-b-denom" || arg=="--radial-b-denom")
+            cli_radial_term_b_denom = true;
+        if (arg=="--nt-taper")
+            cli_nt_gaussian_taper = true;
+        if (arg=="--no-nt-taper")
+            cli_nt_gaussian_taper = false;
+        if (arg=="--nt-taper-sigma" && i+1<argc)
+            cli_nt_taper_sigma_scale = std::stod(argv[++i]);
+        if (arg=="--planck-emission")
+            cli_planck_emission = true;
+        if (arg=="--no-planck-emission")
+            cli_planck_emission = false;
+        if (arg=="--ring-taper")      cp.radial_ring_taper = true;
+        if (arg=="--no-ring-taper")   cp.radial_ring_taper = false;
+        if (arg=="--ring-taper-isco") { cp.radial_ring_taper = true; cp.radial_ring_taper_use_isco = true; }
+        if (arg=="--ring-taper-r0"    && i+1<argc) { cp.radial_ring_taper_r0 = std::stod(argv[++i]); cp.radial_ring_taper_use_isco = false; }
+        if (arg=="--ring-taper-sigma" && i+1<argc) cp.radial_ring_taper_sigma = std::max(1e-6, std::stod(argv[++i]));
 
         // Wormhole
         if (arg=="--wormhole")                   arg_wormhole = true;
@@ -3253,6 +3491,19 @@ int main(int argc, char** argv) {
 
     cp.disk_brightness = std::max(0.0, cli_disk_brightness);
     cp.disk_opacity = clamp(cli_disk_opacity, 0.0, 1.0);
+    cp.radial_profile = cli_disk_radial_profile;
+    cp.page_thorne_gaussian_taper = cli_pt_gaussian_taper;
+    cp.page_thorne_taper_sigma_scale = std::max(1.0e-6, cli_pt_taper_sigma_scale);
+    cp.nt_gaussian_taper = cli_nt_gaussian_taper;
+    cp.nt_taper_sigma_scale = std::max(1.0e-6, cli_nt_taper_sigma_scale);
+    cp.planck_emission = cli_planck_emission;
+    cp.inner_emission_floor = std::max(0.0, cli_inner_emission_floor);
+    cp.inner_emission_floor_width = clamp(cli_inner_emission_floor_width, 1.0e-4, 2.0);
+    cp.doppler_enabled = cli_doppler_enabled;
+    cp.radial_term_zero_torque = cli_radial_term_zero_torque;
+    cp.radial_term_r3_decay = cli_radial_term_r3_decay;
+    cp.radial_term_relativistic = cli_radial_term_relativistic;
+    cp.radial_term_b_denom = cli_radial_term_b_denom;
 
     if (cp.palette == DiskPalette::STRATIFIED) {
         cp.disk_rings = std::max(1, cli_disk_rings);
@@ -3342,9 +3593,17 @@ int main(int argc, char** argv) {
                   << "ColorParams: exposure=" << cp.exposure
                   << " gamma=" << cp.gamma
                   << " temp_scale=" << cp.temp_scale
-                  << " disk_brightness=" << cp.disk_brightness << "\n";
+                  << " disk_brightness=" << cp.disk_brightness
+                  << " radial_profile=" << disk_radial_profile_name(cp.radial_profile)
+                  << " radial_terms={zt:" << (cp.radial_term_zero_torque ? "on" : "off")
+                  << ",r3:" << (cp.radial_term_r3_decay ? "on" : "off")
+                  << ",rel:" << (cp.radial_term_relativistic ? "on" : "off")
+                  << ",b:" << (cp.radial_term_b_denom ? "on" : "off")
+                  << "}"
+                  << " doppler=" << (cp.doppler_enabled ? "on" : "off")
+                  << "\n";
 
-        auto image = colorize_buffer(geo, gW, gH, cp, bg, meta.M_bh, meta.r_isco,
+        auto image = colorize_buffer(geo, gW, gH, cp, bg, meta.M_bh, meta.a_bh, meta.r_isco,
                                      meta.r_disk_in, meta.r_disk_out);
 
         std::time_t now=std::time(nullptr); char ts[32];
@@ -3504,7 +3763,17 @@ int main(int argc, char** argv) {
                   << " γ=" << cp.gamma
                   << " T×=" << cp.temp_scale
                   << " diskB×=" << cp.disk_brightness
-                  << " diskOpacity=" << cp.disk_opacity << "\n";
+                  << " diskOpacity=" << cp.disk_opacity
+                  << " radialProfile=" << disk_radial_profile_name(cp.radial_profile)
+                  << " radialTerms={zt:" << (cp.radial_term_zero_torque ? "on" : "off")
+                  << ",r3:" << (cp.radial_term_r3_decay ? "on" : "off")
+                  << ",rel:" << (cp.radial_term_relativistic ? "on" : "off")
+                  << ",b:" << (cp.radial_term_b_denom ? "on" : "off")
+                  << "}"
+                  << " innerFloor=" << cp.inner_emission_floor
+                  << " innerFloorW=" << cp.inner_emission_floor_width
+                  << " doppler=" << (cp.doppler_enabled ? "on" : "off")
+                  << "\n";
 
         double t0=get_time();
 
@@ -3602,7 +3871,8 @@ int main(int argc, char** argv) {
         std::cout<<"  phi:    "<<phi_start<<"° → "<<phi_end<<"°\n";
     std::cout<<"  r_obs:  "<<r_start<<" M → "<<r_end<<" M\n"
              <<"  a:      "<<a_start<<" → "<<a_end<<"\n"
-             <<"  exp="<<cp.exposure<<" γ="<<cp.gamma<<" T×="<<cp.temp_scale<<" diskB×="<<cp.disk_brightness<<"\n"
+             <<"  exp="<<cp.exposure<<" γ="<<cp.gamma<<" T×="<<cp.temp_scale<<" diskB×="<<cp.disk_brightness
+             <<" doppler="<<(cp.doppler_enabled?"on":"off")<<"\n"
              <<"  output: "<<output_file<<"\n\n";
 
     double t_total=get_time();

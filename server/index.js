@@ -1113,8 +1113,49 @@ app.post('/api/render', (req, res) => {
     const v = Number(p.disk_opacity);
     if (Number.isFinite(v)) args.push('--disk-opacity', String(Math.max(0, Math.min(1, v))));
   }
+  if (p.doppler_enabled === false) {
+    args.push('--no-doppler');
+  } else if (p.doppler_enabled === true) {
+    args.push('--doppler');
+  }
+  if (p.disk_inner_emission_floor !== undefined) {
+    const v = Number(p.disk_inner_emission_floor);
+    if (Number.isFinite(v)) args.push('--disk-inner-emission-floor', String(Math.max(0, v)));
+  }
+  if (p.disk_inner_emission_floor_width !== undefined) {
+    const v = Number(p.disk_inner_emission_floor_width);
+    if (Number.isFinite(v)) args.push('--disk-inner-emission-floor-width', String(Math.max(1e-4, v)));
+  }
+  if (p.radial_term_zero_torque === false) {
+    args.push('--no-radial-term-zero-torque');
+  } else if (p.radial_term_zero_torque === true) {
+    args.push('--radial-term-zero-torque');
+  }
+  if (p.radial_term_r3_decay === false) {
+    args.push('--no-radial-term-r3');
+  } else if (p.radial_term_r3_decay === true) {
+    args.push('--radial-term-r3');
+  }
+  if (p.radial_term_relativistic === false) {
+    args.push('--no-radial-term-relativistic');
+  } else if (p.radial_term_relativistic === true) {
+    args.push('--radial-term-relativistic');
+  }
+  if (p.radial_term_b_denom === false) {
+    args.push('--no-radial-term-b-denom');
+  } else if (p.radial_term_b_denom === true) {
+    args.push('--radial-term-b-denom');
+  }
 
   // Disk palette
+  const radialProfileMode =
+    typeof p.disk_radial_profile === 'string' ? p.disk_radial_profile : 'page_thorne';
+  if (radialProfileMode === 'physical_nt' || radialProfileMode === 'physical-nt' || radialProfileMode === 'nt') {
+    args.push('--disk-radial-profile', 'physical_nt');
+  } else {
+    args.push('--disk-radial-profile', 'page_thorne');
+  }
+
   const paletteMode = typeof p.disk_palette === 'string' ? p.disk_palette : 'blackbody';
   if (paletteMode === 'stratified') {
     args.push('--disk-stratified');

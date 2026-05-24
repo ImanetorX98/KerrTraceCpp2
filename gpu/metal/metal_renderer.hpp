@@ -38,6 +38,7 @@ struct CameraParams_C {
     float disk_brightness; // common disk brightness multiplier
     float disk_opacity; // common disk opacity [0,1] shared by all palettes
     int   disk_palette; // 0=blackbody, 1=stratified, 2=interstellar
+    int   disk_radial_profile; // 0=page_thorne, 1=physical_nt
     float interstellar_omega0;
     float interstellar_p;
     float interstellar_inner_falloff_scale;
@@ -53,6 +54,16 @@ struct CameraParams_C {
     float interstellar_outer_g;
     float interstellar_outer_b;
     float interstellar_time;
+    int   page_thorne_gaussian_taper; // 0 = off, 1 = on
+    float page_thorne_taper_sigma_scale; // sigma = scale * r_isco
+    float disk_flux_ref; // normalization reference for selected radial profile
+    float inner_emission_floor; // optional normalized flux floor at ISCO (0=off)
+    float inner_emission_floor_width; // fade width as fraction of (r_out-r_isco)
+    int   enable_doppler; // 0 = disable Doppler boost, 1 = enable
+    int   radial_term_zero_torque; // 0 = off, 1 = on
+    int   radial_term_r3_decay; // 0 = off, 1 = on
+    int   radial_term_relativistic; // 0 = off, 1 = on (physical NT only)
+    int   radial_term_b_denom; // 0 = off, 1 = on (physical NT only)
 };
 
 /// Renders the image on the default Metal GPU device.

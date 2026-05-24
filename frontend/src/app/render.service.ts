@@ -30,8 +30,16 @@ export interface RenderParams {
   background: string;
   // Disk palette
   disk_palette: 'blackbody' | 'stratified' | 'interstellar';
+  disk_radial_profile: 'page_thorne' | 'physical_nt';
   disk_brightness: number;
   disk_opacity: number;
+  doppler_enabled: boolean;
+  disk_inner_emission_floor: number;
+  disk_inner_emission_floor_width: number;
+  radial_term_zero_torque: boolean;
+  radial_term_r3_decay: boolean;
+  radial_term_relativistic: boolean;
+  radial_term_b_denom: boolean;
   disk_rings: number;
   disk_sectors: number;
   disk_sigma: number;

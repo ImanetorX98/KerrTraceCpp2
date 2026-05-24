@@ -54,6 +54,7 @@ struct CameraParams {
     float disk_brightness; // common disk brightness multiplier
     float disk_opacity; // common disk opacity [0,1] shared by all palettes
     int   disk_palette; // 0=blackbody, 1=stratified, 2=interstellar
+    int   disk_radial_profile; // 0=page_thorne, 1=physical_nt
     float interstellar_omega0;
     float interstellar_p;
     float interstellar_inner_falloff_scale;
@@ -69,6 +70,16 @@ struct CameraParams {
     float interstellar_outer_g;
     float interstellar_outer_b;
     float interstellar_time;
+    int   page_thorne_gaussian_taper; // 0 = off, 1 = on
+    float page_thorne_taper_sigma_scale; // sigma = scale * r_isco
+    float disk_flux_ref; // normalization reference for selected radial profile
+    float inner_emission_floor; // optional normalized flux floor at ISCO (0=off)
+    float inner_emission_floor_width; // fade width as fraction of (r_out-r_isco)
+    int   enable_doppler; // 0 = disable Doppler boost, 1 = enable
+    int   radial_term_zero_torque; // 0 = off, 1 = on
+    int   radial_term_r3_decay; // 0 = off, 1 = on
+    int   radial_term_relativistic; // 0 = off, 1 = on (physical NT only)
+    int   radial_term_b_denom; // 0 = off, 1 = on (physical NT only)
 };
 
 struct RenderParams {
@@ -1498,14 +1509,72 @@ static int elliptic_closed_first_hit(thread const SeparableConsts& c,
 }
 
 // ── Emissivity / tonemap helpers ──────────────────────────────
-// Page-Thorne emissivity f(r) = (1 − √(r_isco/r)) / r³, normalised to 1
-// at its peak r = 3·r_isco  (matches CPU disk_colour exactly)
-static float page_thorne_norm(float r, float r_isco) {
+static float page_thorne_flux_raw_f(float r, float r_isco, CameraParams cp) {
     if (r <= r_isco) return 0.0f;
-    float pt      = (1.0f - sqrt(r_isco / r)) / (r*r*r);
-    float r_peak  = 3.0f * r_isco;
-    float pt_peak = (1.0f - sqrt(r_isco / r_peak)) / (r_peak*r_peak*r_peak);
-    return (pt_peak > 0.0f) ? (pt / pt_peak) : 0.0f;
+    const float x = sqrt(r_isco / r);
+    const float zero_torque = (cp.radial_term_zero_torque != 0)
+        ? clamp(1.0f - x, 0.0f, 1.0f)
+        : 1.0f;
+    const float r3_decay = (cp.radial_term_r3_decay != 0)
+        ? (1.0f / max(r*r*r, 1.0e-8f))
+        : 1.0f;
+    float pt = zero_torque * r3_decay;
+    if (cp.page_thorne_gaussian_taper != 0) {
+        const float dr = max(0.0f, r - r_isco);
+        const float sigma = max(1.0e-6f, cp.page_thorne_taper_sigma_scale * r_isco);
+        const float taper = 1.0f - exp(-0.5f * (dr / sigma) * (dr / sigma));
+        pt *= taper;
+    }
+    return max(0.0f, pt);
+}
+
+static float physical_nt_flux_proxy_raw_f(float r, float r_isco, float a, CameraParams cp) {
+    if (r <= r_isco) return 0.0f;
+    const float r_safe = max(r, r_isco * 1.0005f);
+    const float r2 = r_safe * r_safe;
+    const float r3 = r2 * r_safe;
+    const float r32 = max(r_safe * sqrt(max(r_safe, 1.0e-8f)), 1.0e-8f);
+    const float a2 = a * a;
+    const float A = 1.0f - 2.0f / max(r_safe, 1.0e-8f) + a2 / max(r2, 1.0e-8f);
+    const float B = 1.0f - 3.0f / max(r_safe, 1.0e-8f) + 2.0f * a / r32;
+    const float C = 1.0f - 4.0f * a / r32 + 3.0f * a2 / max(r2, 1.0e-8f);
+    const float zero_torque = (cp.radial_term_zero_torque != 0)
+        ? clamp(1.0f - sqrt(clamp(r_isco / max(r_safe, 1.0e-8f), 0.0f, 1.0f)), 0.0f, 1.0f)
+        : 1.0f;
+    const float relativistic = (cp.radial_term_relativistic != 0)
+        ? sqrt(clamp(C / max(A, 1.0e-6f), 0.02f, 50.0f))
+        : 1.0f;
+    const float inv_r3 = (cp.radial_term_r3_decay != 0)
+        ? (1.0f / max(r3, 1.0e-8f))
+        : 1.0f;
+    const float inv_B = (cp.radial_term_b_denom != 0)
+        ? (1.0f / max(B, 0.02f))
+        : 1.0f;
+    const float flux = zero_torque * relativistic * inv_r3 * inv_B;
+    return max(0.0f, flux);
+}
+
+static float disk_flux_raw_f(float r, float r_isco, float a, CameraParams cp) {
+    if (cp.disk_radial_profile == 1)
+        return physical_nt_flux_proxy_raw_f(r, r_isco, a, cp);
+    return page_thorne_flux_raw_f(r, r_isco, cp);
+}
+
+static float disk_flux_norm_f(float r, float r_isco, float a, CameraParams cp) {
+    const float ref = max(cp.disk_flux_ref, 1.0e-8f);
+    return disk_flux_raw_f(r, r_isco, a, cp) / ref;
+}
+
+static float inner_emission_floor_value_f(float r,
+                                          float r_in,
+                                          float r_out,
+                                          CameraParams cp) {
+    const float floor0 = max(0.0f, cp.inner_emission_floor);
+    if (floor0 <= 0.0f) return 0.0f;
+    const float span = max(r_out - r_in, 1.0e-8f);
+    const float width = max(1.0e-6f, cp.inner_emission_floor_width * span);
+    const float t = max(0.0f, (r - r_in) / width);
+    return floor0 * exp(-(t * t));
 }
 
 // Reinhard tonemap with gamma  (exposure = 1.0 default, matches CPU ColorParams)
@@ -1515,8 +1584,9 @@ static float tonemap_ch(float x, float exposure, float gamma) {
     return pow(clamp(x, 0.0f, 1.0f), 1.0f / gamma);
 }
 
-static inline float doppler_intensity_scale(float redshift) {
-    const float red_c = clamp(redshift, 0.1f, 10.0f);
+static inline float doppler_intensity_scale(float redshift, int enable_doppler) {
+    if (enable_doppler == 0) return 1.0f;
+    const float red_c = clamp(2.0f - redshift, 0.01f, 10.0f);
     const float receding_lift = 1.0f + 0.85f * clamp(1.0f - red_c, 0.0f, 1.0f);
     return pow(red_c, 4.0f) * receding_lift;
 }
@@ -1525,19 +1595,21 @@ static inline float robust_disk_redshift(float r_hit,
                                          float pt_cov,
                                          float pphi_cov,
                                          float M, float a, float Q, float L) {
-    const float pt_abs = max(abs(pt_cov), 1e-12f);
+    // Frequency-shift factor used by colour pipeline.
+    constexpr float kRadicandFloor = 1e-8f;
+    constexpr float kDenomFloor = 1e-8f;
+    constexpr float kRedMax = 6.0f;
     const float Omega = keplerian_omega(r_hit, M, a, Q, L);
-    const float b_ip  = -pphi_cov / pt_abs;
     float gll2[4][4];
     gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
     const float d2 = -(gll2[0][0] + 2.0f*gll2[0][3]*Omega + gll2[3][3]*Omega*Omega);
-    if (!(d2 > 0.0f)) return 1.0f;
-    // Avoid sign-flip seams from tiny interpolation errors around dv≈0.
-    const float dv = abs(1.0f - Omega*b_ip);
-    if (dv < 1e-8f) return 20.0f;
-    const float red = sqrt(d2) / dv;
-    if (!isfinite(red)) return 1.0f;
-    return clamp(red, 0.0f, 20.0f);
+    const float ut = rsqrt(max(d2, kRadicandFloor));
+    // Covariant momenta form: -u^t (p_t + Omega p_phi) = u^t (E - Omega L).
+    const float denom = -(pt_cov * ut + pphi_cov * Omega * ut);
+    const float denom_safe = max(denom, kDenomFloor);
+    const float g_factor = (-pt_cov) / denom_safe;
+    if (!isfinite(g_factor)) return 1.0f;
+    return clamp(g_factor, 0.0f, kRedMax);
 }
 
 // ── Colour helpers ────────────────────────────────────────────
@@ -1704,7 +1776,7 @@ static inline bool disk_tile_pass_through(float r_hit, float phi_hit,
 
 static uint32_t disk_color_abgr(float r_hit, float phi_hit,
                                 float redshift, float magnif,
-                                float M, float r_isco, float r_disk_out,
+                                float M, float a, float r_isco, float r_disk_out,
                                 CameraParams cp) {
     const float red = clamp(redshift, 0.0f, 20.0f);
     if (cp.disk_palette == 2) {
@@ -1746,12 +1818,15 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
         cg += (out_g - cg) * t2;
         cb += (out_b - cb) * t2;
 
-        const float red_c = clamp(red, 0.1f, 10.0f);
+        const float red_c = clamp(2.0f - red, 0.01f, 10.0f);
         const float receding_lift = 1.0f + 0.85f * clamp(1.0f - red_c, 0.0f, 1.0f);
         const float lens = clamp(1.0f / max(magnif, 1e-6f), 0.05f, 5.0f);
 
         float intensity = mask * profile * turbulence * bands;
-        intensity *= pow(red_c, 4.0f) * receding_lift;
+        const float doppler_scale = (cp.enable_doppler != 0)
+            ? (pow(red_c, 4.0f) * receding_lift)
+            : 1.0f;
+        intensity *= doppler_scale;
         intensity *= lens;
         intensity *= max(0.0f, cp.interstellar_hdr_intensity);
         intensity *= max(0.0f, cp.disk_brightness);
@@ -1767,8 +1842,9 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
     }
 
     const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
-    float I = page_thorne_norm(r_hit, r_isco);
-    I *= doppler_intensity_scale(red);
+    float I = disk_flux_norm_f(r_hit, r_isco, a, cp);
+    I = max(I, inner_emission_floor_value_f(r_hit, r_isco, r_disk_out, cp));
+    I *= doppler_intensity_scale(red, cp.enable_doppler);
     I *= clamp(1.0f / max(magnif, 1e-12f), 0.05f, 5.0f);
     I *= max(0.0f, cp.disk_brightness);
     const float4 bb = blackbody_rgb(T);
@@ -2348,7 +2424,7 @@ static inline void trace_pixel_impl(
             }
 
             colour = disk_color_abgr(shade_r_hit, c.phi_hit, shade_redshift, magnif,
-                                     M, kp.r_isco, kp.r_disk_out, cp);
+                                     M, a, kp.r_isco, kp.r_disk_out, cp);
             output[py * width + px] = colour;
             return;
         }
@@ -2477,7 +2553,7 @@ static inline void trace_pixel_impl(
             const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L);
             const float phi_hit_ell = (verify.outcome == 1) ? verify.phi_hit : cp.phi_obs;
             colour = disk_color_abgr(r_hit_ell, phi_hit_ell, red, 1.0f,
-                                     M, kp.r_isco, kp.r_disk_out, cp);
+                                     M, a, kp.r_isco, kp.r_disk_out, cp);
             output[py * width + px] = colour;
             return;
         }
@@ -2603,7 +2679,7 @@ static inline void trace_pixel_impl(
                             }
                             const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
                             colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
-                                                     M, kp.r_isco, kp.r_disk_out, cp);
+                                                     M, a, kp.r_isco, kp.r_disk_out, cp);
                             done = true;
                             break;
                         }
@@ -2715,7 +2791,7 @@ static inline void trace_pixel_impl(
                                               pr_hit, pth_hit, pphi_hit);
                             const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
                             colour = disk_color_abgr(r_hit, ph_hit, red, 1.0f,
-                                                     M, kp.r_isco, kp.r_disk_out, cp);
+                                                     M, a, kp.r_isco, kp.r_disk_out, cp);
                             best_alpha = alpha;
                             best_event = 1;
                         }
@@ -2823,7 +2899,7 @@ static inline void trace_pixel_impl(
             // Disk hit
             const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
             colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
-                                     M, kp.r_isco, kp.r_disk_out, cp);
+                                     M, a, kp.r_isco, kp.r_disk_out, cp);
             break;
         }
         prev_cos = cos_th;

@@ -9,7 +9,7 @@
     <div class="header-side">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.10 — Metal progress + bundle fix</div>
+        <div><strong>Version</strong> v0.2.11 — interstellar disk: Doppler fix, ring taper, inner-glow control</div>
         <div><strong>Layout</strong> {{ isMobileView() ? 'Smartphone' : 'Desktop' }}</div>
       </div>
       <span class="status-chip" [class]="status()">
@@ -265,6 +265,17 @@
           <label>DOPRI5 integrator</label>
           <button class="switch" type="button" tabindex="-1" [class.on]="params.dopri5"></button>
         </div>
+        <div class="switch-row"
+             tabindex="0"
+             role="switch"
+             [attr.aria-checked]="params.doppler_enabled"
+             [attr.aria-disabled]="false"
+             (click)="params.doppler_enabled = !params.doppler_enabled"
+             (keydown.enter)="params.doppler_enabled = !params.doppler_enabled"
+             (keydown.space)="$event.preventDefault(); params.doppler_enabled = !params.doppler_enabled">
+          <label>Doppler boost</label>
+          <button class="switch" type="button" tabindex="-1" [class.on]="params.doppler_enabled"></button>
+        </div>
         <div class="param-row">
           <label>Max steps</label>
           <num-input [(value)]="params.max_steps"
@@ -371,6 +382,88 @@
             <button class="backend-btn"
                     [class.active]="params.disk_palette === 'interstellar'"
                     (click)="params.disk_palette = 'interstellar'">Interstellar</button>
+          </div>
+
+          <h2>Luminosity profile</h2>
+          <div style="display:flex;gap:6px;margin-bottom:10px">
+            <button class="backend-btn"
+                    [class.active]="params.disk_radial_profile === 'page_thorne'"
+                    (click)="params.disk_radial_profile = 'page_thorne'">
+              Page-Thorne
+            </button>
+            <button class="backend-btn"
+                    [class.active]="params.disk_radial_profile === 'physical_nt'"
+                    (click)="params.disk_radial_profile = 'physical_nt'">
+              Physical NT
+            </button>
+          </div>
+          <div class="param-row">
+            <label>Inner floor (norm)</label>
+            <num-input [(value)]="params.disk_inner_emission_floor"
+                       [min]="0.0" [max]="1.0" [step]="0.01" [decimals]="3">
+            </num-input>
+          </div>
+          <div class="param-row" style="margin-bottom:10px">
+            <label>Inner floor width</label>
+            <num-input [(value)]="params.disk_inner_emission_floor_width"
+                       [min]="0.01" [max]="2.0" [step]="0.01" [decimals]="3">
+            </num-input>
+          </div>
+          <div class="switch-row"
+               tabindex="0"
+               role="switch"
+               [attr.aria-checked]="params.radial_term_zero_torque"
+               [attr.aria-disabled]="false"
+               (click)="params.radial_term_zero_torque = !params.radial_term_zero_torque"
+               (keydown.enter)="params.radial_term_zero_torque = !params.radial_term_zero_torque"
+               (keydown.space)="$event.preventDefault(); params.radial_term_zero_torque = !params.radial_term_zero_torque">
+            <label>Term: zero-torque (1-√rISCO/r)</label>
+            <button class="switch" type="button" tabindex="-1" [class.on]="params.radial_term_zero_torque"></button>
+          </div>
+          <div class="switch-row"
+               tabindex="0"
+               role="switch"
+               [attr.aria-checked]="params.radial_term_r3_decay"
+               [attr.aria-disabled]="false"
+               (click)="params.radial_term_r3_decay = !params.radial_term_r3_decay"
+               (keydown.enter)="params.radial_term_r3_decay = !params.radial_term_r3_decay"
+               (keydown.space)="$event.preventDefault(); params.radial_term_r3_decay = !params.radial_term_r3_decay">
+            <label>Term: radial decay (1/r³)</label>
+            <button class="switch" type="button" tabindex="-1" [class.on]="params.radial_term_r3_decay"></button>
+          </div>
+          <div class="switch-row"
+               [class.disabled]="params.disk_radial_profile !== 'physical_nt'"
+               [matTooltip]="params.disk_radial_profile !== 'physical_nt' ? 'Attivo solo con profilo Physical NT' : ''"
+               [attr.tabindex]="params.disk_radial_profile === 'physical_nt' ? 0 : -1"
+               role="switch"
+               [attr.aria-checked]="params.radial_term_relativistic"
+               [attr.aria-disabled]="params.disk_radial_profile !== 'physical_nt'"
+               (click)="params.disk_radial_profile === 'physical_nt' && (params.radial_term_relativistic = !params.radial_term_relativistic)"
+               (keydown.enter)="params.disk_radial_profile === 'physical_nt' && (params.radial_term_relativistic = !params.radial_term_relativistic)"
+               (keydown.space)="$event.preventDefault(); params.disk_radial_profile === 'physical_nt' && (params.radial_term_relativistic = !params.radial_term_relativistic)">
+            <label>Term: relativistic √(C/A)</label>
+            <button class="switch"
+                    type="button"
+                    tabindex="-1"
+                    [class.on]="params.radial_term_relativistic"
+                    [disabled]="params.disk_radial_profile !== 'physical_nt'"></button>
+          </div>
+          <div class="switch-row"
+               [class.disabled]="params.disk_radial_profile !== 'physical_nt'"
+               [matTooltip]="params.disk_radial_profile !== 'physical_nt' ? 'Attivo solo con profilo Physical NT' : ''"
+               [attr.tabindex]="params.disk_radial_profile === 'physical_nt' ? 0 : -1"
+               role="switch"
+               [attr.aria-checked]="params.radial_term_b_denom"
+               [attr.aria-disabled]="params.disk_radial_profile !== 'physical_nt'"
+               (click)="params.disk_radial_profile === 'physical_nt' && (params.radial_term_b_denom = !params.radial_term_b_denom)"
+               (keydown.enter)="params.disk_radial_profile === 'physical_nt' && (params.radial_term_b_denom = !params.radial_term_b_denom)"
+               (keydown.space)="$event.preventDefault(); params.disk_radial_profile === 'physical_nt' && (params.radial_term_b_denom = !params.radial_term_b_denom)">
+            <label>Term: 1/B denominator</label>
+            <button class="switch"
+                    type="button"
+                    tabindex="-1"
+                    [class.on]="params.radial_term_b_denom"
+                    [disabled]="params.disk_radial_profile !== 'physical_nt'"></button>
           </div>
           <div *ngIf="params.disk_palette === 'stratified'">
             <div class="param-row">

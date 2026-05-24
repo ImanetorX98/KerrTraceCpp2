@@ -89,8 +89,16 @@ export class App implements OnInit, OnDestroy {
     background: 'black.png',
     scene_mode: 'black_hole',
     disk_palette: 'blackbody',
+    disk_radial_profile: 'page_thorne',
     disk_brightness: 1.0,
     disk_opacity: 1.0,
+    doppler_enabled: true,
+    disk_inner_emission_floor: 0.0,
+    disk_inner_emission_floor_width: 0.25,
+    radial_term_zero_torque: true,
+    radial_term_r3_decay: true,
+    radial_term_relativistic: true,
+    radial_term_b_denom: true,
     disk_rings: 7,
     disk_sectors: 14,
     disk_sigma: 0.5,
@@ -791,7 +799,16 @@ export class App implements OnInit, OnDestroy {
     if (!this.selectedPresetName) return;
     const preset = this.presets.find(p => p.name === this.selectedPresetName);
     if (!preset) return;
-    this.params = this.cloneParams(preset.params);
+    const next = this.cloneParams(preset.params);
+    if (!next.disk_radial_profile) next.disk_radial_profile = 'page_thorne';
+    if (typeof (next as any).doppler_enabled !== 'boolean') next.doppler_enabled = true;
+    if (typeof (next as any).disk_inner_emission_floor !== 'number') next.disk_inner_emission_floor = 0.0;
+    if (typeof (next as any).disk_inner_emission_floor_width !== 'number') next.disk_inner_emission_floor_width = 0.25;
+    if (typeof (next as any).radial_term_zero_torque !== 'boolean') next.radial_term_zero_torque = true;
+    if (typeof (next as any).radial_term_r3_decay !== 'boolean') next.radial_term_r3_decay = true;
+    if (typeof (next as any).radial_term_relativistic !== 'boolean') next.radial_term_relativistic = true;
+    if (typeof (next as any).radial_term_b_denom !== 'boolean') next.radial_term_b_denom = true;
+    this.params = next;
     this.enforceSolverConstraints();
     if (!this.params.bundles) this.params.anti_fireflies = false;
   }
