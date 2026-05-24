@@ -1586,9 +1586,8 @@ static float tonemap_ch(float x, float exposure, float gamma) {
 
 static inline float doppler_intensity_scale(float redshift, int enable_doppler) {
     if (enable_doppler == 0) return 1.0f;
-    const float red_c = clamp(2.0f - redshift, 0.01f, 10.0f);
-    const float receding_lift = 1.0f + 0.85f * clamp(1.0f - red_c, 0.0f, 1.0f);
-    return pow(red_c, 4.0f) * receding_lift;
+    // Physical g: >1 approaching side → use g^4 directly.
+    return pow(clamp(redshift, 0.01f, 10.0f), 4.0f);
 }
 
 static inline float robust_disk_redshift(float r_hit,
@@ -1599,7 +1598,7 @@ static inline float robust_disk_redshift(float r_hit,
     constexpr float kRadicandFloor = 1e-8f;
     constexpr float kDenomFloor = 1e-8f;
     constexpr float kRedMax = 6.0f;
-    const float Omega = keplerian_omega(r_hit, M, a, Q, L);
+    const float Omega = -keplerian_omega(r_hit, M, a, Q, L);  // physical prograde Ω > 0
     float gll2[4][4];
     gLL_BL(r_hit, M_PI_2_F, M, a, Q, L, gll2);
     const float d2 = -(gll2[0][0] + 2.0f*gll2[0][3]*Omega + gll2[3][3]*Omega*Omega);
@@ -1818,13 +1817,12 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
         cg += (out_g - cg) * t2;
         cb += (out_b - cb) * t2;
 
-        const float red_c = clamp(2.0f - red, 0.01f, 10.0f);
-        const float receding_lift = 1.0f + 0.85f * clamp(1.0f - red_c, 0.0f, 1.0f);
         const float lens = clamp(1.0f / max(magnif, 1e-6f), 0.05f, 5.0f);
 
         float intensity = mask * profile * turbulence * bands;
+        // Physical g: >1 approaching side → use g^4 directly.
         const float doppler_scale = (cp.enable_doppler != 0)
-            ? (pow(red_c, 4.0f) * receding_lift)
+            ? pow(clamp(red, 0.01f, 10.0f), 4.0f)
             : 1.0f;
         intensity *= doppler_scale;
         intensity *= lens;

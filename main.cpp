@@ -94,6 +94,8 @@ struct ColorParams {
     double inner_emission_floor = 0.0; // optional normalized flux floor at ISCO (0=off)
     double inner_emission_floor_width = 0.25; // floor fade width as fraction of (r_out-r_in)
     bool   doppler_enabled = true; // relativistic Doppler boosting toggle
+    double doppler_exp     = 4.0;  // beaming exponent: 4=physical, <4=softer effect
+    bool   zero_torque_taper = false; // multiply intensity by (1-sqrt(r_isco/r)): zero at ISCO, physical inner BC
 
     // Interstellar cinematic mode (artist-friendly controls)
     double interstellar_omega0                = 1.0;
@@ -421,7 +423,7 @@ static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& 
     constexpr double kRadicandFloor = 1.0e-8;
     constexpr double kDenomFloor = 1.0e-8;
     constexpr double kGMax = 6.0;
-    double Omega = g.keplerian_omega(r);
+    double Omega = -g.keplerian_omega(r);  // physical prograde Ω > 0 (keplerian_omega uses sign trick for r_isco)
     double gLL[4][4]; g.covariant_BL(r, M_PI/2.0, gLL);
     const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
     const double ut = 1.0 / std::sqrt(std::max(d2, kRadicandFloor));
@@ -434,16 +436,14 @@ static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& 
     return clamp(g_factor, 0.0, kGMax);
 }
 
-static double doppler_luma_scale_inverted(double redshift) {
-    // keplerian_omega uses Omega<0 for a>0 so the raw g factor is <1 on the
-    // approaching side (left for a>0) and >1 on the receding side.
-    // Mirror around g=1 to restore physical brightness: approaching → bright left.
-    const double red_c = clamp(2.0 - redshift, 0.01, 10.0);
-    return std::pow(red_c, 4.0);
+static double doppler_luma_scale_inverted(double redshift, double exp) {
+    // Physical g: >1 on approaching side (left for a>0), <1 on receding side.
+    // Use g directly — no 2-g mirror needed.
+    return std::pow(clamp(redshift, 0.01, 10.0), exp);
 }
 
 static inline double doppler_luma_scale(double redshift, const ColorParams& cp) {
-    return cp.doppler_enabled ? doppler_luma_scale_inverted(redshift) : 1.0;
+    return cp.doppler_enabled ? doppler_luma_scale_inverted(redshift, cp.doppler_exp) : 1.0;
 }
 
 // Continue tracing from an already-known state, but ignoring further disk hits.
@@ -2342,6 +2342,9 @@ static RGB disk_colour_interstellar(double r, double phi,
         const double sig = std::max(1e-6, cp.radial_ring_taper_sigma);
         intensity *= std::exp(-std::abs(r - r0) / sig);
     }
+    if (cp.zero_torque_taper && r_isco > 0.0 && r > r_isco) {
+        intensity *= 1.0 - std::sqrt(r_isco / r);
+    }
     intensity = std::max(intensity, 0.0);
 
     return {
@@ -2355,9 +2358,8 @@ static RGB disk_colour(double r, double red, double magnif,
                        double M, double a, double r_isco, double r_disk_out,
                        const ColorParams& cp,
                        double flux_ref) {
-    // keplerian_omega convention: Omega<0 for a>0, so raw g<1 on approaching side.
-    // Mirror g around 1 to get the physically observed shift (same as doppler_luma_scale).
-    const double red_phys = clamp(2.0 - red, 0.2, 5.0);
+    // Physical g: >1 on approaching side → hotter temperature there.
+    const double red_phys = clamp(red, 0.2, 5.0);
     double T = 6500.0 * cp.temp_scale * std::sqrt(6.0*M/r) * red_phys;
     const double flux = disk_flux_raw(r, r_isco, a, cp);
     const double safe_ref = std::max(1.0e-12, flux_ref);
@@ -2383,6 +2385,9 @@ static RGB disk_colour(double r, double red, double magnif,
         const double r0  = cp.radial_ring_taper_use_isco ? r_isco : cp.radial_ring_taper_r0;
         const double sig = std::max(1e-6, cp.radial_ring_taper_sigma);
         I *= std::exp(-std::abs(r - r0) / sig);
+    }
+    if (cp.zero_torque_taper && r_isco > 0.0 && r > r_isco) {
+        I *= 1.0 - std::sqrt(r_isco / r);
     }
     auto c = blackbody(T);
     return {(uint8_t)(tonemap(c.r/255.0*I, cp.exposure, cp.gamma)*255),
@@ -3421,6 +3426,9 @@ int main(int argc, char** argv) {
             cli_inner_emission_floor_width = std::stod(argv[++i]);
         if (arg=="--no-doppler") cli_doppler_enabled = false;
         if (arg=="--doppler") cli_doppler_enabled = true;
+        if (arg=="--doppler-exp" && i+1<argc) cp.doppler_exp = std::max(0.0, std::stod(argv[++i]));
+        if (arg=="--zero-torque-taper")    cp.zero_torque_taper = true;
+        if (arg=="--no-zero-torque-taper") cp.zero_torque_taper = false;
         if (arg=="--no-radial-term-zero-torque" || arg=="--no-radial-zero-torque")
             cli_radial_term_zero_torque = false;
         if (arg=="--radial-term-zero-torque" || arg=="--radial-zero-torque")
