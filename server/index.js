@@ -26,6 +26,8 @@ const THUMB_DIR    = path.join(OUT_DIR, '.thumbs');
 const QUEUE_STATE_FILE = path.join(OUT_DIR, '.queue_state.json');
 const ASSETS_DIR   = path.join(ROOT, 'assets', 'backgrounds');
 const DEFAULT_BACKGROUND = 'sfondo5.jpg';
+const NAV_BAKES_DIR = path.join(OUT_DIR, 'nav_bakes');
+fs.mkdirSync(NAV_BAKES_DIR, { recursive: true });
 
 function firstExisting(paths) {
   for (const p of paths) {
@@ -80,6 +82,9 @@ let queuedJobs = [];
 let recentJobs = [];
 let nextJobId = 1;
 const MAX_RECENT_JOBS = 80;
+
+// ── Nav bake state ────────────────────────────────────────────
+let navBakeJob = null; // { id, bakeDir, frames, renderParams, done, total, cancelled, currentProc }
 const QUEUE_STATE_VERSION = 1;
 
 function nowSeconds() {
@@ -807,6 +812,121 @@ function ensureRenderThumbnail(sourceFilePath, sourceName, widthPx) {
 
 loadQueueState();
 
+// ── Nav bake runner ───────────────────────────────────────────
+async function runNavBake(job) {
+  // CPU binary (OpenMP) is ~70× faster than Metal for small bake frames (160×90).
+  const navBinary = BINARY_CPU || BINARY_METAL;
+  if (!navBinary) {
+    broadcast({ type: 'nav_bake_error', error: 'no binary available' });
+    navBakeJob = null;
+    return;
+  }
+
+  // Build static args (everything except --theta / --phi which go via stdin)
+  const staticMsg = { ...job.renderParams, theta: 0, phi: 0 };
+  const allArgs = buildNavArgs(staticMsg);
+  // Remove --theta and --phi from args (sent per-frame via stdin instead)
+  const thetaIdx = allArgs.indexOf('--theta');
+  if (thetaIdx >= 0) allArgs.splice(thetaIdx, 2);
+  const phiIdx = allArgs.indexOf('--phi');
+  if (phiIdx >= 0) allArgs.splice(phiIdx, 2);
+  allArgs.push('--bake-mode');
+
+  const proc = spawn(navBinary, allArgs, { cwd: ROOT, stdio: ['pipe', 'pipe', 'ignore'] });
+  job.currentProc = proc;
+
+  let stdoutBuf = '';
+
+  const processNextFrame = (frameIdx) => {
+    return new Promise((resolve) => {
+      if (frameIdx >= job.frames.length || job.cancelled) {
+        proc.stdin.end();
+        resolve();
+        return;
+      }
+      const frame = job.frames[frameIdx];
+
+      const onData = (chunk) => {
+        stdoutBuf += chunk.toString();
+        const lines = stdoutBuf.split('\n');
+        stdoutBuf = lines.pop(); // keep incomplete line
+        for (const line of lines) {
+          const m = line.match(/Saved:\s+(\S+\.png)/i);
+          if (m) {
+            proc.stdout.removeListener('data', onData);
+            const fullPath = path.isAbsolute(m[1]) ? m[1] : path.join(ROOT, m[1]);
+            if (fs.existsSync(fullPath)) {
+              try { fs.renameSync(fullPath, path.join(job.bakeDir, frame.file)); } catch {}
+            }
+            job.done++;
+            broadcast({ type: 'nav_bake_progress', bakeId: job.id, done: job.done, total: job.total });
+            resolve();
+          }
+        }
+      };
+      proc.stdout.on('data', onData);
+      proc.stdin.write(`${frame.theta} ${frame.phi}\n`);
+    });
+  };
+
+  // Process frames sequentially
+  for (let i = 0; i < job.frames.length && !job.cancelled; i++) {
+    await processNextFrame(i);
+  }
+
+  if (!proc.stdin.destroyed) proc.stdin.end();
+  await new Promise(resolve => proc.on('close', resolve));
+
+  navBakeJob = null;
+  if (!job.cancelled) {
+    broadcast({ type: 'nav_bake_done', bakeId: job.id, total: job.total });
+  }
+}
+
+// ── Navigate helper ───────────────────────────────────────────
+function buildNavArgs(msg) {
+  // 320×180 for fast interactive preview
+  const args = ['--custom-res', '320', '180', '--ks', '--solver-mode', 'standard',
+                '--intersection-hermite'];
+  const theta = Number(msg.theta);
+  const phi   = Number(msg.phi);
+  if (Number.isFinite(theta)) args.push('--theta', String(theta));
+  if (Number.isFinite(phi))   args.push('--phi',   String(phi));
+  const a = Number(msg.a);
+  if (Number.isFinite(a))     args.push('--a', String(a));
+  const diskOut = Number(msg.disk_out);
+  if (Number.isFinite(diskOut) && diskOut > 0) args.push('--disk-out', String(diskOut));
+  const rObs = Number(msg.r_obs);
+  if (Number.isFinite(rObs) && rObs > 0) args.push('--r-obs', String(rObs));
+  const fov = Number(msg.fov);
+  if (Number.isFinite(fov) && fov > 0) args.push('--fov', String(fov));
+
+  const palette = String(msg.disk_palette || 'blackbody');
+  if (palette === 'interstellar') {
+    args.push('--disk-interstellar');
+    const p = Number(msg.interstellar_p);
+    if (Number.isFinite(p)) args.push('--disk-interstellar-p', String(p));
+  } else if (palette === 'stratified') {
+    args.push('--disk-stratified');
+  }
+
+  const brightness = Number(msg.disk_brightness);
+  if (Number.isFinite(brightness) && brightness > 0)
+    args.push('--disk-brightness', String(brightness));
+
+  if (msg.doppler_enabled === true)  args.push('--doppler');
+  else if (msg.doppler_enabled === false) args.push('--no-doppler');
+
+  if (msg.radial_term_zero_torque === true) args.push('--radial-term-zero-torque');
+
+  const bg = typeof msg.background === 'string' ? msg.background.trim() : '';
+  if (bg && bg !== 'none') {
+    const bgPath = path.join(ASSETS_DIR, bg);
+    if (fs.existsSync(bgPath)) args.push('--bg', bgPath);
+  }
+  return args;
+}
+
 // ── WebSocket ─────────────────────────────────────────────────
 wss.on('connection', ws => {
   // Send current job status on connect
@@ -816,6 +936,67 @@ wss.on('connection', ws => {
     ws.send(JSON.stringify({ type: 'status', running: false }));
   }
   ws.send(JSON.stringify({ type: 'queue_state', ...buildQueueSnapshot() }));
+
+  // ── Per-connection navigate state ─────────────────────────
+  let navProc    = null;
+  let navDebounce = null;
+
+  ws.on('message', raw => {
+    let msg;
+    try { msg = JSON.parse(String(raw)); } catch { return; }
+
+    if (msg.type === 'navigate') {
+      if (navDebounce) { clearTimeout(navDebounce); navDebounce = null; }
+      if (navProc)     { try { navProc.kill('SIGTERM'); } catch {} navProc = null; }
+
+      navDebounce = setTimeout(() => {
+        navDebounce = null;
+        const navBinary = BINARY_CPU || BINARY_METAL;
+        if (!navBinary) {
+          if (ws.readyState === WebSocket.OPEN)
+            ws.send(JSON.stringify({ type: 'nav_error', error: 'no binary available' }));
+          return;
+        }
+
+        const args = buildNavArgs(msg);
+        const proc = spawn(navBinary, args, { cwd: ROOT });
+        navProc = proc;
+
+        let savedFile = null;
+        proc.stdout.on('data', chunk => {
+          const m = chunk.toString().match(/Saved:\s+(\S+\.png)/i);
+          if (m) savedFile = m[1].trim();
+        });
+
+        proc.on('close', code => {
+          if (navProc === proc) navProc = null;
+          if (code !== 0 || !savedFile) return;
+          const fullPath = path.isAbsolute(savedFile)
+            ? savedFile : path.join(ROOT, savedFile);
+          if (!fs.existsSync(fullPath)) return;
+          try {
+            const buf = fs.readFileSync(fullPath);
+            const dataUrl = 'data:image/png;base64,' + buf.toString('base64');
+            if (ws.readyState === WebSocket.OPEN)
+              ws.send(JSON.stringify({ type: 'nav_frame', dataUrl }));
+            fs.unlinkSync(fullPath);
+          } catch (err) {
+            console.warn('[nav] read/send error:', err.message);
+          }
+        });
+
+        proc.on('error', err => {
+          if (navProc === proc) navProc = null;
+          console.warn('[nav] spawn error:', err.message);
+        });
+      }, 50);
+    }
+  });
+
+  ws.on('close', () => {
+    if (navDebounce) { clearTimeout(navDebounce); navDebounce = null; }
+    if (navProc) { try { navProc.kill('SIGTERM'); } catch {} navProc = null; }
+  });
 });
 
 // ── GET /api/info ─────────────────────────────────────────────
@@ -1404,6 +1585,92 @@ app.post('/api/queue/duplicate', (req, res) => {
     jobId: enqueued.id,
     queuePosition,
   });
+});
+
+// ── GET /api/nav-bakes ────────────────────────────────────────
+app.get('/api/nav-bakes', (req, res) => {
+  const active = navBakeJob
+    ? { id: navBakeJob.id, done: navBakeJob.done, total: navBakeJob.total, running: true }
+    : null;
+  if (!fs.existsSync(NAV_BAKES_DIR)) return res.json({ active, bakes: [] });
+  const bakes = fs.readdirSync(NAV_BAKES_DIR)
+    .filter(d => fs.statSync(path.join(NAV_BAKES_DIR, d)).isDirectory())
+    .map(d => {
+      const mf = path.join(NAV_BAKES_DIR, d, 'manifest.json');
+      if (!fs.existsSync(mf)) return null;
+      try {
+        const m = JSON.parse(fs.readFileSync(mf, 'utf8'));
+        return { id: d, thetaStep: m.thetaStep, phiStep: m.phiStep, total: m.frames.length, createdAt: m.createdAt };
+      } catch { return null; }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  res.json({ active, bakes });
+});
+
+// ── POST /api/nav-bake ────────────────────────────────────────
+app.post('/api/nav-bake', (req, res) => {
+  if (req.body.cancel) {
+    if (navBakeJob) {
+      navBakeJob.cancelled = true;
+      if (navBakeJob.currentProc) {
+        try { navBakeJob.currentProc.stdin.end(); } catch {}
+        try { navBakeJob.currentProc.kill('SIGTERM'); } catch {}
+      }
+      navBakeJob = null;
+      broadcast({ type: 'nav_bake_cancelled' });
+    }
+    return res.json({ status: 'cancelled' });
+  }
+  if (navBakeJob) return res.status(409).json({ error: 'bake already running' });
+
+  const thetaStep = Math.max(1, Math.min(30, Number(req.body.theta_step) || 10));
+  const phiStep   = Math.max(1, Math.min(30, Number(req.body.phi_step)   || 10));
+  const bakeId    = Date.now().toString(36);
+  const bakeDir   = path.join(NAV_BAKES_DIR, bakeId);
+  fs.mkdirSync(bakeDir, { recursive: true });
+
+  const thetaVals = [], phiVals = [];
+  for (let t = thetaStep; t < 180; t += thetaStep) thetaVals.push(t);
+  for (let p = 0; p < 360; p += phiStep) phiVals.push(p);
+  const frames = [];
+  for (const theta of thetaVals)
+    for (const phi of phiVals)
+      frames.push({ theta, phi, file: `t${theta}_p${phi}.png` });
+
+  const renderParams = {
+    a: req.body.a, disk_out: req.body.disk_out, r_obs: req.body.r_obs,
+    fov: req.body.fov, disk_palette: req.body.disk_palette,
+    disk_brightness: req.body.disk_brightness, doppler_enabled: req.body.doppler_enabled,
+    radial_term_zero_torque: req.body.radial_term_zero_torque,
+    interstellar_p: req.body.interstellar_p, background: req.body.background,
+  };
+
+  fs.writeFileSync(path.join(bakeDir, 'manifest.json'), JSON.stringify({
+    thetaStep, phiStep, frames, renderParams, createdAt: new Date().toISOString()
+  }));
+
+  navBakeJob = { id: bakeId, bakeDir, frames, renderParams, done: 0, total: frames.length, cancelled: false, currentProc: null };
+  res.json({ status: 'started', bakeId, total: frames.length });
+  runNavBake(navBakeJob);
+});
+
+// ── DELETE /api/nav-bake/:id ──────────────────────────────────
+app.delete('/api/nav-bake/:id', (req, res) => {
+  const id = req.params.id.replace(/[^a-z0-9]/gi, '');
+  const bakeDir = path.join(NAV_BAKES_DIR, id);
+  if (!fs.existsSync(bakeDir)) return res.status(404).json({ error: 'not found' });
+  fs.rmSync(bakeDir, { recursive: true, force: true });
+  res.json({ status: 'deleted' });
+});
+
+// ── GET /api/nav-bakes/:id/:file ──────────────────────────────
+app.get('/api/nav-bakes/:id/:file', (req, res) => {
+  const id   = req.params.id.replace(/[^a-z0-9]/gi, '');
+  const file = req.params.file.replace(/[^a-z0-9._]/gi, '');
+  const full = path.join(NAV_BAKES_DIR, id, file);
+  if (!fs.existsSync(full)) return res.status(404).end();
+  res.sendFile(full);
 });
 
 // ── Start ─────────────────────────────────────────────────────

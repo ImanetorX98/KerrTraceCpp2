@@ -16,22 +16,34 @@
 #include <string>
 #include <vector>
 
-std::vector<uint32_t> metal_render(
-    const KNdSParams_C&  kp,
-    const CameraParams_C& cp,
-    const uint8_t* bg_rgb,
-    int bg_w,
-    int bg_h)
+// ── Per-process Metal singleton ───────────────────────────────────────────────
+// Compiling tracer.metal takes ~60 s on first call. Cache device, library, and
+// all three PSOs so subsequent calls within the same process are instant.
+namespace {
+
+struct MetalCache {
+    id<MTLDevice>              device  = nil;
+    id<MTLLibrary>             lib     = nil;
+    id<MTLComputePipelineState> pso_single  = nil; // trace_pixel_single
+    id<MTLComputePipelineState> pso_bundle  = nil; // trace_pixel_bundle
+    id<MTLComputePipelineState> pso_unified = nil; // trace_pixel (legacy)
+    id<MTLCommandQueue>        queue   = nil;
+    bool                       precise = false;
+};
+
+static MetalCache g_cache;
+static bool       g_cache_valid = false;
+
+static void ensure_metal_cache(bool precise_math)
 {
-    // ── Acquire GPU device ────────────────────────────────────
+    if (g_cache_valid && g_cache.precise == precise_math) return;
+
+    NSError* err = nil;
+
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device)
         throw std::runtime_error("No Metal-capable GPU found");
 
-    // ── Compile the shader at runtime from source ─────────────
-    NSError* err = nil;
-    // Locate tracer.metal relative to the executable first (developer build),
-    // then fallback to bundle resources.
     NSString* exeDir = [[[NSProcessInfo processInfo]
                           arguments][0] stringByDeletingLastPathComponent];
     NSString* shaderPath = [exeDir stringByAppendingPathComponent:@"../gpu/metal/tracer.metal"];
@@ -52,27 +64,70 @@ std::vector<uint32_t> metal_render(
 
     MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
     opts.languageVersion = MTLLanguageVersion2_4;
-    // Optional high-precision mode for near-horizon debugging/validation:
-    //   KERR_METAL_PRECISE_MATH=1  -> safer math (slower)
-    //   default                    -> fast math (faster)
-    bool precise_math = false;
-    if (const char* env = std::getenv("KERR_METAL_PRECISE_MATH")) {
-        precise_math = (std::atoi(env) != 0);
-    }
     if (@available(macOS 15.0, *)) {
         opts.mathMode = precise_math ? MTLMathModeSafe : MTLMathModeFast;
     } else {
         opts.fastMathEnabled = precise_math ? NO : YES;
     }
+
     id<MTLLibrary> lib = [device newLibraryWithSource:src options:opts error:&err];
     if (!lib)
         throw std::runtime_error(
             std::string("Metal compile error: ") +
             [err.localizedDescription UTF8String]);
 
+    auto make_pso = [&](NSString* name) -> id<MTLComputePipelineState> {
+        id<MTLFunction> fn = [lib newFunctionWithName:name];
+        if (!fn) return nil;
+        NSError* e2 = nil;
+        id<MTLComputePipelineState> p = [device newComputePipelineStateWithFunction:fn error:&e2];
+        return p; // nil on failure is handled at call-site
+    };
+
+    id<MTLComputePipelineState> pso_single  = make_pso(@"trace_pixel_single");
+    id<MTLComputePipelineState> pso_bundle  = make_pso(@"trace_pixel_bundle");
+    id<MTLComputePipelineState> pso_unified = make_pso(@"trace_pixel");
+
+    if (!pso_single && !pso_unified)
+        throw std::runtime_error("PSO creation failed: no usable kernel found in tracer.metal");
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (!queue)
+        throw std::runtime_error("Failed to create Metal command queue");
+
+    g_cache.device      = device;
+    g_cache.lib         = lib;
+    g_cache.pso_single  = pso_single;
+    g_cache.pso_bundle  = pso_bundle;
+    g_cache.pso_unified = pso_unified;
+    g_cache.queue       = queue;
+    g_cache.precise     = precise_math;
+    g_cache_valid       = true;
+}
+
+} // namespace
+
+std::vector<uint32_t> metal_render(
+    const KNdSParams_C&  kp,
+    const CameraParams_C& cp,
+    const uint8_t* bg_rgb,
+    int bg_w,
+    int bg_h)
+{
+    // ── Ensure cached device / compiled library / PSOs ────────
+    bool precise_math = false;
+    if (const char* env = std::getenv("KERR_METAL_PRECISE_MATH"))
+        precise_math = (std::atoi(env) != 0);
+
+    ensure_metal_cache(precise_math);
+
+    id<MTLDevice>       device = g_cache.device;
+    id<MTLCommandQueue> queue  = g_cache.queue;
+
+    // ── Select PSO ────────────────────────────────────────────
     NSString* kernelName = @"trace_pixel_single";
     switch (cp.metal_kernel_mode) {
-        case 1:  kernelName = @"trace_pixel";        break; // unified legacy kernel
+        case 1:  kernelName = @"trace_pixel";        break;
         case 2:  kernelName = @"trace_pixel_single"; break;
         case 3:  kernelName = @"trace_pixel_bundle"; break;
         default: kernelName = (cp.use_bundles != 0) ? @"trace_pixel_bundle"
@@ -80,20 +135,15 @@ std::vector<uint32_t> metal_render(
                  break;
     }
 
-    id<MTLFunction> fn = [lib newFunctionWithName:kernelName];
-    if (!fn) {
-        // Backward-compatible fallback for older shader builds.
-        fn = [lib newFunctionWithName:@"trace_pixel"];
-    }
-    if (!fn)
-        throw std::runtime_error("Cannot find Metal kernel entrypoint in tracer.metal");
-
-    id<MTLComputePipelineState> pso =
-        [device newComputePipelineStateWithFunction:fn error:&err];
+    id<MTLComputePipelineState> pso = nil;
+    if      ([kernelName isEqualToString:@"trace_pixel_bundle"])  pso = g_cache.pso_bundle;
+    else if ([kernelName isEqualToString:@"trace_pixel_single"])  pso = g_cache.pso_single;
+    else                                                           pso = g_cache.pso_unified;
+    // Fallback chain
+    if (!pso) pso = g_cache.pso_single;
+    if (!pso) pso = g_cache.pso_unified;
     if (!pso)
-        throw std::runtime_error(
-            std::string("PSO creation failed: ") +
-            [err.localizedDescription UTF8String]);
+        throw std::runtime_error("No suitable Metal PSO available for requested kernel");
 
     // ── Buffers ───────────────────────────────────────────────
     const NSUInteger npix = cp.width * cp.height;
@@ -163,9 +213,7 @@ std::vector<uint32_t> metal_render(
         throw std::runtime_error("Failed to create Metal sampler state");
 
     // ── Dispatch ──────────────────────────────────────────────
-    id<MTLCommandQueue> queue = [device newCommandQueue];
-    if (!queue)
-        throw std::runtime_error("Failed to create Metal command queue");
+    // (queue is the cached g_cache.queue)
 
     // Tile in adaptive row/column slices to stay under GPU interactivity watchdog.
     // On failure we retry the same tile with smaller extents until it succeeds.

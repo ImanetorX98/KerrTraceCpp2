@@ -9,7 +9,7 @@
     <div class="header-side">
       <div class="app-meta">
         <div><strong>Author</strong> Iman Rosignoli</div>
-        <div><strong>Version</strong> v0.2.12 — physical Doppler (exact g formula), Page-Thorne r^{-p} profile, Metal shader sync</div>
+        <div><strong>Version</strong> v0.2.12 — physical Doppler (exact g formula), Page-Thorne r^&#123;-p&#125; profile, Metal shader sync</div>
         <div><strong>Layout</strong> {{ isMobileView() ? 'Smartphone' : 'Desktop' }}</div>
       </div>
       <span class="status-chip" [class]="status()">
@@ -31,6 +31,10 @@
             (click)="postProcessTab='recolor'">
       <mat-icon>tune</mat-icon>Re-colorize
     </button>
+    <button class="tab-btn" [class.active]="postProcessTab==='navigate'"
+            (click)="postProcessTab='navigate'">
+      <mat-icon>360</mat-icon>Navigate
+    </button>
   </div>
 
   <div class="grid">
@@ -45,7 +49,7 @@
         <h2>Resolution</h2>
         <mat-select [(ngModel)]="params.resolution"
                     style="width:100%;font-size:13px;color:#f0f0f0">
-          <mat-option *ngFor="let r of info?.resolutions ?? []" [value]="r">{{r}}</mat-option>
+          <mat-option *ngFor="let r of info?.resolutions ?? []" [value]="r"><span [innerHTML]="r"></span></mat-option>
         </mat-select>
       </div>
 
@@ -122,7 +126,7 @@
             <mat-select [(ngModel)]="params.bg_b" placeholder="Same as A"
                         style="width:100%;font-size:13px">
               <mat-option value="">Same as Universe A</mat-option>
-              <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg">{{bg}}</mat-option>
+              <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg"><span [innerHTML]="bg"></span></mat-option>
             </mat-select>
           </div>
           <div style="margin-top:6px;color:#555;font-size:11px;line-height:1.4">
@@ -176,10 +180,10 @@
                     class="backend-btn"
                     [class.active]="params.backend === b"
                     (click)="params.backend = b">
-              <mat-icon style="font-size:14px;width:14px;height:14px;margin-right:4px">
-                {{ b === 'metal' ? 'memory' : b === 'cuda' ? 'developer_board' : 'computer' }}
+              <mat-icon style="font-size:14px;width:14px;height:14px;margin-right:4px"
+                        [fontIcon]="b === 'metal' ? 'memory' : b === 'cuda' ? 'developer_board' : 'computer'">
               </mat-icon>
-              {{ b === 'metal' ? 'Metal GPU' : b === 'cuda' ? 'CUDA GPU' : 'CPU' }}
+              <span [innerHTML]="b === 'metal' ? 'Metal GPU' : b === 'cuda' ? 'CUDA GPU' : 'CPU'"></span>
             </button>
           </div>
         </div>
@@ -299,16 +303,14 @@
           <mat-select [(ngModel)]="params.camera_spp"
                       style="width:170px;font-size:13px;color:#f0f0f0">
             <mat-option *ngFor="let spp of supersamplingLevels" [value]="spp">
-              {{ spp }} raggi/pixel
+              <span [innerHTML]="spp + ' raggi/pixel'"></span>
             </mat-option>
           </mat-select>
         </div>
         <div style="margin:-4px 0 8px;color:#787c84;font-size:12px;line-height:1.35">
           Multi-pass subpixel AA (stile KerrTrace Python). Più alto = meno sgranatura, ma render più lento.
-          <span *ngIf="raysPerFrame() !== null" style="display:block;margin-top:3px">
-            Raggi/frame stimati:
-            {{ fmtInt(raysPerFrame()!) }}
-            ({{ fmtInt(currentResolutionSize()!.w) }}×{{ fmtInt(currentResolutionSize()!.h) }} × {{ params.camera_spp }})
+          <span *ngIf="raysPerFrame() !== null" style="display:block;margin-top:3px"
+                [innerHTML]="'Raggi/frame stimati: ' + fmtInt(raysPerFrame()!) + ' (' + fmtInt(currentResolutionSize()!.w) + '\xD7' + fmtInt(currentResolutionSize()!.h) + ' \xD7 ' + params.camera_spp + ')'">
           </span>
         </div>
         <div style="margin:12px 0 6px">
@@ -351,7 +353,7 @@
         <mat-select [(ngModel)]="params.background" placeholder="Black"
                     style="width:100%;font-size:13px">
           <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg">
-            {{bg === 'black.png' ? 'Black' : bg}}
+            <span [innerHTML]="bg === 'black.png' ? 'Black' : bg"></span>
           </mat-option>
         </mat-select>
 
@@ -603,7 +605,7 @@
           <mat-select [(ngModel)]="selectedPresetName" placeholder="Select preset"
                       style="flex:1;font-size:13px">
             <mat-option *ngFor="let p of presets" [value]="p.name">
-              {{p.name}}
+              <span [innerHTML]="p.name"></span>
             </mat-option>
           </mat-select>
         </div>
@@ -743,12 +745,12 @@
       <!-- Progress -->
       <div class="progress-wrap" *ngIf="status()==='running'">
         <div class="progress-info">
-          <span *ngIf="hasDeterminateProgress(); else renderProgressPending">{{progress()}}%</span>
+          <span *ngIf="hasDeterminateProgress(); else renderProgressPending" [innerHTML]="progress() + '%'"></span>
           <ng-template #renderProgressPending>
             <span>In corso...</span>
           </ng-template>
-          <span *ngIf="eta() > 0">{{fmtClock(elapsed())}} elapsed · ETA {{fmtClock(eta())}}</span>
-          <span *ngIf="eta() <= 0">{{fmtClock(elapsed())}} elapsed</span>
+          <span *ngIf="eta() > 0" [innerHTML]="fmtClock(elapsed()) + ' elapsed \xB7 ETA ' + fmtClock(eta())"></span>
+          <span *ngIf="eta() <= 0" [innerHTML]="fmtClock(elapsed()) + ' elapsed'"></span>
         </div>
         <mat-progress-bar
           [mode]="hasDeterminateProgress() ? 'determinate' : 'indeterminate'"
@@ -758,7 +760,7 @@
 
       <!-- Log -->
       <div class="log-console" *ngIf="logLines().length > 0">
-        <div *ngFor="let l of logLines()">{{l}}</div>
+        <div *ngFor="let l of logLines()" [innerHTML]="l"></div>
       </div>
     </div>
 
@@ -773,7 +775,7 @@
           <mat-select [(ngModel)]="colorParams.geoFile" placeholder="Select file…"
                       style="flex:1;font-size:13px">
             <mat-option *ngFor="let f of geoFiles" [value]="f.name">
-              {{f.name}}
+              <span [innerHTML]="f.name"></span>
             </mat-option>
           </mat-select>
           <button class="action-btn danger" style="padding:0 10px;height:34px"
@@ -828,12 +830,12 @@
       <!-- Progress -->
       <div class="progress-wrap" *ngIf="status()==='running'">
         <div class="progress-info">
-          <span *ngIf="hasDeterminateProgress(); else recolorProgressPending">{{progress()}}%</span>
+          <span *ngIf="hasDeterminateProgress(); else recolorProgressPending" [innerHTML]="progress() + '%'"></span>
           <ng-template #recolorProgressPending>
             <span>In corso...</span>
           </ng-template>
-          <span *ngIf="eta() > 0">{{fmtClock(elapsed())}} elapsed · ETA {{fmtClock(eta())}}</span>
-          <span *ngIf="eta() <= 0">{{fmtClock(elapsed())}} elapsed</span>
+          <span *ngIf="eta() > 0" [innerHTML]="fmtClock(elapsed()) + ' elapsed \xB7 ETA ' + fmtClock(eta())"></span>
+          <span *ngIf="eta() <= 0" [innerHTML]="fmtClock(elapsed()) + ' elapsed'"></span>
         </div>
         <mat-progress-bar
           [mode]="hasDeterminateProgress() ? 'determinate' : 'indeterminate'"
@@ -843,7 +845,112 @@
 
       <!-- Log -->
       <div class="log-console" *ngIf="logLines().length > 0">
-        <div *ngFor="let l of logLines()">{{l}}</div>
+        <div *ngFor="let l of logLines()" [innerHTML]="l"></div>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════ -->
+    <!--  LEFT — Navigate panel                                 -->
+    <!-- ══════════════════════════════════════════════════════ -->
+    <div *ngIf="postProcessTab === 'navigate'">
+
+      <!-- Controls -->
+      <div class="panel" style="margin-bottom:14px">
+        <div class="param-row">
+          <label>θ inclination</label>
+          <span style="color:#f0f0f0;font-size:13px" [innerHTML]="(navTheta | number:'1.1-1') + '°'"></span>
+        </div>
+        <div class="param-row">
+          <label>φ azimuth</label>
+          <span style="color:#f0f0f0;font-size:13px" [innerHTML]="(navPhi | number:'1.1-1') + '°'"></span>
+        </div>
+        <div class="param-row">
+          <label>Drag sensitivity</label>
+          <input type="range" min="0.05" max="1.0" step="0.05" [(ngModel)]="navSensitivity" style="flex:1" />
+          <span style="color:#888;font-size:11px;min-width:28px" [innerHTML]="navSensitivity | number:'1.2-2'"></span>
+        </div>
+        <div class="param-row">
+          <label>Palette disco</label>
+          <mat-select [(ngModel)]="navPalette" style="flex:1;font-size:12px" placeholder="— da params —">
+            <mat-option [value]="null">— da params —</mat-option>
+            <mat-option value="blackbody">Blackbody</mat-option>
+            <mat-option value="stratified">Stratified</mat-option>
+            <mat-option value="interstellar">Interstellar</mat-option>
+          </mat-select>
+        </div>
+        <div class="param-row">
+          <label>Background</label>
+          <mat-select [(ngModel)]="navBackground" style="flex:1;font-size:12px" placeholder="— da params —">
+            <mat-option [value]="null">— da params —</mat-option>
+            <mat-option *ngFor="let bg of info?.backgrounds ?? []" [value]="bg">
+              <span [innerHTML]="bg"></span>
+            </mat-option>
+          </mat-select>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button class="action-btn" (click)="navSyncFromParams()">Sync da params</button>
+          <button class="action-btn" (click)="navSyncToParams()">Copia θ/φ</button>
+          <button class="action-btn primary" (click)="sendNavigateNow()">Avvia preview</button>
+        </div>
+      </div>
+
+      <!-- Pre-bake -->
+      <div class="panel" style="margin-bottom:14px">
+        <div style="font-size:11px;color:#aaa;margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">Pre-bake griglia</div>
+
+        <div class="param-row">
+          <label>Passo &#952;</label>
+          <mat-select [ngModel]="navBakeStepTheta()" (ngModelChange)="navBakeStepTheta.set($event)" style="width:80px;font-size:12px">
+            <mat-option [value]="1"><span [innerHTML]="'1°'"></span></mat-option>
+            <mat-option [value]="2"><span [innerHTML]="'2°'"></span></mat-option>
+            <mat-option [value]="5"><span [innerHTML]="'5°'"></span></mat-option>
+            <mat-option [value]="10"><span [innerHTML]="'10°'"></span></mat-option>
+            <mat-option [value]="15"><span [innerHTML]="'15°'"></span></mat-option>
+            <mat-option [value]="20"><span [innerHTML]="'20°'"></span></mat-option>
+          </mat-select>
+        </div>
+        <div class="param-row">
+          <label>Passo &#966;</label>
+          <mat-select [ngModel]="navBakeStepPhi()" (ngModelChange)="navBakeStepPhi.set($event)" style="width:80px;font-size:12px">
+            <mat-option [value]="1"><span [innerHTML]="'1°'"></span></mat-option>
+            <mat-option [value]="2"><span [innerHTML]="'2°'"></span></mat-option>
+            <mat-option [value]="5"><span [innerHTML]="'5°'"></span></mat-option>
+            <mat-option [value]="10"><span [innerHTML]="'10°'"></span></mat-option>
+            <mat-option [value]="15"><span [innerHTML]="'15°'"></span></mat-option>
+            <mat-option [value]="20"><span [innerHTML]="'20°'"></span></mat-option>
+          </mat-select>
+          <span style="color:#888;font-size:11px;margin-left:8px" [innerHTML]="navBakeEstFrames() + ' frame'"></span>
+        </div>
+
+        <div *ngIf="navBaking()" style="margin-top:8px">
+          <mat-progress-bar mode="determinate" [value]="navBakePct()" style="border-radius:2px"></mat-progress-bar>
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:#888;margin-top:3px">
+            <span [innerHTML]="navBakeDone() + ' / ' + navBakeTotal() + ' (' + navBakePct() + '%)'"></span>
+            <span *ngIf="navBakeEta() !== null" [innerHTML]="'ETA ~' + navBakeEta() + 's'"></span>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+          <button class="action-btn primary" *ngIf="!navBaking()" (click)="startNavBake()">Avvia bake</button>
+          <button class="action-btn" *ngIf="navBaking()" (click)="cancelNavBake()">Annulla bake</button>
+        </div>
+
+        <!-- Available bakes -->
+        <div *ngIf="navBakeList().length > 0" style="margin-top:10px">
+          <div style="font-size:10px;color:#888;margin-bottom:4px">Bake disponibili</div>
+          <div style="max-height:200px;overflow-y:auto;padding-right:2px">
+            <div *ngFor="let b of navBakeList()" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:11px">
+              <button class="action-btn" [class.primary]="navBakeId() === b.id" (click)="useNavBake(b.id)"
+                      [innerHTML]="(navBakeId() === b.id ? '&#10003; ' : '') + '&#952;' + b.thetaStep + '° &#966;' + b.phiStep + '° · ' + b.total + ' frame'">
+              </button>
+              <span style="color:#555;font-size:10px" [innerHTML]="b.createdAt | date:'dd/MM HH:mm'"></span>
+              <button class="action-btn" (click)="deleteNavBake(b.id)" style="color:#c44;min-width:unset;padding:2px 6px">&#10005;</button>
+            </div>
+          </div>
+          <button *ngIf="navBakeId()" class="action-btn" (click)="navBakeId.set(null)">
+            Usa live render
+          </button>
+        </div>
       </div>
     </div>
 
@@ -853,7 +960,7 @@
     <div class="right-col">
 
       <!-- Queue / jobs -->
-      <div class="panel" style="margin-bottom:14px">
+      <div class="panel" *ngIf="postProcessTab !== 'navigate'" style="margin-bottom:14px">
         <div class="gallery-header">
           <h2 style="margin:0">Render queue</h2>
           <button class="action-btn danger" style="padding:0 8px;height:28px"
@@ -864,31 +971,29 @@
 
         <div *ngIf="queueActive() as active" class="job-card">
           <div class="job-head">
-            <span class="job-badge" [ngClass]="queueStatusClass(active.status)">
-              {{queueStatusLabel(active.status)}}
+            <span class="job-badge" [ngClass]="queueStatusClass(active.status)"
+                  [innerHTML]="queueStatusLabel(active.status)">
             </span>
-            <span class="job-id">#{{active.id}}</span>
-            <span class="job-meta">{{active.resolution}} · {{active.backend | uppercase}} · {{active.chart | uppercase}}</span>
+            <span class="job-id" [innerHTML]="'#' + active.id"></span>
+            <span class="job-meta" [innerHTML]="active.resolution + ' \xB7 ' + (active.backend | uppercase) + ' \xB7 ' + (active.chart | uppercase)"></span>
             <button class="backend-btn" (click)="cancelQueuedJob(active.id)">Cancel</button>
           </div>
           <div class="job-progress-row">
-            <span *ngIf="(active.progressPct ?? 0) > 0; else queueProgressPending">
-              {{active.progressPct ?? 0 | number:'1.0-0'}}%
-            </span>
+            <span *ngIf="(active.progressPct ?? 0) > 0; else queueProgressPending"
+                  [innerHTML]="(active.progressPct ?? 0 | number:'1.0-0') + '%'"></span>
             <ng-template #queueProgressPending>
               <span>Calcolo iniziale...</span>
             </ng-template>
-            <span *ngIf="(active.etaSmoothedSec ?? active.etaSec ?? 0) > 0; else queueEtaPending">
-              {{fmtClock(active.elapsedSec ?? 0)}} elapsed · ETA {{fmtClock((active.etaSmoothedSec ?? active.etaSec ?? 0))}}
-            </span>
+            <span *ngIf="(active.etaSmoothedSec ?? active.etaSec ?? 0) > 0; else queueEtaPending"
+                  [innerHTML]="fmtClock(active.elapsedSec ?? 0) + ' elapsed \xB7 ETA ' + fmtClock(active.etaSmoothedSec ?? active.etaSec ?? 0)"></span>
             <ng-template #queueEtaPending>
-              <span>{{fmtClock(active.elapsedSec ?? 0)}} elapsed</span>
+              <span [innerHTML]="fmtClock(active.elapsedSec ?? 0) + ' elapsed'"></span>
             </ng-template>
           </div>
           <div class="job-stats-row" *ngIf="(active.pixelCount ?? 0) > 0">
-            <span>{{fmtInt(active.donePixels ?? 0)}} / {{fmtInt(active.pixelCount ?? 0)}} px</span>
-            <span>{{fmtRate(active.throughputPixPerSec ?? 0)}} px/s</span>
-            <span>{{fmtRate(active.throughputRaysPerSec ?? 0)}} rays/s</span>
+            <span [innerHTML]="fmtInt(active.donePixels ?? 0) + ' / ' + fmtInt(active.pixelCount ?? 0) + ' px'"></span>
+            <span [innerHTML]="fmtRate(active.throughputPixPerSec ?? 0) + ' px/s'"></span>
+            <span [innerHTML]="fmtRate(active.throughputRaysPerSec ?? 0) + ' rays/s'"></span>
           </div>
           <mat-progress-bar [mode]="(active.progressPct ?? 0) > 0 ? 'determinate' : 'indeterminate'"
                             [value]="active.progressPct ?? 0"></mat-progress-bar>
@@ -899,9 +1004,9 @@
         <div class="job-list-title" *ngIf="queuePending().length > 0">In coda</div>
         <div class="job-card queued" *ngFor="let q of queuePending()">
           <div class="job-head">
-            <span class="job-badge" [ngClass]="queueStatusClass(q.status)">{{queueStatusLabel(q.status)}}</span>
-            <span class="job-id">#{{q.id}}</span>
-            <span class="job-meta">{{q.resolution}} · {{q.backend | uppercase}} · pos {{q.queueIndex}}</span>
+            <span class="job-badge" [ngClass]="queueStatusClass(q.status)" [innerHTML]="queueStatusLabel(q.status)"></span>
+            <span class="job-id" [innerHTML]="'#' + q.id"></span>
+            <span class="job-meta" [innerHTML]="q.resolution + ' \xB7 ' + (q.backend | uppercase) + ' \xB7 pos ' + q.queueIndex"></span>
             <div style="display:flex;gap:4px">
               <button class="backend-btn" (click)="moveQueuedJob(q.id, 'up')">↑</button>
               <button class="backend-btn" (click)="moveQueuedJob(q.id, 'down')">↓</button>
@@ -913,9 +1018,9 @@
         <div class="job-list-title" *ngIf="queueRecent().length > 0">Recenti</div>
         <div class="job-card recent" *ngFor="let rj of queueRecent().slice(0, 6)">
           <div class="job-head">
-            <span class="job-badge" [ngClass]="queueStatusClass(rj.status)">{{queueStatusLabel(rj.status)}}</span>
-            <span class="job-id">#{{rj.id}}</span>
-            <span class="job-meta">{{rj.resolution}} · {{rj.backend | uppercase}}</span>
+            <span class="job-badge" [ngClass]="queueStatusClass(rj.status)" [innerHTML]="queueStatusLabel(rj.status)"></span>
+            <span class="job-id" [innerHTML]="'#' + rj.id"></span>
+            <span class="job-meta" [innerHTML]="rj.resolution + ' \xB7 ' + (rj.backend | uppercase)"></span>
             <div style="display:flex;gap:4px">
               <button class="backend-btn" (click)="retryRecentJob(rj.id)">Retry</button>
               <button class="backend-btn" (click)="duplicateRecentJob(rj.id)">Duplicate</button>
@@ -925,7 +1030,34 @@
         </div>
       </div>
 
-      <!-- Render viewer -->
+      <!-- Navigate viewport (shown instead of render viewer in navigate mode) -->
+      <div *ngIf="postProcessTab === 'navigate'">
+        <div style="position:relative;cursor:grab;user-select:none;border-radius:4px;overflow:hidden;margin-bottom:8px"
+             (mousedown)="onNavMouseDown($event)"
+             (mousemove)="onNavMouseMove($event)"
+             (mouseup)="onNavMouseUp($event)"
+             (mouseleave)="onNavMouseLeave($event)">
+          <img *ngIf="navFrameUrl()" [src]="navFrameUrl()!" style="width:100%;display:block" draggable="false" alt="Navigate preview" />
+          <div *ngIf="!navFrameUrl()" style="aspect-ratio:16/9;background:#111;display:flex;align-items:center;justify-content:center;color:#555;font-size:13px;padding:16px;text-align:center">
+            Trascina per navigare — clicca "Avvia preview" per il primo frame
+          </div>
+        </div>
+        <div *ngIf="navLoading()" style="margin-bottom:8px">
+          <mat-progress-bar
+            [mode]="navProgressPct() < 0 ? 'indeterminate' : 'determinate'"
+            [value]="navProgressPct() < 0 ? 0 : navProgressPct()"
+            style="border-radius:2px">
+          </mat-progress-bar>
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:#888;margin-top:3px">
+            <span [innerHTML]="(navElapsedMs() / 1000 | number:'1.1-1') + 's elapsed'"></span>
+            <span *ngIf="navProgressPct() >= 0" [innerHTML]="'ETA ~' + ((navAvgMs() - navElapsedMs()) / 1000 | number:'1.1-1') + 's'"></span>
+            <span *ngIf="navProgressPct() < 0">calcolando…</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Render viewer (hidden in navigate mode) -->
+      <ng-container *ngIf="postProcessTab !== 'navigate'">
       <div class="render-toolbar">
         <button class="backend-btn"
                 [class.active]="compareMode"
@@ -956,7 +1088,7 @@
                     style="min-width:220px;font-size:12px"
                     placeholder="Compare with...">
           <mat-option *ngFor="let r of renders" [value]="r.name" [disabled]="r.name === activeRender()">
-            {{r.name}}
+            <span [innerHTML]="r.name"></span>
           </mat-option>
         </mat-select>
       </div>
@@ -1015,9 +1147,10 @@
           </div>
         </div>
       </div>
+      </ng-container><!-- /ngIf postProcessTab !== navigate -->
 
       <!-- Gallery -->
-      <div class="panel" style="margin-top:14px">
+      <div class="panel" *ngIf="postProcessTab !== 'navigate'" style="margin-top:14px">
         <div class="gallery-header">
           <h2 style="margin:0">Render history</h2>
           <button class="action-btn danger" style="padding:0 8px;height:28px"
@@ -1027,9 +1160,7 @@
         </div>
 
         <div class="history-filters">
-          <div class="history-summary">
-            {{ historySummaryLabel() }}
-          </div>
+          <div class="history-summary" [innerHTML]="historySummaryLabel()"></div>
           <input
             class="history-search"
             type="text"
@@ -1050,22 +1181,22 @@
           <div class="history-selects">
             <mat-select [(ngModel)]="historyTypeFilter" style="font-size:12px">
               <mat-option *ngFor="let opt of historyTypeOptions" [value]="opt">
-                {{historyTypeLabel(opt)}}
+                <span [innerHTML]="historyTypeLabel(opt)"></span>
               </mat-option>
             </mat-select>
             <mat-select [(ngModel)]="historyResolutionFilter" style="font-size:12px">
               <mat-option *ngFor="let opt of historyResolutionOptions" [value]="opt">
-                Res: {{opt}}
+                <span [innerHTML]="'Res: ' + opt"></span>
               </mat-option>
             </mat-select>
             <mat-select [(ngModel)]="historyBackendFilter" style="font-size:12px">
               <mat-option *ngFor="let opt of historyBackendOptions" [value]="opt">
-                Backend: {{opt}}
+                <span [innerHTML]="'Backend: ' + opt"></span>
               </mat-option>
             </mat-select>
             <mat-select [(ngModel)]="historyChartFilter" style="font-size:12px">
               <mat-option *ngFor="let opt of historyChartOptions" [value]="opt">
-                Chart: {{opt}}
+                <span [innerHTML]="'Chart: ' + opt"></span>
               </mat-option>
             </mat-select>
           </div>
@@ -1075,8 +1206,7 @@
             <button *ngIf="historyMode==='search'" class="backend-btn" (click)="historyPrevPage()" [disabled]="!historyHasPrev">Prev</button>
             <button *ngIf="historyMode==='search'" class="backend-btn" (click)="historyNextPage()" [disabled]="!historyHasNext">Next</button>
           </div>
-          <div class="history-summary">
-            Pagina {{historyPage}} / {{historyTotalPages}} · Totale {{historyTotal}}
+          <div class="history-summary" [innerHTML]="'Pagina ' + historyPage + ' / ' + historyTotalPages + ' \xB7 Totale ' + historyTotal">
           </div>
         </div>
 
@@ -1087,11 +1217,11 @@
                (click)="selectRender(r.name)">
             <img [src]="svc.renderThumbUrl(r.name, 360)" [alt]="r.name" loading="lazy" decoding="async" />
             <div class="meta-row">
-              <span class="meta-chip">{{getRenderMeta(r).resolution}}</span>
-              <span class="meta-chip">{{humanBackend(getRenderMeta(r))}}</span>
-              <span class="meta-chip">{{getRenderMeta(r).chart | uppercase}}</span>
+              <span class="meta-chip" [innerHTML]="getRenderMeta(r).resolution"></span>
+              <span class="meta-chip" [innerHTML]="humanBackend(getRenderMeta(r))"></span>
+              <span class="meta-chip" [innerHTML]="getRenderMeta(r).chart | uppercase"></span>
             </div>
-            <div class="fname" [title]="r.name">{{r.name}}</div>
+            <div class="fname" [title]="r.name" [innerHTML]="r.name"></div>
             <button class="compare-btn"
                     *ngIf="compareMode && r.name !== activeRender()"
                     (click)="selectCompareRender(r.name); $event.stopPropagation()">

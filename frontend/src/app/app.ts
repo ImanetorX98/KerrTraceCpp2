@@ -20,6 +20,7 @@ import {
   RenderHistoryQuery,
   QueueJobState,
   QueueStateResponse,
+  NavBakeMeta,
 } from './render.service';
 
 interface RenderMetaLite {
@@ -183,7 +184,57 @@ export class App implements OnInit, OnDestroy {
   // ── Post-process panel ────────────────────────────────────────
   geoFiles: GeoFile[] = [];
   colorParams: ColorizeParams = { geoFile: '', exposure: 1.0, gamma: 2.2, tempScale: 1.0 };
-  postProcessTab: 'render' | 'recolor' = 'render';
+  postProcessTab: 'render' | 'recolor' | 'navigate' = 'render';
+
+  // ── Navigate ──────────────────────────────────────────────────
+  navTheta        = 80;
+  navPhi          = 0;
+  navSensitivity  = 0.35;
+  navBackground: string | null = null;  // null = use params.background
+  navPalette: 'blackbody' | 'stratified' | 'interstellar' | null = null;  // null = use params.disk_palette
+
+  // Nav bake
+  navBakeStepTheta   = signal(10); // degrees for θ
+  navBakeStepPhi     = signal(10); // degrees for φ
+  navBakeId          = signal<string | null>(null);   // active bake being used
+  navBakeList        = signal<NavBakeMeta[]>([]);
+  navBaking          = signal(false);
+  navBakeDone        = signal(0);
+  navBakeTotal       = signal(0);
+  readonly navBakeEta = computed(() => {
+    const done = this.navBakeDone(), total = this.navBakeTotal();
+    if (!this.navBaking() || done === 0 || total === 0) return null;
+    const avg = this.navAvgMs() > 0 ? this.navAvgMs() : 1000;
+    return Math.round((total - done) * avg / 1000);
+  });
+  readonly navBakePct = computed(() => {
+    const total = this.navBakeTotal();
+    return total > 0 ? Math.round(this.navBakeDone() / total * 100) : 0;
+  });
+  readonly navBakeEstFrames = computed(() => {
+    const tCount = Math.floor(179 / this.navBakeStepTheta());
+    const pCount = Math.ceil(360 / this.navBakeStepPhi());
+    return tCount * pCount;
+  });
+
+  readonly navFrameUrl    = signal<string | null>(null);
+  readonly navLoading     = signal(false);
+  readonly navElapsedMs   = signal(0);
+  readonly navAvgMs       = signal(0);
+  readonly navProgressPct = computed(() => {
+    const avg = this.navAvgMs();
+    if (avg <= 0) return -1;  // -1 = indeterminate
+    return Math.min(99, Math.round(this.navElapsedMs() / avg * 100));
+  });
+  private navStartMs      = 0;
+  private navAvgHistory: number[] = [];
+  private navElapsedTimer: ReturnType<typeof setInterval> | null = null;
+  private navDragging  = false;
+  private navDragX0    = 0;
+  private navDragY0    = 0;
+  private navTheta0    = 80;
+  private navPhi0      = 0;
+  private navThrottle: ReturnType<typeof setTimeout> | null = null;
 
   readonly previewUrl = computed(() => {
     if (this.status() === 'running' && this.livePreviewFile()) {
@@ -226,6 +277,7 @@ export class App implements OnInit, OnDestroy {
     this.loadLatestRenders();
     this.loadGeoFiles();
     this.loadQueueState();
+    this.loadNavBakes();
 
     this.sub = this.svc.messages$.subscribe(msg => {
       switch (msg.type) {
@@ -278,6 +330,32 @@ export class App implements OnInit, OnDestroy {
           this.livePreviewFile.set(null);
           this.stopStatusPolling();
           this.refreshOutputs(msg.file ?? null);
+          break;
+        case 'nav_frame':
+          if (msg.dataUrl) {
+            this.navStopTimer();
+            this.navFrameUrl.set(msg.dataUrl);
+            this.navLoading.set(false);
+          }
+          break;
+        case 'nav_error':
+          this.navStopTimer();
+          this.navLoading.set(false);
+          break;
+        case 'nav_bake_progress':
+          this.navBakeDone.set(msg.done ?? 0);
+          this.navBakeTotal.set(msg.total ?? 0);
+          break;
+        case 'nav_bake_done':
+          this.navBaking.set(false);
+          this.navBakeDone.set(msg.total ?? 0);
+          this.loadNavBakes();
+          break;
+        case 'nav_bake_cancelled':
+          this.navBaking.set(false);
+          break;
+        case 'nav_bake_error':
+          this.navBaking.set(false);
           break;
       }
     });
@@ -900,5 +978,153 @@ export class App implements OnInit, OnDestroy {
   fmtRate(v: number): string {
     if (!Number.isFinite(v) || v <= 0) return '0';
     return new Intl.NumberFormat('it-IT', { maximumFractionDigits: 0 }).format(v);
+  }
+
+  // ── Navigate ──────────────────────────────────────────────────
+
+  navSyncFromParams() {
+    this.navTheta = this.params.theta;
+    this.navPhi   = ((this.params.phi % 360) + 360) % 360;
+    this.sendNavigateNow();
+  }
+
+  navSyncToParams() {
+    this.params.theta = this.navTheta;
+    this.params.phi   = this.navPhi;
+  }
+
+  private navStartTimer() {
+    if (this.navElapsedTimer) clearInterval(this.navElapsedTimer);
+    this.navStartMs = Date.now();
+    this.navElapsedMs.set(0);
+    this.navElapsedTimer = setInterval(() => {
+      this.navElapsedMs.set(Date.now() - this.navStartMs);
+    }, 50);
+  }
+
+  private navStopTimer() {
+    if (this.navElapsedTimer) { clearInterval(this.navElapsedTimer); this.navElapsedTimer = null; }
+    const duration = Date.now() - this.navStartMs;
+    if (duration > 50) {
+      this.navAvgHistory.push(duration);
+      if (this.navAvgHistory.length > 5) this.navAvgHistory.shift();
+      const avg = Math.round(this.navAvgHistory.reduce((a, b) => a + b, 0) / this.navAvgHistory.length);
+      this.navAvgMs.set(avg);
+    }
+  }
+
+  loadNavBakes() {
+    this.svc.getNavBakes().subscribe(r => {
+      this.navBakeList.set(r.bakes ?? []);
+    });
+  }
+
+  startNavBake() {
+    const body: Record<string, unknown> = {
+      theta_step: this.navBakeStepTheta(), phi_step: this.navBakeStepPhi(),
+      a: this.params.a, disk_out: this.params.disk_out, r_obs: this.params.r_obs,
+      fov: this.params.fov, disk_palette: this.navPalette ?? this.params.disk_palette,
+      disk_brightness: this.params.disk_brightness,
+      doppler_enabled: this.params.doppler_enabled,
+      radial_term_zero_torque: this.params.radial_term_zero_torque,
+      interstellar_p: this.params.interstellar_p,
+      background: this.navBackground ?? this.params.background,
+    };
+    this.svc.startNavBake(body).subscribe(r => {
+      if (r.bakeId) {
+        this.navBaking.set(true);
+        this.navBakeDone.set(0);
+        this.navBakeTotal.set(r.total ?? 0);
+      }
+    });
+  }
+
+  cancelNavBake() {
+    this.svc.cancelNavBake().subscribe();
+    this.navBaking.set(false);
+  }
+
+  deleteNavBake(id: string) {
+    this.svc.deleteNavBake(id).subscribe(() => this.loadNavBakes());
+  }
+
+  useNavBake(id: string) {
+    this.navBakeId.set(id);
+  }
+
+  findBakedFrameUrl(theta: number, phi: number): string | null {
+    const id = this.navBakeId();
+    if (!id) return null;
+    const bake = this.navBakeList().find(b => b.id === id);
+    if (!bake) return null;
+    const st = bake.thetaStep;
+    const sp = bake.phiStep;
+    const tSnap = Math.max(st, Math.min(180 - st, Math.round(theta / st) * st));
+    const pSnap = ((Math.round(phi / sp) * sp) % 360 + 360) % 360;
+    return this.svc.navBakeFrameUrl(id, tSnap, pSnap);
+  }
+
+  sendNavigateNow() {
+    const bakedUrl = this.findBakedFrameUrl(this.navTheta, this.navPhi);
+    if (bakedUrl) {
+      this.navFrameUrl.set(bakedUrl);
+      return;
+    }
+    this.navLoading.set(true);
+    this.navStartTimer();
+    this.svc.sendWs({
+      type:                    'navigate',
+      theta:                   this.navTheta,
+      phi:                     this.navPhi,
+      a:                       this.params.a,
+      disk_out:                this.params.disk_out,
+      r_obs:                   this.params.r_obs,
+      fov:                     this.params.fov,
+      disk_palette:            this.navPalette ?? this.params.disk_palette,
+      disk_brightness:         this.params.disk_brightness,
+      doppler_enabled:         this.params.doppler_enabled,
+      radial_term_zero_torque: this.params.radial_term_zero_torque,
+      interstellar_p:          this.params.interstellar_p,
+      background:              this.navBackground ?? this.params.background,
+    });
+  }
+
+  private scheduleNavigate() {
+    if (this.navThrottle) return;
+    this.navThrottle = setTimeout(() => {
+      this.navThrottle = null;
+      this.sendNavigateNow();
+    }, 80);
+  }
+
+  onNavMouseDown(e: MouseEvent) {
+    this.navDragging = true;
+    this.navDragX0   = e.clientX;
+    this.navDragY0   = e.clientY;
+    this.navTheta0   = this.navTheta;
+    this.navPhi0     = this.navPhi;
+    (e.currentTarget as HTMLElement).style.cursor = 'grabbing';
+  }
+
+  onNavMouseMove(e: MouseEvent) {
+    if (!this.navDragging) return;
+    const dx = e.clientX - this.navDragX0;
+    const dy = e.clientY - this.navDragY0;
+    this.navPhi   = ((this.navPhi0 - dx * this.navSensitivity) % 360 + 360) % 360;
+    this.navTheta = Math.max(1, Math.min(179,
+                    this.navTheta0 + dy * this.navSensitivity));
+    this.scheduleNavigate();
+  }
+
+  onNavMouseUp(e: MouseEvent) {
+    if (!this.navDragging) return;
+    this.navDragging = false;
+    (e.currentTarget as HTMLElement).style.cursor = 'grab';
+    if (this.navThrottle) { clearTimeout(this.navThrottle); this.navThrottle = null; }
+    this.sendNavigateNow();
+  }
+
+  onNavMouseLeave(e: MouseEvent) {
+    if (this.navDragging) this.onNavMouseUp(e);
   }
 }

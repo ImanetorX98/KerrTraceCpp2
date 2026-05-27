@@ -123,7 +123,8 @@ export interface QueueStateResponse {
 }
 
 export interface WsMessage {
-  type: 'status' | 'start' | 'progress' | 'done' | 'stdout' | 'queue_state' | 'job_preview';
+  type: 'status' | 'start' | 'progress' | 'done' | 'stdout' | 'queue_state' | 'job_preview' | 'nav_frame' | 'nav_error'
+      | 'nav_bake_progress' | 'nav_bake_done' | 'nav_bake_cancelled' | 'nav_bake_error';
   running?: boolean;
   pct?: number;
   elapsed?: number;
@@ -144,6 +145,13 @@ export interface WsMessage {
   active?: QueueJobState | null;
   queued?: QueueJobState[];
   recent?: QueueJobState[];
+  // Navigate
+  dataUrl?: string;
+  error?: string;
+  // Nav bake
+  bakeId?: string;
+  done?: number;
+  total?: number;
 }
 
 export interface RenderFile {
@@ -178,6 +186,14 @@ export interface ColorizeParams {
   exposure: number;
   gamma: number;
   tempScale: number;
+}
+
+export interface NavBakeMeta {
+  id: string;
+  thetaStep: number;
+  phiStep: number;
+  total: number;
+  createdAt: string;
 }
 
 export interface ApiInfo {
@@ -326,5 +342,32 @@ export class RenderService {
 
   livePreviewUrl(filename: string): string {
     return `/api/live-preview/${encodeURIComponent(filename)}?_ts=${Date.now()}`;
+  }
+
+  getNavBakes() {
+    const params = new HttpParams().set('_ts', Date.now().toString());
+    return this.http.get<{active: any, bakes: NavBakeMeta[]}>('/api/nav-bakes', { params });
+  }
+
+  startNavBake(body: Record<string, unknown>) {
+    return this.http.post<{ status: string; bakeId?: string; total?: number }>('/api/nav-bake', body);
+  }
+
+  cancelNavBake() {
+    return this.http.post<{ status: string }>('/api/nav-bake', { cancel: true });
+  }
+
+  deleteNavBake(id: string) {
+    return this.http.delete<{ status: string }>(`/api/nav-bake/${id}`);
+  }
+
+  navBakeFrameUrl(bakeId: string, theta: number, phi: number): string {
+    return `/api/nav-bakes/${bakeId}/t${theta}_p${phi}.png`;
+  }
+
+  sendWs(data: unknown): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
+    }
   }
 }

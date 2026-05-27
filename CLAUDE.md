@@ -123,6 +123,113 @@ where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
 
 ---
 
+---
+
+## Phase 5 — Interactive 3D Navigable Mode (Feasibility Study & Roadmap)
+
+### Feasibility Summary
+
+**Overall verdict: Feasible. Medium-high complexity. Recommended phased approach.**
+
+The core physics engine (geodesic integrator, metric, disk model) is already production-quality.
+The main new work is: (1) a real-time preview pipeline at low res/quality, (2) a native window +
+3D camera controller, (3) progressive refinement up to cinematic quality, (4) an optional LUT
+pre-bake for "instant" preview. The web-based frontend (Express + WebSocket) already handles
+parameter dispatch and image delivery, which simplifies integration.
+
+### Module Feasibility Breakdown
+
+| Module | Difficulty | Notes |
+|--------|-----------|-------|
+| **PreviewInteractive** (live Metal, 64–256 px, <100 ms) | Low | Metal tile dispatch already exists; just reduce resolution |
+| **PhysicsPreview** (720p, full physics, 1–5 s) | Low | Already works via `metal_render()`; add async dispatch |
+| **CinematicRender** (4K, bundles, full quality) | Low | Already works; just needs UI trigger |
+| **CameraController** (orbit, pan, roll, FOV) | Medium | New: 3D arcball/quaternion math; maps to `Camera` params |
+| **RenderSettings** (live param sliders) | Low | Frontend already does this via JSON POST |
+| **MetricModule** (KNdS param switching) | Low | Already runtime-configurable |
+| **GeodesicIntegrator** (RK4/DOPRI5 switch) | Low | Already a runtime flag |
+| **DiskModule** (profile, palette, taper) | Low | Already runtime flags |
+| **RedshiftDopplerModule** | Done | v0.2.12 exact g formula |
+| **Background/Skybox** (HDR HDRI rotation) | Medium | Need equirect rotation by camera yaw; currently fixed |
+| **LookupTable** (pre-baked r,θ → hit-record) | High | New: offline bake step; significant engineering; optional |
+| **ProgressiveRefinement** (coarse→fine) | Medium | Needs multi-pass accumulation buffer |
+| **TemporalAccumulation** (TAA-style) | High | Needs per-pixel history; complex for non-linear projection |
+| **Upscaling** (bilinear / MetalFX SR) | Medium | Bilinear trivial; MetalFX requires AVFoundation integration |
+| **Native Window / UI** | High | Biggest new component; recommend SDL2 + Dear ImGui |
+
+### Risks & Constraints
+
+- **LUT bake** is the highest-risk item: a full `(r_obs, θ_obs, α, β)` → hit-record table is
+  O(GB) for 4K. Practical only for fixed-metric, fixed-r_obs slices. Mark as optional/stretch.
+- **Temporal accumulation** with GR lensing is non-trivial: pixel history is in screen space but
+  lensing maps non-linearly. Reprojection from previous frame requires storing geodesic endpoints
+  per pixel. Defer to stretch goal.
+- **MetalFX Super Resolution** requires macOS 13+ and a Metal Performance Shaders dependency.
+  Bilinear 2× upscale is a free 1-day task; MetalFX is a separate sprint.
+- **Native window** is the largest new dependency. SDL2 (MIT license, single `.framework` on
+  macOS) is the lowest-friction choice. Dear ImGui adds ~5k LOC but gives free sliders/panels.
+- **Camera controller**: arcball orbit is standard; the tricky part is mapping 3D screen-space
+  mouse deltas to BL coordinate `(θ_obs, φ_obs)` increments. Gimbal-lock-free quaternion
+  accumulation then re-projection to BL angles is the correct approach.
+
+### Recommended Architecture
+
+```
+┌─────────────────────────────────────────┐
+│  SDL2 window  +  Dear ImGui sidebar     │  ← new (Phase 5a)
+├─────────────────────────────────────────┤
+│  CameraController                       │  ← new (Phase 5a)
+│   arcball quaternion → BL (r,θ,φ,fov)  │
+├──────────────┬──────────────────────────┤
+│ Preview path │ Full-quality path        │
+│ 128×72 px    │ up to 4K                 │
+│ Metal, 1 ms  │ Metal/CPU, async         │  ← mostly exists
+├──────────────┴──────────────────────────┤
+│  Shared render core (metal_render / CPU)│  ← unchanged
+│  KNdSMetric, Geodesic, Camera, Disk     │
+└─────────────────────────────────────────┘
+```
+
+### Implementation Roadmap
+
+#### Phase 5a — Live Preview Window (2–3 weeks)
+- [ ] Add SDL2 + Dear ImGui as optional CMake deps (`-DUSE_INTERACTIVE=ON`)
+- [ ] `InteractiveWindow` class: SDL2 event loop, MTLTexture → SDL_Texture blit
+- [ ] `CameraController`: arcball quaternion, map to BL `(θ_obs, φ_obs, fov_h)`; mouse drag = orbit, scroll = zoom, middle-drag = pan
+- [ ] Async render thread: on param change, dispatch low-res Metal (128×72) immediately; dispatch 720p after 300 ms debounce; dispatch cinematic on explicit button press
+- [ ] ImGui sidebar: sliders for `a`, `Q`, `Λ`, inclination, FOV, disk brightness, p exponent, toggle Doppler/bundles/chart
+- [ ] Background rotation: add `phi_bg_offset` uniform to shader for skybox yaw sync with camera φ
+
+#### Phase 5b — Progressive Refinement (1–2 weeks)
+- [ ] Multi-pass accumulation: render at 1/8 res, 1/4, 1/2, full — blit each pass to screen
+- [ ] Pixel-stable jitter: Halton (2,3) sub-pixel offset per pass for free MSAA convergence
+- [ ] Cancel-on-move: abort in-flight render when camera moves (use `MTLCommandBuffer cancel` + a `std::atomic<bool>`)
+
+#### Phase 5c — LUT Pre-bake (stretch, 3–4 weeks)
+- [ ] Offline bake tool (`kerr_bake`): for fixed `(M, a, Q, Λ, r_obs)` sweep `(θ_obs, α, β)` grid, store `GeoPixel` hit-records in a flat binary `.kgeo` file
+- [ ] Runtime LUT loader: on LUT hit, skip geodesic integration entirely; interpolate `(r_hit, theta_hit, phi_hit, redshift)` from 4 nearest samples
+- [ ] LUT memory budget: 1920×1080×(1 byte type + 3×4 byte coords + 4 byte redshift) ≈ 24 MB per inclination slice — manageable for a small grid of inclinations
+
+#### Phase 5d — Temporal Accumulation & Upscaling (stretch, 2–3 weeks)
+- [ ] Per-pixel geodesic endpoint cache: store `(r_hit, phi_hit)` in a secondary Metal buffer
+- [ ] TAA reprojection: reproject previous frame endpoint into current frame UV; blend with α=0.1
+- [ ] Bilinear 2× upscale: render at 960×540, blit to 1920×1080 (Metal blit encoder, trivial)
+- [ ] MetalFX SR (macOS 13+): optional CMake flag `-DUSE_METALFX=ON`; wrap `MTLFXSpatialScaler`
+
+### File Changes Required
+
+| File | Change |
+|------|--------|
+| `CMakeLists.txt` | Add `USE_INTERACTIVE` flag, find SDL2 + ImGui |
+| `interactive/window.hpp/.mm` | New: SDL2 window, MTL texture blit |
+| `interactive/camera_controller.hpp` | New: arcball quaternion → BL angles |
+| `interactive/render_scheduler.hpp` | New: async multi-pass dispatch |
+| `interactive/ui.hpp` | New: Dear ImGui sidebar layout |
+| `gpu/metal/tracer.metal` | Add `phi_bg_offset` uniform to `CameraParams_C` |
+| `main.cpp` | Add `--interactive` flag dispatching to `InteractiveWindow::run()` |
+
+---
+
 ## Key References (in `sources/`)
 - James et al. (2015) — DNGR / Interstellar technique, ray bundles
 - Gralla & Lupsasca (2019) — Analytical Kerr null geodesics

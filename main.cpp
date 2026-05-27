@@ -3273,6 +3273,9 @@ int main(int argc, char** argv) {
     std::string geo_file;         // path for .kgeo output (geo_only) or input (color_only)
     bool        color_only  = false;
 
+    // ── Bake mode ─────────────────────────────────────────────
+    bool        bake_mode   = false;
+
     // ── Animation params ──────────────────────────────────────
     bool anim_mode=false, anim_ease=false, anim_keep_frames=false;
     bool anim_resume=false, anim_no_encode=false;
@@ -3473,6 +3476,9 @@ int main(int argc, char** argv) {
         if (arg=="--geo-file" && i+1<argc) geo_file  = argv[++i];
         if (arg=="--color-only"&& i+1<argc){ color_only=true; geo_file=argv[++i]; }
 
+        // Bake mode (batch stdin loop: one process, many frames)
+        if (arg=="--bake-mode") bake_mode = true;
+
         // Animation
         if (arg=="--anim")                   anim_mode=true;
         if (arg=="--frames"   && i+1<argc)   anim_frames=std::stoi(argv[++i]);
@@ -3570,6 +3576,12 @@ int main(int argc, char** argv) {
         std::cerr << "Info: GKS + Lambda != 0 disables ray bundles in this build; running single-ray mode.\n";
         use_bundles = false;
         anti_fireflies = false;
+    }
+
+    // In bake mode, default to 320×180 if no explicit resolution was given
+    if (bake_mode && !custom_w && !custom_h &&
+        !preview && !hd_preview && !res_720p && !res_2k && !res_4k) {
+        custom_w = 320; custom_h = 180;
     }
 
     const int W = custom_w ? custom_w : res_4k ? 3840 : res_2k ? 2560
@@ -3725,7 +3737,7 @@ int main(int argc, char** argv) {
     const std::string spp_tag = (camera_spp > 1) ? ("_spp" + std::to_string(camera_spp)) : "";
     const std::string mode_backend_tag = mode_tag + "_" + backend_tag + fp64_tag + spp_tag;
 
-    // ── SINGLE FRAME mode ────────────────────────────────────
+    // ── SINGLE FRAME mode / BAKE mode ───────────────────────────
     if (!anim_mode) {
         FrameParams fp;
         fp.a=arg_a; fp.theta=arg_theta; fp.phi=arg_phi;
@@ -3735,6 +3747,38 @@ int main(int argc, char** argv) {
         fp.wh_rho      = arg_wh_rho;
         fp.wh_a_tunnel = arg_wh_a;
         fp.wh_M_lens   = arg_wh_M;
+
+        // ── BAKE mode: read (theta phi) pairs from stdin, render each frame ──
+        if (bake_mode) {
+            // Suppress verbose output; only "Saved: <path>" goes to stdout.
+            // Render each frame as it arrives, then flush stdout.
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (line.empty()) continue;
+                double bake_theta = fp.theta, bake_phi = fp.phi;
+                std::istringstream iss(line);
+                if (!(iss >> bake_theta >> bake_phi)) continue;
+                fp.theta = bake_theta;
+                fp.phi   = bake_phi;
+
+                auto image = render_image(W, H, fp, bg, use_bundles, solver_mode, chart, intg,
+                                          int_ctl, camera_spp, M_bh, Q_bh, Lam,
+                                          intersection_mode, metal_kernel_mode, gpu_fp64,
+                                          elliptic_fallback_black, anti_fireflies, cp,
+                                          nullptr, debug_elliptic,
+                                          0.0, 0.0, bg_b);
+
+                std::string ts_str = make_ts();
+                std::string outfile = std::string(OUT_DIR)+"/"+res_tag
+                                    +"_"+std::to_string(W)+"x"+std::to_string(H)
+                                    +"_"+mode_backend_tag
+                                    +"_"+ts_str+".png";
+                write_png(outfile.c_str(), image, W, H);
+                std::cout << "Saved: " << outfile << "\n";
+                std::cout.flush();
+            }
+            return 0;
+        }
 
         if (fp.wormhole) {
             std::cout << "DNEG Wormhole  ρ=" << fp.wh_rho
