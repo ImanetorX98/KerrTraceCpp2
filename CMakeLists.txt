@@ -12,7 +12,7 @@ option(USE_CUDA  "Use CUDA GPU backend (Linux/Windows)" OFF)
 option(CUDA_ENABLE_FAST_MATH "Enable --use_fast_math for CUDA kernels (faster, less precise)" OFF)
 
 # ── Common CPU sources ────────────────────────────────────────
-set(CPU_SOURCES main.cpp)
+set(CPU_SOURCES main.cpp falling_renderer.cpp)
 
 # ── OpenMP (CPU backend only) ─────────────────────────────────
 find_package(OpenMP)
@@ -89,7 +89,7 @@ endif()
 
 # ── Always build Metal binary on macOS (alongside CPU) ────────
 if(APPLE AND NOT USE_METAL)
-    add_executable(kerr_tracer_metal main.cpp gpu/metal/metal_renderer.mm)
+    add_executable(kerr_tracer_metal main.cpp falling_renderer.cpp gpu/metal/metal_renderer.mm)
     configure_file(gpu/metal/tracer.metal
                    ${CMAKE_BINARY_DIR}/tracer.metal COPYONLY)
     target_include_directories(kerr_tracer_metal PRIVATE ${CMAKE_SOURCE_DIR})
@@ -132,4 +132,15 @@ if(BUILD_TESTING)
         $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
     add_test(NAME kerrtrace.spin_orientation
         COMMAND kerrtrace_spin_orientation_regression $<TARGET_FILE:kerr_tracer>)
+
+    # ── Falling-camera smoke test ──────────────────────────────
+    add_test(NAME kerrtrace.falling_smoke
+        COMMAND $<TARGET_FILE:kerr_tracer>
+            --falling-camera
+            --a 0.9
+            --fall-r-start 15
+            --fall-E 1.0
+            --fall-frames 2
+            --fall-dtau 0.5
+            --custom-res 64 36)
 endif()

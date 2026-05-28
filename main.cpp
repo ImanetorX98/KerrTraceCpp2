@@ -12,6 +12,7 @@
 //    Animation       ./kerr_tracer --anim --frames 120 --orbits 1 --720p
 // ============================================================
 #include "camera.hpp"
+#include "falling_renderer.hpp"
 #include "geodesic.hpp"
 #include "knds_metric.hpp"
 #include "ray_bundle.hpp"
@@ -30,6 +31,7 @@
 #include <cstring>
 #include <ctime>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -3268,6 +3270,16 @@ int main(int argc, char** argv) {
     bool   cli_radial_term_relativistic         = cp.radial_term_relativistic;
     bool   cli_radial_term_b_denom              = cp.radial_term_b_denom;
 
+    // ── Falling-camera params ─────────────────────────────────
+    bool   do_falling      = false;
+    double fall_r_start    = 20.0;
+    double fall_E          = 1.0;
+    double fall_L          = 0.0;
+    double fall_Qc         = 0.0;
+    double fall_theta_deg  = 90.0;
+    int    fall_frames     = 120;
+    double fall_dtau       = 0.1;
+
     // ── Two-phase modes ───────────────────────────────────────
     bool        geo_only    = false;
     std::string geo_file;         // path for .kgeo output (geo_only) or input (color_only)
@@ -3365,6 +3377,8 @@ int main(int argc, char** argv) {
         if (arg=="--custom-res" && i+2<argc) {
             custom_w=std::stoi(argv[++i]); custom_h=std::stoi(argv[++i]);
         }
+        if (arg=="--width"  && i+1<argc) custom_w=std::stoi(argv[++i]);
+        if (arg=="--height" && i+1<argc) custom_h=std::stoi(argv[++i]);
 
         // Single-frame physics
         if (arg=="--bg"       && i+1<argc) bg_path     = argv[++i];
@@ -3501,6 +3515,16 @@ int main(int argc, char** argv) {
         if (arg=="--a-end"          &&i+1<argc) anim_a_end          =std::stod(argv[++i]);
         if (arg=="--disk-out-start" &&i+1<argc) anim_disk_out_start =std::stod(argv[++i]);
         if (arg=="--disk-out-end"   &&i+1<argc) anim_disk_out_end   =std::stod(argv[++i]);
+
+        // Falling camera
+        if (arg=="--falling-camera")             do_falling      = true;
+        if (arg=="--fall-r-start" && i+1<argc)  fall_r_start    = std::stod(argv[++i]);
+        if (arg=="--fall-E"       && i+1<argc)  fall_E          = std::stod(argv[++i]);
+        if (arg=="--fall-L"       && i+1<argc)  fall_L          = std::stod(argv[++i]);
+        if (arg=="--fall-Qc"      && i+1<argc)  fall_Qc         = std::stod(argv[++i]);
+        if (arg=="--fall-theta"   && i+1<argc)  fall_theta_deg  = std::stod(argv[++i]);
+        if (arg=="--fall-frames"  && i+1<argc)  fall_frames     = std::stoi(argv[++i]);
+        if (arg=="--fall-dtau"    && i+1<argc)  fall_dtau       = std::stod(argv[++i]);
     }
 
     cp.disk_brightness = std::max(0.0, cli_disk_brightness);
@@ -3736,6 +3760,43 @@ int main(int argc, char** argv) {
     const std::string fp64_tag = gpu_fp64 ? "_gpufp64req" : "";
     const std::string spp_tag = (camera_spp > 1) ? ("_spp" + std::to_string(camera_spp)) : "";
     const std::string mode_backend_tag = mode_tag + "_" + backend_tag + fp64_tag + spp_tag;
+
+    // ── FALLING CAMERA mode ─────────────────────────────────────
+    if (do_falling) {
+        FallingParams fpar;
+        fpar.bh             = KNdSMetric(M_bh, arg_a, Q_bh, Lam);
+        fpar.r_start        = fall_r_start;
+        fpar.E              = fall_E;
+        fpar.L              = fall_L;
+        fpar.Qc             = fall_Qc;
+        fpar.theta_start    = fall_theta_deg * M_PI / 180.0;
+        fpar.width          = W;
+        fpar.height         = H;
+        fpar.fov_h          = arg_fov * M_PI / 180.0;
+        fpar.frames         = fall_frames;
+        fpar.dtau           = fall_dtau;
+        fpar.r_disk_out     = arg_disk_out * M_bh;
+        fpar.disk_brightness= cp.disk_brightness;
+
+        const std::string fall_dir = std::string(OUT_DIR) + "/falling/" + make_ts();
+        std::filesystem::create_directories(fall_dir);
+
+        CameraState cs = init_worldline(fpar);
+        for (int fi = 0; fi < fpar.frames; ++fi) {
+            if (cs.x[1] < fpar.r_singularity) {
+                std::cout << "Falling render: r < r_singularity at frame "
+                          << fi << ", stopping.\n";
+                break;
+            }
+            char fname[256];
+            std::snprintf(fname, sizeof(fname), "%s/frame_%04d.png",
+                          fall_dir.c_str(), fi);
+            render_falling_frame(fi, fpar.frames, fpar, cs, std::string(fname));
+            cs = step_worldline(cs, fpar.bh, fpar.dtau);
+        }
+        std::cout << "Falling render complete: " << fall_dir << "\n";
+        return 0;
+    }
 
     // ── SINGLE FRAME mode / BAKE mode ───────────────────────────
     if (!anim_mode) {
