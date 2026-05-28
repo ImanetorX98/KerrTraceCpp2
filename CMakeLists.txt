@@ -145,6 +145,15 @@ if(BUILD_TESTING)
     add_test(NAME kerrtrace.spin_orientation
         COMMAND kerrtrace_spin_orientation_regression $<TARGET_FILE:kerr_tracer>)
 
+    add_executable(kerrtrace_falling_tests
+        tests/test_falling_camera.cpp falling_renderer.cpp)
+    target_include_directories(kerrtrace_falling_tests PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(kerrtrace_falling_tests PRIVATE
+        FALLING_RENDERER_STANDALONE)
+    target_compile_options(kerrtrace_falling_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
+    add_test(NAME kerrtrace.falling COMMAND kerrtrace_falling_tests)
+
     # ── Falling-camera smoke test ──────────────────────────────
     add_test(NAME kerrtrace.falling_smoke
         COMMAND $<TARGET_FILE:kerr_tracer>
