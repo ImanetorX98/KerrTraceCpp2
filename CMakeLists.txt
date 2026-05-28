@@ -15,6 +15,18 @@ option(CUDA_ENABLE_FAST_MATH "Enable --use_fast_math for CUDA kernels (faster, l
 set(CPU_SOURCES main.cpp falling_renderer.cpp)
 
 # ── OpenMP (CPU backend only) ─────────────────────────────────
+# On macOS, Apple clang needs libomp from Homebrew (brew install libomp).
+# Provide hints so find_package can locate it automatically.
+if(APPLE)
+    foreach(_prefix "/opt/homebrew/opt/libomp" "/usr/local/opt/libomp")
+        if(EXISTS "${_prefix}")
+            set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${_prefix}/include")
+            set(OpenMP_CXX_LIB_NAMES "omp")
+            set(OpenMP_omp_LIBRARY "${_prefix}/lib/libomp.dylib")
+            break()
+        endif()
+    endforeach()
+endif()
 find_package(OpenMP)
 
 # ── Metal backend (macOS) ─────────────────────────────────────
