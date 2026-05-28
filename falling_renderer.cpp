@@ -1,4 +1,12 @@
 #include "falling_renderer.hpp"
+// Define stb_image_write implementation only when not linking with main.cpp.
+// In the test binary (compiled with -DFALLING_RENDERER_STANDALONE), this
+// ensures stbi_write_png is available.  In the main build, main.cpp already
+// defines STB_IMAGE_WRITE_IMPLEMENTATION before including stb_image_write.h.
+#ifdef FALLING_RENDERER_STANDALONE
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#endif
+#include "stb_image_write.h"
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -134,6 +142,29 @@ FallingGeoPixel trace_photon_gpg(const double x0[4], const double k0[4],
                 pix.outcome = 1;
                 pix.r_hit   = float(prev_x[1] + t_frac*(x[1]-prev_x[1]));
                 pix.phi_hit = float(prev_x[3] + t_frac*(x[3]-prev_x[3]));
+
+                // Compute approximate redshift g-factor
+                {
+                    double gLL_d[4][4];
+                    gpg_covariant(bh, double(pix.r_hit), M_PI/2.0, gLL_d);
+                    const double Omega = bh.keplerian_omega(double(pix.r_hit));
+                    const double N2 = -(gLL_d[0][0]
+                                      + 2.0*gLL_d[0][3]*Omega
+                                      + gLL_d[3][3]*Omega*Omega);
+                    if (N2 > 1e-20) {
+                        const double ut_em  = 1.0 / std::sqrt(N2);
+                        const double uph_em = Omega * ut_em;
+                        double k_low[4] = {0.0};
+                        for (int mu=0;mu<4;++mu)
+                            for (int nu=0;nu<4;++nu)
+                                k_low[mu] += gLL_d[mu][nu] * k[nu];
+                        const double k_u_emit = k_low[0]*ut_em + k_low[3]*uph_em;
+                        const double k_u_obs  = std::abs(k_low[0]);  // coordinate energy approx
+                        if (std::abs(k_u_emit) > 1e-20)
+                            pix.redshift = float(k_u_obs / std::abs(k_u_emit));
+                    }
+                }
+
                 return pix;
             }
         }
@@ -155,11 +186,102 @@ FallingGeoPixel trace_photon_gpg(const double x0[4], const double k0[4],
     return pix;
 }
 
-// ── render_falling_frame stub — implemented in Task 6 ────────────────────────
-void render_falling_frame(int /*frame_idx*/, int /*total_frames*/,
-                           const FallingParams& /*fp*/,
-                           const CameraState& /*cs_at_frame*/,
-                           const std::string& /*out_path*/)
+// ── render_falling_frame ──────────────────────────────────────────────────────
+void render_falling_frame(int frame_idx, int total_frames,
+                           const FallingParams& fp,
+                           const CameraState& cs_at_frame,
+                           const std::string& out_path)
 {
-    // Implementation in Task 6
+    const int W = fp.width, H = fp.height;
+    std::vector<uint8_t> rgb(W * H * 3, 0);
+
+    // Build local tetrad and apply HorizonFlip roll
+    double e[4][4];
+    build_tetrad(cs_at_frame, fp.bh, e);
+    const double psi = horizon_flip_psi(cs_at_frame.x[1], fp.bh.r_horizon());
+    apply_roll(e, psi);
+
+    // Pre-compute disk ISCO for Phase B shading
+    const double r_isco_val = fp.bh.r_isco();
+    const double r_in  = (fp.r_disk_in < 0.0) ? r_isco_val : fp.r_disk_in;
+    const double r_out = fp.r_disk_out;
+    (void)r_in;  // used indirectly via FallingParams in trace_photon_gpg
+
+    auto t0 = std::chrono::steady_clock::now();
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic,16)
+#endif
+    for (int py = 0; py < H; ++py) {
+        for (int px = 0; px < W; ++px) {
+            double k[4];
+            init_photon_k(cs_at_frame, e, fp.bh,
+                          px, py, W, H, fp.fov_h, k);
+
+            FallingGeoPixel pix = trace_photon_gpg(
+                cs_at_frame.x, k, fp.bh, fp, 50000, 0.05, 1e-7);
+
+            uint8_t R = 0, G = 0, B = 0;
+
+            if (pix.outcome == 0) {
+                // Escaped — dark background (Phase A); Phase C will add HDRI skybox
+                R = G = B = 30;
+
+            } else if (pix.outcome == 1) {
+                // Disk hit — Phase B shading
+                const double r_h  = double(pix.r_hit);
+                const double g_rs = double(pix.redshift);
+
+                // Page-Thorne flux profile: f(r) ∝ (1 - sqrt(r_isco/r)) / r³
+                double lum = 0.0;
+                if (r_h > r_isco_val && r_h <= r_out) {
+                    const double x_pt = std::sqrt(r_isco_val / r_h);
+                    lum = (1.0 - x_pt) / (r_h * r_h * r_h);
+                    // Normalize by approximate peak at 3*r_isco
+                    const double r_peak = 3.0 * r_isco_val;
+                    const double x_peak = std::sqrt(r_isco_val / r_peak);
+                    const double lum_peak = (1.0 - x_peak) / (r_peak*r_peak*r_peak);
+                    if (lum_peak > 1e-30) lum /= lum_peak;
+                    // Apply redshift: I_obs = g^4 * I_emit
+                    lum *= std::pow(std::max(g_rs, 0.0), 4.0);
+                    lum  = std::min(lum * fp.disk_brightness, 1.0);
+                }
+
+                // Color: blueshift side (g>1) → white-yellow; redshift side → orange-red
+                const float fl = float(lum);
+                if (g_rs > 1.0) {
+                    R = uint8_t(std::min(255.0f, 255.0f * fl));
+                    G = uint8_t(std::min(255.0f, 210.0f * fl));
+                    B = uint8_t(std::min(255.0f, 100.0f * fl));
+                } else {
+                    R = uint8_t(std::min(255.0f, 220.0f * fl));
+                    G = uint8_t(std::min(255.0f, 100.0f * fl * float(g_rs)));
+                    B = 0;
+                }
+                // outcome 2 (singularity), 3 (trapped) → remain black
+            }
+
+            const int idx = (py * W + px) * 3;
+            rgb[idx + 0] = R;
+            rgb[idx + 1] = G;
+            rgb[idx + 2] = B;
+        }
+
+        // Progress (approximate — not thread-safe but visually fine)
+        if (py % std::max(1, H / 20) == 0) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - t0).count();
+            int pct = (py * 100) / H;
+            std::printf("[frame %04d/%04d] %d%% %.1fs elapsed\r",
+                        frame_idx + 1, total_frames, pct, elapsed);
+            std::fflush(stdout);
+        }
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - t0).count();
+    std::printf("[frame %04d/%04d] 100%% %.1fs elapsed\n",
+                frame_idx + 1, total_frames, elapsed);
+
+    stbi_write_png(out_path.c_str(), W, H, 3, rgb.data(), W * 3);
 }
