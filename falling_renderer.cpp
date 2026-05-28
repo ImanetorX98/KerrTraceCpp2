@@ -186,6 +186,43 @@ FallingGeoPixel trace_photon_gpg(const double x0[4], const double k0[4],
     return pix;
 }
 
+// ── shade_falling_pixel ───────────────────────────────────────────────────────
+// Returns {R,G,B} for a traced pixel. Mirrors shade_pixel_f in tracer_falling.metal.
+static std::tuple<uint8_t,uint8_t,uint8_t>
+shade_falling_pixel(const FallingGeoPixel& pix, const FallingParams& fp,
+                    double r_isco_val)
+{
+    uint8_t R=0, G=0, B=0;
+    if (pix.outcome == 0) {
+        R = G = B = 30;
+    } else if (pix.outcome == 1) {
+        const double r_h  = double(pix.r_hit);
+        const double g_rs = double(pix.redshift);
+        double lum = 0.0;
+        if (r_h > r_isco_val && r_h <= fp.r_disk_out) {
+            const double x_pt     = std::sqrt(r_isco_val / r_h);
+            lum = (1.0 - x_pt) / (r_h * r_h * r_h);
+            const double r_peak   = 3.0 * r_isco_val;
+            const double x_peak   = std::sqrt(r_isco_val / r_peak);
+            const double lum_peak = (1.0 - x_peak) / (r_peak*r_peak*r_peak);
+            if (lum_peak > 1e-30) lum /= lum_peak;
+            lum *= std::pow(std::max(g_rs, 0.0), 4.0);
+            lum  = std::min(lum * fp.disk_brightness, 1.0);
+        }
+        const float fl = float(lum);
+        if (g_rs > 1.0) {
+            R = uint8_t(std::min(255.0f, 255.0f * fl));
+            G = uint8_t(std::min(255.0f, 210.0f * fl));
+            B = uint8_t(std::min(255.0f, 100.0f * fl));
+        } else {
+            R = uint8_t(std::min(255.0f, 220.0f * fl));
+            G = uint8_t(std::min(255.0f, 100.0f * fl * float(g_rs)));
+            B = 0;
+        }
+    }
+    return {R, G, B};
+}
+
 // ── render_falling_frame ──────────────────────────────────────────────────────
 void render_falling_frame(int frame_idx, int total_frames,
                            const FallingParams& fp,
@@ -203,9 +240,7 @@ void render_falling_frame(int frame_idx, int total_frames,
 
     // Pre-compute disk ISCO for Phase B shading
     const double r_isco_val = fp.bh.r_isco();
-    const double r_in  = (fp.r_disk_in < 0.0) ? r_isco_val : fp.r_disk_in;
-    const double r_out = fp.r_disk_out;
-    (void)r_in;  // used indirectly via FallingParams in trace_photon_gpg
+    (void)fp.r_disk_in;  // used indirectly via FallingParams in trace_photon_gpg
 
     auto t0 = std::chrono::steady_clock::now();
 
@@ -221,45 +256,7 @@ void render_falling_frame(int frame_idx, int total_frames,
             FallingGeoPixel pix = trace_photon_gpg(
                 cs_at_frame.x, k, fp.bh, fp, 50000, 0.05, 1e-7);
 
-            uint8_t R = 0, G = 0, B = 0;
-
-            if (pix.outcome == 0) {
-                // Escaped — dark background (Phase A); Phase C will add HDRI skybox
-                R = G = B = 30;
-
-            } else if (pix.outcome == 1) {
-                // Disk hit — Phase B shading
-                const double r_h  = double(pix.r_hit);
-                const double g_rs = double(pix.redshift);
-
-                // Page-Thorne flux profile: f(r) ∝ (1 - sqrt(r_isco/r)) / r³
-                double lum = 0.0;
-                if (r_h > r_isco_val && r_h <= r_out) {
-                    const double x_pt = std::sqrt(r_isco_val / r_h);
-                    lum = (1.0 - x_pt) / (r_h * r_h * r_h);
-                    // Normalize by approximate peak at 3*r_isco
-                    const double r_peak = 3.0 * r_isco_val;
-                    const double x_peak = std::sqrt(r_isco_val / r_peak);
-                    const double lum_peak = (1.0 - x_peak) / (r_peak*r_peak*r_peak);
-                    if (lum_peak > 1e-30) lum /= lum_peak;
-                    // Apply redshift: I_obs = g^4 * I_emit
-                    lum *= std::pow(std::max(g_rs, 0.0), 4.0);
-                    lum  = std::min(lum * fp.disk_brightness, 1.0);
-                }
-
-                // Color: blueshift side (g>1) → white-yellow; redshift side → orange-red
-                const float fl = float(lum);
-                if (g_rs > 1.0) {
-                    R = uint8_t(std::min(255.0f, 255.0f * fl));
-                    G = uint8_t(std::min(255.0f, 210.0f * fl));
-                    B = uint8_t(std::min(255.0f, 100.0f * fl));
-                } else {
-                    R = uint8_t(std::min(255.0f, 220.0f * fl));
-                    G = uint8_t(std::min(255.0f, 100.0f * fl * float(g_rs)));
-                    B = 0;
-                }
-                // outcome 2 (singularity), 3 (trapped) → remain black
-            }
+            auto [R, G, B] = shade_falling_pixel(pix, fp, r_isco_val);
 
             const int idx = (py * W + px) * 3;
             rgb[idx + 0] = R;
