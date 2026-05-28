@@ -242,3 +242,123 @@ static uchar4 shade_pixel_f(int outcome, float r_hit, float redshift,
     // outcome 2 (singularity), 3 (trapped) → black
     return uchar4(R, G, B, 255);
 }
+
+// ── photon_init_f: null photon k^μ for pixel (px,py) from tetrad ──────────────
+static void photon_init_f(uint px, uint py,
+                           constant FallingCameraParams& fp,
+                           thread float* k_out)
+{
+    float W    = float(fp.width);
+    float H    = float(fp.height);
+    float fov_v= fp.fov_h * H / W;
+    float alpha= fp.fov_h * (float(px) - W*0.5f) / (W - 1.0f);
+    float beta = fov_v   * (H*0.5f - float(py))  / (H - 1.0f);
+
+    float nx = sin(beta)*cos(alpha);
+    float ny = sin(beta)*sin(alpha);
+    float nz = cos(beta);
+
+    // k^μ = e[0]^μ + nx·e[1]^μ + ny·e[2]^μ + nz·e[3]^μ
+    float k[4];
+    for (int mu=0;mu<4;++mu)
+        k[mu] = fp.e[0][mu] + nx*fp.e[1][mu] + ny*fp.e[2][mu] + nz*fp.e[3][mu];
+
+    // Enforce null: rescale k^T so g_μν k^μ k^ν = 0
+    float gLL[16];
+    gpg_covariant_f(fp.M, fp.a, fp.Q, fp.Lambda, fp.x[1], fp.x[2], gLL);
+    float A = G4(gLL,0,0);
+    float B = 0.0f, C = 0.0f;
+    for (int mu=1;mu<4;++mu) B += 2.0f*G4(gLL,0,mu)*k[mu];
+    for (int mu=1;mu<4;++mu)
+        for (int nu=1;nu<4;++nu)
+            C += G4(gLL,mu,nu)*k[mu]*k[nu];
+    float disc = B*B - 4.0f*A*C;
+    if (disc >= 0.0f) {
+        float kT1 = (-B + sqrt(disc))/(2.0f*A);
+        float kT2 = (-B - sqrt(disc))/(2.0f*A);
+        k[0] = (kT1 > kT2) ? kT1 : kT2;
+    }
+    for (int i=0;i<4;++i) k_out[i] = k[i];
+}
+
+// ── trace_falling_pixel: main kernel — one thread per pixel ───────────────────
+kernel void trace_falling_pixel(
+    device uchar4*                   rgb_out  [[buffer(0)]],
+    device float*                    rmin_out [[buffer(1)]],
+    constant FallingCameraParams&    fp       [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= uint(fp.width) || gid.y >= uint(fp.height)) return;
+
+    // Initialise photon at camera position fp.x
+    float k[4], x[4];
+    for (int i=0;i<4;++i) x[i] = fp.x[i];
+    photon_init_f(gid.x, gid.y, fp, k);
+
+    float r_min      = x[1];
+    float dlam       = fp.h0;
+    int   outcome    = 3;       // trapped default
+    float r_hit      = 0.0f;
+    float redshift   = 1.0f;
+    float prev_theta = x[2];
+    float prev_r     = x[1];
+
+    for (int step=0; step < fp.max_steps; ++step) {
+        if (x[1] < r_min) r_min = x[1];
+
+        // Escape
+        if (x[1] >= fp.r_escape) {
+            outcome = 0; r_hit = x[1]; break;
+        }
+        // Singularity
+        if (x[1] < fp.r_singularity) {
+            outcome = 2; break;
+        }
+
+        // Disk crossing: sign change of (θ − π/2) within [r_in, r_out]
+        float cur_theta = x[2];
+        if (x[1] >= fp.r_in && x[1] <= fp.r_out) {
+            float dp = prev_theta - M_PI_F/2.0f;
+            float dc = cur_theta  - M_PI_F/2.0f;
+            if (dp * dc < 0.0f) {
+                outcome = 1;
+                float t = abs(dp) / (abs(dp) + abs(dc));
+                r_hit = prev_r + t*(x[1] - prev_r);
+
+                // Redshift g-factor: Keplerian Omega_K, g_μν at r_hit equatorial
+                float gLL_d[16];
+                gpg_covariant_f(fp.M, fp.a, fp.Q, fp.Lambda,
+                                r_hit, M_PI_F/2.0f, gLL_d);
+                float sqrtM = sqrt(fp.M);
+                float Omega = sqrtM / (pow(r_hit, 1.5f) + fp.a * sqrtM);
+                float N2 = -(G4(gLL_d,0,0)
+                           + 2.0f*G4(gLL_d,0,3)*Omega
+                           + G4(gLL_d,3,3)*Omega*Omega);
+                if (N2 > 1e-20f) {
+                    float ut_em  = 1.0f / sqrt(N2);
+                    float uph_em = Omega * ut_em;
+                    float k_low[4] = {0,0,0,0};
+                    for (int mu=0;mu<4;++mu)
+                        for (int nu=0;nu<4;++nu)
+                            k_low[mu] += G4(gLL_d,mu,nu)*k[nu];
+                    float k_u_emit = k_low[0]*ut_em + k_low[3]*uph_em;
+                    float k_u_obs  = abs(k_low[0]);
+                    if (abs(k_u_emit) > 1e-20f)
+                        redshift = k_u_obs / abs(k_u_emit);
+                }
+                break;
+            }
+        }
+        prev_theta = cur_theta;
+        prev_r     = x[1];
+
+        // Adaptive step: fine near horizon
+        dlam = (x[1] < fp.r_horizon * 3.0f) ? 0.005f : fp.h0;
+        photon_step_f(fp.M, fp.a, fp.Q, fp.Lambda, x, k, dlam);
+    }
+
+    uint idx = gid.y * uint(fp.width) + gid.x;
+    rgb_out [idx] = shade_pixel_f(outcome, r_hit, redshift,
+                                   fp.r_isco, fp.r_out, fp.disk_brightness);
+    rmin_out[idx] = r_min;
+}
