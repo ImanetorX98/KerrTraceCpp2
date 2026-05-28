@@ -329,8 +329,12 @@ kernel void trace_falling_pixel(
                 float gLL_d[16];
                 gpg_covariant_f(fp.M, fp.a, fp.Q, fp.Lambda,
                                 r_hit, M_PI_F/2.0f, gLL_d);
-                float sqrtM = sqrt(fp.M);
-                float Omega = sqrtM / (pow(r_hit, 1.5f) + fp.a * sqrtM);
+                float s_sign = (fp.a < 0.0f) ? 1.0f : -1.0f;
+                float Meff   = fp.M - fp.Q*fp.Q/(2.0f*r_hit)
+                               + fp.Lambda*fp.a*r_hit*r_hit/3.0f;
+                float sq_Meff = sqrt(max(Meff, 0.0f));
+                float omega_den = r_hit*sqrt(r_hit) + s_sign*fp.a*sq_Meff;
+                float Omega = (omega_den > 1e-10f) ? s_sign*sq_Meff/omega_den : 0.0f;
                 float N2 = -(G4(gLL_d,0,0)
                            + 2.0f*G4(gLL_d,0,3)*Omega
                            + G4(gLL_d,3,3)*Omega*Omega);
