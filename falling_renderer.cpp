@@ -11,6 +11,9 @@
 #include <chrono>
 #include <cstdio>
 #include <vector>
+#ifdef USE_METAL
+#include "gpu/metal/metal_falling_renderer.hpp"
+#endif
 
 // ── Photon initialization ─────────────────────────────────────────────────────
 void init_photon_k(const CameraState& cs, const double e[4][4],
@@ -243,6 +246,45 @@ void render_falling_frame(int frame_idx, int total_frames,
     (void)fp.r_disk_in;  // used indirectly via FallingParams in trace_photon_gpg
 
     auto t0 = std::chrono::steady_clock::now();
+
+#ifdef USE_METAL
+    {
+        std::vector<float>   r_min(W * H, float(fp.r_escape));
+        FallingCameraParams_C cp = make_falling_metal_params(fp, cs_at_frame, e);
+        if (metal_render_falling_frame(cp, rgb, r_min)) {
+            // Pass 2: CPU double refinement for near-horizon pixels
+            const double r_switch = fp.bh.r_horizon() * fp.r_switch_factor;
+            int refined = 0;
+            for (int py = 0; py < H; ++py) {
+                for (int px = 0; px < W; ++px) {
+                    const int idx = py * W + px;
+                    if (r_min[idx] < float(r_switch)) {
+                        double k[4];
+                        init_photon_k(cs_at_frame, e, fp.bh,
+                                      px, py, W, H, fp.fov_h, k);
+                        FallingGeoPixel pix = trace_photon_gpg(
+                            cs_at_frame.x, k, fp.bh, fp, 50000, 0.05, 1e-7);
+                        auto [R, G, B] = shade_falling_pixel(pix, fp, r_isco_val);
+                        rgb[idx*3+0] = R;
+                        rgb[idx*3+1] = G;
+                        rgb[idx*3+2] = B;
+                        ++refined;
+                    }
+                }
+            }
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - t0).count();
+            std::printf("[frame %04d/%04d] Metal+CPU refine=%d (%.0f%%)  %.1fs elapsed\n",
+                        frame_idx + 1, total_frames,
+                        refined,
+                        refined * 100.0 / double(W * H),
+                        elapsed);
+            stbi_write_png(out_path.c_str(), W, H, 3, rgb.data(), W * 3);
+            return;
+        }
+        // Metal failed → fall through to CPU path
+    }
+#endif
 
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic,16)
