@@ -98,6 +98,10 @@ FallingGeoPixel trace_photon_gpg(const double x0[4], const double k0[4],
     double dlam = h0;
     const double r_h = bh.r_horizon();
 
+    // prev_x tracks position before each step for interpolation
+    double prev_x[4];
+    for (int i=0;i<4;++i) prev_x[i] = x[i];
+
     for (int step=0; step<max_steps; ++step) {
         if (x[1] < double(pix.r_min)) pix.r_min = float(x[1]);
 
@@ -106,7 +110,11 @@ FallingGeoPixel trace_photon_gpg(const double x0[4], const double k0[4],
             pix.outcome   = 0;
             pix.r_hit     = float(x[1]);
             pix.theta_esc = float(std::fmod(std::abs(x[2]), M_PI));
-            pix.phi_esc   = float(std::fmod(x[3] + 4.0*M_PI, 2.0*M_PI));
+            {
+                double phi_wrapped = std::fmod(x[3], 2.0*M_PI);
+                if (phi_wrapped < 0.0) phi_wrapped += 2.0*M_PI;
+                pix.phi_esc = float(phi_wrapped);
+            }
             return pix;
         }
         // Singularity
@@ -122,18 +130,24 @@ FallingGeoPixel trace_photon_gpg(const double x0[4], const double k0[4],
             double d_prev = prev_theta - M_PI/2.0;
             double d_cur  = cur_theta  - M_PI/2.0;
             if (d_prev * d_cur < 0.0) {
+                // Linear interpolation between prev_x and x for the crossing point
+                double t_frac = std::abs(d_prev) / (std::abs(d_prev) + std::abs(d_cur));
                 pix.outcome = 1;
-                // Linear interpolation for r_hit and phi_hit
-                pix.r_hit   = float(x[1]);               // approx (last step r)
-                pix.phi_hit = float(x[3]);
+                pix.r_hit   = float(prev_x[1] + t_frac*(x[1]-prev_x[1]));
+                pix.phi_hit = float(prev_x[3] + t_frac*(x[3]-prev_x[3]));
                 return pix;
             }
         }
         prev_theta = cur_theta;
 
-        // Reduce step size near horizon for accuracy
+        // Bidirectional adaptive step: fine near horizon, reset when far
         if (x[1] < r_h * 3.0)
-            dlam = std::min(dlam, 0.005);
+            dlam = 0.005;
+        else
+            dlam = h0;
+
+        // Save position before stepping
+        for (int i=0;i<4;++i) prev_x[i] = x[i];
 
         photon_step(bh, x, k, dlam);
     }
