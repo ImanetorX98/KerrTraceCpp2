@@ -15,11 +15,15 @@ ray-bundle antialiasing.  Target: publication-quality images like DNGR/Interstel
 | `geodesic.hpp` | Hamiltonian RHS, adaptive RK4 (step-doubling) |
 | `camera.hpp` | BL camera, pixel→(α,β)→initial state, `angle_ray()` |
 | `ray_bundle.hpp` | Jacobi-field bundle: Hessian(H), variational equations, magnification |
-| `main.cpp` | Render loop, backend dispatch, PPM output |
+| `main.cpp` | Render loop, backend dispatch, PNG output |
 | `gpu/metal/tracer.metal` | MSL compute shader (one thread = one pixel) |
 | `gpu/metal/metal_renderer.hpp/.mm` | Objective-C++ Metal bridge |
 | `gpu/cuda/tracer.cu/.cuh` | CUDA kernel + host launcher |
 | `CMakeLists.txt` | Build: `-DUSE_METAL=ON`, `-DUSE_CUDA=ON`, default=CPU |
+| `falling_camera.hpp` | GPG metric, `CameraState`, `FallingParams`, worldline RK4, tetrad, roll, HorizonFlip |
+| `falling_renderer.hpp` | `FallingGeoPixel`, `init_photon_k`, `trace_photon_gpg`, `render_falling_frame` |
+| `falling_renderer.cpp` | Backward GPG null geodesic, Phase A+B shading, PNG output |
+| `tests/test_falling_camera.cpp` | 10 unit tests: metric, worldline, tetrad, photon null |
 
 ---
 
@@ -27,16 +31,38 @@ ray-bundle antialiasing.  Target: publication-quality images like DNGR/Interstel
 
 ```bash
 # CPU (default)
-cmake -B build && cmake --build build -j$(nproc)
-./build/kerr_tracer           # single-ray
-./build/kerr_tracer --bundles # ray-bundle mode
+cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu -j$(sysctl -n hw.ncpu)
+./build_cpu/kerr_tracer           # single-ray
+./build_cpu/kerr_tracer --bundles # ray-bundle mode
 
 # Metal GPU (macOS)
-cmake -B build -DUSE_METAL=ON && cmake --build build -j$(nproc)
+cmake -B build -DUSE_METAL=ON && cmake --build build -j$(sysctl -n hw.ncpu)
 
 # CUDA GPU (Linux/Windows, requires nvcc)
 cmake -B build -DUSE_CUDA=ON && cmake --build build -j$(nproc)
+
+# Falling camera (CPU, Phases A+B)
+./build_cpu/kerr_tracer --falling-camera --a 0.9 --fall-r-start 20 --fall-E 1.0 \
+  --fall-frames 30 --fall-dtau 0.3 --width 640 --height 360
+# Output: out/falling/<timestamp>/frame_NNNN.png
+
+# CTest
+cmake -B build_cpu -DUSE_METAL=OFF -DBUILD_TESTING=ON && cmake --build build_cpu
+cd build_cpu && ctest --output-on-failure
 ```
+
+### Falling camera CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--falling-camera` | — | Enable falling camera mode |
+| `--fall-r-start` | 20.0 | Initial radius [M] |
+| `--fall-E` | 1.0 | Conserved energy (1 = fall from rest at ∞) |
+| `--fall-L` | 0.0 | Angular momentum [M] |
+| `--fall-Qc` | 0.0 | Carter constant [M²] |
+| `--fall-theta` | 90.0 | Initial polar angle [deg] |
+| `--fall-frames` | 120 | Number of frames |
+| `--fall-dtau` | 0.1 | Proper time step per frame [M] |
 
 ---
 
@@ -101,10 +127,27 @@ where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
 - [x] Thin-disk renderer with relativistic redshift
 - [x] CPU/OpenMP backend
 
-### Phase 2 — GPU & quality (in progress)
+### Phase 2 — GPU & quality (done)
 - [x] Metal compute shader (macOS)
 - [x] CUDA kernel (Linux/Windows)
 - [x] Ray-bundle Jacobi-field renderer
+
+### Phase 6 — Falling Camera (Phases A+B done, C–E TODO)
+- [x] GPG coordinates for KNdS (Lin & Soo 2009, arXiv:0905.3244) — regular at horizon
+- [x] Timelike geodesic integration: RK4, normalization reprojection, init from (E, L, Qc)
+- [x] Local tetrad via metric Gram-Schmidt with degenerate-seed fallback
+- [x] `apply_roll` (rotation around ê₃) and `horizon_flip_psi` (cubic smoothstep)
+- [x] Backward null geodesic in GPG: escape / disk / singularity / trapped stop conditions
+- [x] Phase A: grey background for escaped photons
+- [x] Phase B: Page-Thorne flux × g⁴ redshift, blueshift/redshift color split
+- [x] `--falling-camera` CLI, timestamped PNG output, `kerrtrace.falling_smoke` CTest
+- [ ] Phase C: redshift/Doppler with exact camera 4-velocity (currently uses coordinate-energy approx)
+- [ ] Phase D: Metal GPU pass + CPU refinement mask for near-horizon pixels (`r_min < k·r_h`)
+- [ ] Phase E: camera roll animation, frontend tab, MP4 output via ffmpeg
+- [ ] Phase F: Carter constant Ξ corrections for Λ≠0 in `u_θ` init
+
+**Note on performance**: Apple clang has no OpenMP → single-threaded on macOS (~9 min/frame at 320×180).
+Use Metal build (`-DUSE_METAL=ON`) for GPU acceleration once Phase D is implemented.
 
 ### Phase 3 — Accuracy & features (TODO)
 - [ ] Chart switching BL↔KS when `Δ_r < ε` (Arcmancer-style)
@@ -292,10 +335,15 @@ Option (b) is already in effect via the fallback guard.
 
 **Standard renders confirmed correct** at both a=0.5 and a=0.998 (near-extremal).
 
-### Build notes (2026-04-24)
+### Build notes (2026-05-28)
 - CPU binary: `cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu`
 - Metal binary: `cmake -B build -DUSE_METAL=ON && cmake --build build`
 - tracer.metal is loaded at runtime from `build/tracer.metal` (copied from source).
   Changes to `gpu/metal/tracer.metal` require rebuild to copy to build dir.
 - Metal elliptic-closed: `can_separable_kerr` in shader checks Q≈0, Λ≈0 (NOT chart),
   so elliptic solver runs even in KS chart mode on GPU.
+- **Do NOT pass `-fopenmp` to cmake on macOS** — Apple clang doesn't support it and the
+  flag gets cached, breaking subsequent builds. Clear with `rm -rf build_cpu` if it happens.
+- Falling camera uses `FALLING_RENDERER_STANDALONE` define in tests to provide
+  `stbi_write_png` implementation without `main.cpp`; do not define `STB_IMAGE_WRITE_IMPLEMENTATION`
+  in `falling_renderer.cpp` itself.
