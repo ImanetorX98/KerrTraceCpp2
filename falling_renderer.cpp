@@ -1,6 +1,5 @@
 #include "falling_renderer.hpp"
 #include <cmath>
-#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <vector>
