@@ -90,3 +90,75 @@ inline void gpg_contravariant(const KNdSMetric& bh, double r, double theta,
         for (int j=0;j<4;++j)
             gUU[i][j] = cofactor(j,i)*((i+j)%2==0?1:-1)*inv_det;
 }
+
+// ── Falling camera parameter block ───────────────────────────────────────────
+struct FallingParams {
+    KNdSMetric bh;
+    double r_start     = 20.0;
+    double E           = 1.0;    // conserved energy (1 = fall from rest at ∞)
+    double L           = 0.0;    // conserved angular momentum [M]
+    double Qc          = 0.0;    // Carter constant [M²]
+    double theta_start = M_PI/2;
+    double phi_start   = 0.0;
+    double fov_h       = 90.0 * M_PI/180.0;
+    int    width       = 1280;
+    int    height      = 720;
+    int    frames      = 120;
+    double dtau        = 0.1;
+    double r_disk_in   = -1.0;   // <0 = use ISCO
+    double r_disk_out  = 12.0;
+    double r_escape    = 200.0;
+    double r_singularity = 0.05;
+    double disk_brightness = 1.0;
+};
+
+// ── Camera state in GPG coordinates ──────────────────────────────────────────
+// x[0]=T, x[1]=r, x[2]=θ, x[3]=φ_P   (position)
+// u[0..3]                              (contravariant four-velocity)
+struct CameraState {
+    double x[4];
+    double u[4];
+};
+
+// ── Initial worldline from conserved quantities ───────────────────────────────
+inline CameraState init_worldline(const FallingParams& fp) {
+    const KNdSMetric& bh = fp.bh;
+    const double r  = fp.r_start;
+    const double th = fp.theta_start;
+
+    double gLL[4][4], gUU[4][4];
+    gpg_covariant(bh, r, th, gLL);
+    gpg_contravariant(bh, r, th, gUU);
+
+    // Covariant conserved components
+    const double uT_low  = -fp.E;
+    const double uph_low =  fp.L;
+
+    // u_θ from Carter constant (Kerr-leading-order form)
+    const double cos2 = std::cos(th)*std::cos(th);
+    const double sin2 = std::sin(th)*std::sin(th);
+    const double under = fp.Qc - cos2*(bh.a*bh.a*fp.E*fp.E
+                                       - fp.L*fp.L/std::max(sin2, 1e-10));
+    const double uth_low = std::sqrt(std::max(under, 0.0));
+
+    // Solve for u_r: normalization g^μν u_μ u_ν = -1
+    // g^rr ur² + 2(g^rT uT + g^rφ uφ) ur + C = -1
+    const double C = gUU[0][0]*uT_low*uT_low
+                   + 2.0*gUU[0][3]*uT_low*uph_low
+                   + gUU[3][3]*uph_low*uph_low
+                   + gUU[2][2]*uth_low*uth_low;
+    const double A = gUU[1][1];
+    const double B = 2.0*(gUU[1][0]*uT_low + gUU[1][3]*uph_low);
+    const double disc = B*B - 4.0*A*(C+1.0);
+    // Ingoing root (ur < 0)
+    const double ur_low = (-B - std::sqrt(std::max(disc, 0.0))) / (2.0*A);
+
+    // Raise indices: u^μ = g^μν u_ν
+    CameraState cs;
+    cs.x[0] = 0.0; cs.x[1] = r; cs.x[2] = th; cs.x[3] = fp.phi_start;
+    cs.u[0] = gUU[0][0]*uT_low + gUU[0][1]*ur_low + gUU[0][3]*uph_low;
+    cs.u[1] = gUU[1][0]*uT_low + gUU[1][1]*ur_low + gUU[1][3]*uph_low;
+    cs.u[2] = gUU[2][2]*uth_low;
+    cs.u[3] = gUU[3][0]*uT_low + gUU[3][1]*ur_low + gUU[3][3]*uph_low;
+    return cs;
+}
