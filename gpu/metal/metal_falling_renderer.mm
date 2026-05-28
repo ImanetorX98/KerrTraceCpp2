@@ -118,7 +118,8 @@ FallingCameraParams_C make_falling_metal_params(
                                 // are refined by CPU pass anyway)
     c.width         = fp.width;
     c.height        = fp.height;
-    c.pad[0] = c.pad[1] = c.pad[2] = 0;
+    c.y_start       = 0;
+    c.pad[0] = c.pad[1] = 0;
     return c;
 }
 
@@ -149,24 +150,44 @@ bool metal_render_falling_frame(
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:c.pso];
-    [enc setBuffer:rgbBuf  offset:0 atIndex:0];
-    [enc setBuffer:rminBuf offset:0 atIndex:1];
-    [enc setBuffer:cpBuf   offset:0 atIndex:2];
+    // Dispatch in row tiles to avoid macOS GPU watchdog timeout.
+    // Each tile is one command buffer so the OS can preempt between tiles.
+    const NSUInteger TILE_ROWS = 16;
+    MTLSize tg = MTLSizeMake(16, 16, 1);
 
-    MTLSize tg   = MTLSizeMake(16, 16, 1);
-    MTLSize grid = MTLSizeMake(((W+15)/16)*16, ((H+15)/16)*16, 1);
-    [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
+    for (NSUInteger y0 = 0; y0 < H; y0 += TILE_ROWS) {
+        NSUInteger tile_h = std::min(TILE_ROWS, H - y0);
 
-    if (cmd.status != MTLCommandBufferStatusCompleted) {
-        fprintf(stderr, "[falling-metal] command buffer failed: %s\n",
-                cmd.error ? [cmd.error.localizedDescription UTF8String] : "unknown");
-        return false;
+        // Build per-tile params (only y_start changes)
+        FallingCameraParams_C tp = params;
+        tp.y_start = (int)y0;
+        [cpBuf  release];  // release previous (first iteration: cpBuf from above is valid)
+        cpBuf = [c.device newBufferWithBytes:&tp
+                                      length:sizeof(tp)
+                                     options:MTLResourceStorageModeShared];
+        if (!cpBuf) return false;
+
+        MTLSize grid = MTLSizeMake(((W+15)/16)*16, ((tile_h+15)/16)*16, 1);
+        NSUInteger rgb_off  = y0 * W * 4;
+        NSUInteger rmin_off = y0 * W * sizeof(float);
+
+        id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:c.pso];
+        [enc setBuffer:rgbBuf  offset:rgb_off  atIndex:0];
+        [enc setBuffer:rminBuf offset:rmin_off atIndex:1];
+        [enc setBuffer:cpBuf   offset:0        atIndex:2];
+        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.status != MTLCommandBufferStatusCompleted) {
+            fprintf(stderr, "[falling-metal] tile y=%u failed: %s\n",
+                    (unsigned)y0,
+                    cmd.error ? [cmd.error.localizedDescription UTF8String] : "unknown");
+            return false;
+        }
     }
 
     const auto t1 = std::chrono::steady_clock::now();

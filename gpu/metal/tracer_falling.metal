@@ -18,7 +18,7 @@ struct FallingCameraParams {
     float M, a, Q, Lambda;
     float r_in, r_out, r_isco, r_escape, r_singularity, r_horizon;
     float disk_brightness, fov_h, h0, r_switch_factor;
-    int   max_steps, width, height, pad[3];
+    int   max_steps, width, height, y_start, pad[2];
 };
 
 // ── Flat 4×4 index helper ─────────────────────────────────────────────────────
@@ -288,12 +288,13 @@ kernel void trace_falling_pixel(
     constant FallingCameraParams&    fp       [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= uint(fp.width) || gid.y >= uint(fp.height)) return;
+    uint abs_y = gid.y + uint(fp.y_start);
+    if (gid.x >= uint(fp.width) || abs_y >= uint(fp.height)) return;
 
     // Initialise photon at camera position fp.x
     float k[4], x[4];
     for (int i=0;i<4;++i) x[i] = fp.x[i];
-    photon_init_f(gid.x, gid.y, fp, k);
+    photon_init_f(gid.x, abs_y, fp, k);
 
     float r_min      = x[1];
     float dlam       = fp.h0;
@@ -361,7 +362,7 @@ kernel void trace_falling_pixel(
         photon_step_f(fp.M, fp.a, fp.Q, fp.Lambda, x, k, dlam);
     }
 
-    uint idx = gid.y * uint(fp.width) + gid.x;
+    uint idx = abs_y * uint(fp.width) + gid.x;
     rgb_out [idx] = shade_pixel_f(outcome, r_hit, redshift,
                                    fp.r_isco, fp.r_out, fp.disk_brightness);
     rmin_out[idx] = r_min;
