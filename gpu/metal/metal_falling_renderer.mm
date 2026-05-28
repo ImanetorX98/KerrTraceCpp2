@@ -168,15 +168,15 @@ bool metal_render_falling_frame(
         if (!cpBuf) return false;
 
         MTLSize grid = MTLSizeMake(((W+15)/16)*16, ((tile_h+15)/16)*16, 1);
-        NSUInteger rgb_off  = y0 * W * 4;
-        NSUInteger rmin_off = y0 * W * sizeof(float);
 
         id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:c.pso];
-        [enc setBuffer:rgbBuf  offset:rgb_off  atIndex:0];
-        [enc setBuffer:rminBuf offset:rmin_off atIndex:1];
-        [enc setBuffer:cpBuf   offset:0        atIndex:2];
+        // No buffer offset: the kernel uses absolute indices (abs_y = gid.y + y_start)
+        // so the writes land at the correct positions in the full-frame buffers.
+        [enc setBuffer:rgbBuf  offset:0 atIndex:0];
+        [enc setBuffer:rminBuf offset:0 atIndex:1];
+        [enc setBuffer:cpBuf   offset:0 atIndex:2];
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc endEncoding];
         [cmd commit];

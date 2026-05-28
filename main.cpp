@@ -3279,6 +3279,7 @@ int main(int argc, char** argv) {
     double fall_theta_deg  = 90.0;
     int    fall_frames     = 120;
     double fall_dtau       = 0.1;
+    double fall_r_switch   = -1.0;  // <0 → use FallingParams default (3.0)
 
     // ── Two-phase modes ───────────────────────────────────────
     bool        geo_only    = false;
@@ -3525,6 +3526,7 @@ int main(int argc, char** argv) {
         if (arg=="--fall-theta"   && i+1<argc)  fall_theta_deg  = std::stod(argv[++i]);
         if (arg=="--fall-frames"  && i+1<argc)  fall_frames     = std::stoi(argv[++i]);
         if (arg=="--fall-dtau"    && i+1<argc)  fall_dtau       = std::stod(argv[++i]);
+        if (arg=="--fall-r-switch"&& i+1<argc)  fall_r_switch   = std::stod(argv[++i]);
     }
 
     cp.disk_brightness = std::max(0.0, cli_disk_brightness);
@@ -3777,6 +3779,7 @@ int main(int argc, char** argv) {
         fpar.dtau           = fall_dtau;
         fpar.r_disk_out     = arg_disk_out * M_bh;
         fpar.disk_brightness= cp.disk_brightness;
+        if (fall_r_switch >= 0.0) fpar.r_switch_factor = fall_r_switch;
 
         const std::string fall_dir = std::string(OUT_DIR) + "/falling/" + make_ts();
         std::filesystem::create_directories(fall_dir);
