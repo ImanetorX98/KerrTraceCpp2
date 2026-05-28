@@ -253,3 +253,78 @@ inline CameraState step_worldline(const CameraState& cs,
     }
     return next;
 }
+
+// ── CameraTetrad: metric Gram-Schmidt ─────────────────────────────────────────
+// e[a][mu]: a=tetrad index (0=time,1=radial,2=polar,3=azimuthal), mu=coord index
+// Satisfies: g_μν e[a]^μ e[b]^ν = η_ab = diag(-1,+1,+1,+1)
+inline void build_tetrad(const CameraState& cs, const KNdSMetric& bh,
+                          double e[4][4])
+{
+    double gLL[4][4];
+    gpg_covariant(bh, cs.x[1], cs.x[2], gLL);
+
+    auto inner = [&](const double* v, const double* w) -> double {
+        double s=0.0;
+        for (int mu=0;mu<4;++mu) for (int nu=0;nu<4;++nu)
+            s += gLL[mu][nu]*v[mu]*w[nu];
+        return s;
+    };
+    auto normalize_v = [&](double* v, double sign) {
+        double n2 = sign*inner(v,v);
+        double n  = std::sqrt(std::max(n2, 1e-30));
+        for (int mu=0;mu<4;++mu) v[mu] /= n;
+    };
+    auto subtract_proj = [&](double* v, const double* basis, double basis_norm2) {
+        double coeff = inner(v, basis) / basis_norm2;
+        for (int mu=0;mu<4;++mu) v[mu] -= coeff*basis[mu];
+    };
+
+    // e[0] = u^μ (timelike unit, already normalized by init_worldline)
+    for (int mu=0;mu<4;++mu) e[0][mu] = cs.u[mu];
+    normalize_v(e[0], -1.0);
+
+    // e[1] seed = ∂_r
+    double seed1[4]={0,1,0,0};
+    subtract_proj(seed1, e[0], inner(e[0],e[0]));
+    for (int mu=0;mu<4;++mu) e[1][mu]=seed1[mu];
+    normalize_v(e[1], 1.0);
+
+    // e[2] seed = ∂_θ
+    double seed2[4]={0,0,1,0};
+    subtract_proj(seed2, e[0], inner(e[0],e[0]));
+    subtract_proj(seed2, e[1], inner(e[1],e[1]));
+    for (int mu=0;mu<4;++mu) e[2][mu]=seed2[mu];
+    normalize_v(e[2], 1.0);
+
+    // e[3] seed = ∂_φ
+    double seed3[4]={0,0,0,1};
+    subtract_proj(seed3, e[0], inner(e[0],e[0]));
+    subtract_proj(seed3, e[1], inner(e[1],e[1]));
+    subtract_proj(seed3, e[2], inner(e[2],e[2]));
+    for (int mu=0;mu<4;++mu) e[3][mu]=seed3[mu];
+    normalize_v(e[3], 1.0);
+}
+
+// ── Apply roll ψ around ê_3 (azimuthal axis) ─────────────────────────────────
+// Rotates ê_1 (radial) and ê_2 (polar) in the radial-polar plane.
+inline void apply_roll(double e[4][4], double psi) {
+    double e1[4], e2[4];
+    for (int mu=0;mu<4;++mu) { e1[mu]=e[1][mu]; e2[mu]=e[2][mu]; }
+    for (int mu=0;mu<4;++mu) {
+        e[1][mu] =  std::cos(psi)*e1[mu] + std::sin(psi)*e2[mu];
+        e[2][mu] = -std::sin(psi)*e1[mu] + std::cos(psi)*e2[mu];
+    }
+}
+
+// ── HorizonFlip: ψ(r) — 0=look outward, π=look toward BH ─────────────────────
+inline double horizon_flip_psi(double r, double r_horizon,
+                                double delta_out=2.0, double delta_in=0.8)
+{
+    const double r_far  = r_horizon * delta_out;
+    const double r_near = r_horizon * delta_in;
+    if (r >= r_far)  return M_PI;
+    if (r <= r_near) return 0.0;
+    double t = (r - r_near) / (r_far - r_near);
+    double smooth = t*t*(3.0 - 2.0*t);
+    return M_PI * smooth;
+}

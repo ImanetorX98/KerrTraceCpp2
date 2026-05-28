@@ -96,6 +96,27 @@ bool test_worldline_r_decreases() {
     return true;
 }
 
+bool test_tetrad_orthonormal() {
+    KNdSMetric bh(1.0, 0.9, 0.0, 0.0);
+    FallingParams fp; fp.bh = bh; fp.r_start = 5.0; fp.E = 1.0; fp.L = 0.0; fp.Qc = 0.0;
+    CameraState cs = init_worldline(fp);
+    double e[4][4];
+    build_tetrad(cs, bh, e);
+    double gLL[4][4];
+    gpg_covariant(bh, cs.x[1], cs.x[2], gLL);
+    const double eta[4][4]={{-1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}};
+    for (int a=0;a<4;++a) for (int b=0;b<4;++b) {
+        double s=0.0;
+        for (int mu=0;mu<4;++mu) for (int nu=0;nu<4;++nu)
+            s += gLL[mu][nu]*e[a][mu]*e[b][nu];
+        if (!approx(s, eta[a][b], 1e-6)) {
+            std::cerr<<"FAIL tetrad ["<<a<<"]["<<b<<"] = "<<s<<" expected "<<eta[a][b]<<"\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 int main() {
     int fail=0;
     if (!test_gpg_metric_inverse())  { std::cerr<<"FAIL test_gpg_metric_inverse\n";  ++fail; }
@@ -110,5 +131,7 @@ int main() {
     else std::cout<<"PASS test_worldline_step_stays_normalized\n";
     if (!test_worldline_r_decreases())           { std::cerr<<"FAIL r_decreases\n";     ++fail; }
     else std::cout<<"PASS test_worldline_r_decreases\n";
+    if (!test_tetrad_orthonormal()) { std::cerr<<"FAIL tetrad_orthonormal\n"; ++fail; }
+    else std::cout<<"PASS test_tetrad_orthonormal\n";
     return fail;
 }
