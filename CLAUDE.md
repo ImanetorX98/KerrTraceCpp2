@@ -142,12 +142,12 @@ where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
 - [x] Phase B: Page-Thorne flux × g⁴ redshift, blueshift/redshift color split
 - [x] `--falling-camera` CLI, timestamped PNG output, `kerrtrace.falling_smoke` CTest
 - [ ] Phase C: redshift/Doppler with exact camera 4-velocity (currently uses coordinate-energy approx)
-- [ ] Phase D: Metal GPU pass + CPU refinement mask for near-horizon pixels (`r_min < k·r_h`)
+- [x] Phase D: Metal GPU pass + CPU refinement mask for near-horizon pixels (`r_min < k·r_h`)
 - [ ] Phase E: camera roll animation, frontend tab, MP4 output via ffmpeg
 - [ ] Phase F: Carter constant Ξ corrections for Λ≠0 in `u_θ` init
 
 **Note on performance**: Apple clang has no OpenMP → single-threaded on macOS (~9 min/frame at 320×180).
-Use Metal build (`-DUSE_METAL=ON`) for GPU acceleration once Phase D is implemented.
+Use Metal build (`kerr_tracer_metal` or `-DUSE_METAL=ON`) for GPU acceleration (Phase D done).
 
 ### Phase 3 — Accuracy & features (TODO)
 - [ ] Chart switching BL↔KS when `Δ_r < ε` (Arcmancer-style)
