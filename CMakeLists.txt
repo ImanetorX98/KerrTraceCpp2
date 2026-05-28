@@ -35,9 +35,11 @@ if(USE_METAL)
         message(FATAL_ERROR "USE_METAL requires macOS")
     endif()
     list(APPEND CPU_SOURCES gpu/metal/metal_renderer.mm)
-    # Copy the .metal shader next to the binary so the renderer can find it
+    list(APPEND CPU_SOURCES gpu/metal/metal_falling_renderer.mm)
     configure_file(gpu/metal/tracer.metal
                    ${CMAKE_BINARY_DIR}/tracer.metal COPYONLY)
+    configure_file(gpu/metal/tracer_falling.metal
+                   ${CMAKE_BINARY_DIR}/tracer_falling.metal COPYONLY)
     message(STATUS "Metal GPU backend enabled")
 endif()
 
@@ -101,9 +103,13 @@ endif()
 
 # ── Always build Metal binary on macOS (alongside CPU) ────────
 if(APPLE AND NOT USE_METAL)
-    add_executable(kerr_tracer_metal main.cpp falling_renderer.cpp gpu/metal/metal_renderer.mm)
+    add_executable(kerr_tracer_metal main.cpp falling_renderer.cpp
+                   gpu/metal/metal_renderer.mm
+                   gpu/metal/metal_falling_renderer.mm)
     configure_file(gpu/metal/tracer.metal
                    ${CMAKE_BINARY_DIR}/tracer.metal COPYONLY)
+    configure_file(gpu/metal/tracer_falling.metal
+                   ${CMAKE_BINARY_DIR}/tracer_falling.metal COPYONLY)
     target_include_directories(kerr_tracer_metal PRIVATE ${CMAKE_SOURCE_DIR})
     target_compile_definitions(kerr_tracer_metal PRIVATE
         USE_METAL
