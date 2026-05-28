@@ -283,26 +283,63 @@ inline void build_tetrad(const CameraState& cs, const KNdSMetric& bh,
     for (int mu=0;mu<4;++mu) e[0][mu] = cs.u[mu];
     normalize_v(e[0], -1.0);
 
-    // e[1] seed = ∂_r
-    double seed1[4]={0,1,0,0};
-    subtract_proj(seed1, e[0], inner(e[0],e[0]));
-    for (int mu=0;mu<4;++mu) e[1][mu]=seed1[mu];
-    normalize_v(e[1], 1.0);
+    // Candidate coordinate seeds in order T,r,θ,φ
+    static const double coord_seeds[4][4] = {
+        {1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}
+    };
 
-    // e[2] seed = ∂_θ
-    double seed2[4]={0,0,1,0};
-    subtract_proj(seed2, e[0], inner(e[0],e[0]));
-    subtract_proj(seed2, e[1], inner(e[1],e[1]));
-    for (int mu=0;mu<4;++mu) e[2][mu]=seed2[mu];
-    normalize_v(e[2], 1.0);
+    // Build spacelike basis vectors e[1], e[2], e[3] via Gram-Schmidt.
+    // For each basis vector we try candidate seeds in priority order, picking
+    // the first whose residual (after projecting out already-built vectors)
+    // has n² = g(res,res) > 1e-10 to avoid degenerate directions near horizon.
+    int used_seed[4] = {-1,-1,-1,-1}; // track which coord direction each slot used
+    used_seed[0] = -1; // e[0] = u, no coord seed
 
-    // e[3] seed = ∂_φ
-    double seed3[4]={0,0,0,1};
-    subtract_proj(seed3, e[0], inner(e[0],e[0]));
-    subtract_proj(seed3, e[1], inner(e[1],e[1]));
-    subtract_proj(seed3, e[2], inner(e[2],e[2]));
-    for (int mu=0;mu<4;++mu) e[3][mu]=seed3[mu];
-    normalize_v(e[3], 1.0);
+    // Priority order for e[1]: r, θ, φ, T
+    static const int pref1[4] = {1,2,3,0};
+    // Priority order for e[2]: θ, φ, T, r
+    static const int pref2[4] = {2,3,0,1};
+    // Priority order for e[3]: φ, T, r, θ
+    static const int pref3[4] = {3,0,1,2};
+
+    auto try_build = [&](int slot, const int pref[4]) {
+        for (int ki=0; ki<4; ++ki) {
+            int k = pref[ki];
+            // Don't reuse a seed already chosen for a previous slot
+            bool already_used = false;
+            for (int s=0; s<slot; ++s) if (used_seed[s] == k) { already_used=true; break; }
+            if (already_used) continue;
+
+            double seed[4];
+            for (int mu=0;mu<4;++mu) seed[mu] = coord_seeds[k][mu];
+            // Project out all previously built basis vectors
+            subtract_proj(seed, e[0], inner(e[0],e[0]));
+            for (int s=1; s<slot; ++s)
+                subtract_proj(seed, e[s], inner(e[s],e[s]));
+            double n2 = inner(seed, seed); // should be positive (spacelike)
+            if (n2 > 1e-10) {
+                for (int mu=0;mu<4;++mu) e[slot][mu] = seed[mu];
+                normalize_v(e[slot], 1.0);
+                used_seed[slot] = k;
+                return;
+            }
+        }
+        // Fallback: use whatever we got from the first preference (shouldn't happen
+        // in well-behaved spacetimes, but avoids silent garbage)
+        int k = pref[0];
+        double seed[4];
+        for (int mu=0;mu<4;++mu) seed[mu] = coord_seeds[k][mu];
+        subtract_proj(seed, e[0], inner(e[0],e[0]));
+        for (int s=1; s<slot; ++s)
+            subtract_proj(seed, e[s], inner(e[s],e[s]));
+        for (int mu=0;mu<4;++mu) e[slot][mu] = seed[mu];
+        normalize_v(e[slot], 1.0);
+        used_seed[slot] = k;
+    };
+
+    try_build(1, pref1);
+    try_build(2, pref2);
+    try_build(3, pref3);
 }
 
 // ── Apply roll ψ around ê_3 (azimuthal axis) ─────────────────────────────────
@@ -316,7 +353,11 @@ inline void apply_roll(double e[4][4], double psi) {
     }
 }
 
-// ── HorizonFlip: ψ(r) — 0=look outward, π=look toward BH ─────────────────────
+// ── HorizonFlip: ψ(r) ────────────────────────────────────────────────────────
+// Returns ψ ∈ [0, π].
+// r ≥ r_far  (far from horizon): ψ = π   → camera looks toward BH (inward)
+// r ≤ r_near (inside horizon):   ψ = 0   → camera looks outward (back through horizon)
+// Transition: cubic smoothstep between r_near and r_far.
 inline double horizon_flip_psi(double r, double r_horizon,
                                 double delta_out=2.0, double delta_in=0.8)
 {

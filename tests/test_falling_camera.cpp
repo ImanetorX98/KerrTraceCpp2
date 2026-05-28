@@ -117,6 +117,67 @@ bool test_tetrad_orthonormal() {
     return true;
 }
 
+bool test_apply_roll() {
+    // Build a trivial tetrad in flat space and verify roll by π/2 swaps ê_1↔ê_2
+    // We test using a Schwarzschild BH (a=0) at r=100 (nearly flat)
+    KNdSMetric bh(1.0, 0.0, 0.0, 0.0);
+    FallingParams fp; fp.bh = bh; fp.r_start=100.0; fp.E=1.0;
+    CameraState cs = init_worldline(fp);
+    double e[4][4];
+    build_tetrad(cs, bh, e);
+    // Save e[1] and e[2] before roll
+    double e1_before[4], e2_before[4];
+    for (int mu=0;mu<4;++mu) { e1_before[mu]=e[1][mu]; e2_before[mu]=e[2][mu]; }
+    double e0_before[4], e3_before[4];
+    for (int mu=0;mu<4;++mu) { e0_before[mu]=e[0][mu]; e3_before[mu]=e[3][mu]; }
+    // Roll by π/2: ê_1' = ê_2, ê_2' = -ê_1
+    apply_roll(e, M_PI/2.0);
+    for (int mu=0;mu<4;++mu) {
+        if (!approx(e[1][mu], e2_before[mu], 1e-12)) {
+            std::cerr<<"FAIL apply_roll e[1] after π/2, mu="<<mu<<"\n"; return false;
+        }
+        if (!approx(e[2][mu], -e1_before[mu], 1e-12)) {
+            std::cerr<<"FAIL apply_roll e[2] after π/2, mu="<<mu<<"\n"; return false;
+        }
+        if (!approx(e[0][mu], e0_before[mu], 1e-12)) {
+            std::cerr<<"FAIL apply_roll modified e[0], mu="<<mu<<"\n"; return false;
+        }
+        if (!approx(e[3][mu], e3_before[mu], 1e-12)) {
+            std::cerr<<"FAIL apply_roll modified e[3], mu="<<mu<<"\n"; return false;
+        }
+    }
+    return true;
+}
+
+bool test_horizon_flip_psi() {
+    // Schwarzschild r_horizon = 2M
+    double r_h = 2.0;
+    // r_far = 4.0, r_near = 1.6
+    // Far: ψ = π
+    if (!approx(horizon_flip_psi(10.0, r_h), M_PI, 1e-12)) {
+        std::cerr<<"FAIL flip_psi far\n"; return false;
+    }
+    // Inside: ψ = 0
+    if (!approx(horizon_flip_psi(0.5, r_h), 0.0, 1e-12)) {
+        std::cerr<<"FAIL flip_psi inside\n"; return false;
+    }
+    // At r_far exactly: ψ = π
+    if (!approx(horizon_flip_psi(4.0, r_h), M_PI, 1e-12)) {
+        std::cerr<<"FAIL flip_psi at r_far\n"; return false;
+    }
+    // At r_near exactly: ψ = 0
+    if (!approx(horizon_flip_psi(1.6, r_h), 0.0, 1e-12)) {
+        std::cerr<<"FAIL flip_psi at r_near\n"; return false;
+    }
+    // Midpoint t=0.5: smoothstep(0.5) = 0.5, ψ = π * 0.5 = π/2
+    double r_mid = 1.6 + 0.5*(4.0 - 1.6); // = 2.8
+    double psi_mid = horizon_flip_psi(r_mid, r_h);
+    if (!approx(psi_mid, M_PI/2.0, 1e-10)) {
+        std::cerr<<"FAIL flip_psi midpoint psi="<<psi_mid<<"\n"; return false;
+    }
+    return true;
+}
+
 int main() {
     int fail=0;
     if (!test_gpg_metric_inverse())  { std::cerr<<"FAIL test_gpg_metric_inverse\n";  ++fail; }
@@ -133,5 +194,9 @@ int main() {
     else std::cout<<"PASS test_worldline_r_decreases\n";
     if (!test_tetrad_orthonormal()) { std::cerr<<"FAIL tetrad_orthonormal\n"; ++fail; }
     else std::cout<<"PASS test_tetrad_orthonormal\n";
+    if (!test_apply_roll())         { std::cerr<<"FAIL apply_roll\n"; ++fail; }
+    else std::cout<<"PASS test_apply_roll\n";
+    if (!test_horizon_flip_psi())   { std::cerr<<"FAIL horizon_flip_psi\n"; ++fail; }
+    else std::cout<<"PASS test_horizon_flip_psi\n";
     return fail;
 }
