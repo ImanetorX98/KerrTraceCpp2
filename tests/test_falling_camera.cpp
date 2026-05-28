@@ -1,4 +1,5 @@
 #include "falling_camera.hpp"
+#include "falling_renderer.hpp"
 #include "knds_metric.hpp"
 #include <cmath>
 #include <iostream>
@@ -178,6 +179,27 @@ bool test_horizon_flip_psi() {
     return true;
 }
 
+// Test 10: center pixel photon is null
+bool test_photon_null() {
+    KNdSMetric bh(1.0, 0.9, 0.0, 0.0);
+    FallingParams fp; fp.bh = bh; fp.r_start=5.0; fp.E=1.0;
+    CameraState cs = init_worldline(fp);
+    double e[4][4];
+    build_tetrad(cs, bh, e);
+    double k[4];
+    init_photon_k(cs, e, bh, fp.width/2, fp.height/2,
+                  fp.width, fp.height, fp.fov_h, k);
+    double gLL[4][4];
+    gpg_covariant(bh, cs.x[1], cs.x[2], gLL);
+    double norm=0.0;
+    for (int mu=0;mu<4;++mu) for (int nu=0;nu<4;++nu)
+        norm += gLL[mu][nu]*k[mu]*k[nu];
+    if (!approx(norm, 0.0, 1e-6)) {
+        std::cerr<<"FAIL photon null residual="<<norm<<"\n"; return false;
+    }
+    return true;
+}
+
 int main() {
     int fail=0;
     if (!test_gpg_metric_inverse())  { std::cerr<<"FAIL test_gpg_metric_inverse\n";  ++fail; }
@@ -198,5 +220,7 @@ int main() {
     else std::cout<<"PASS test_apply_roll\n";
     if (!test_horizon_flip_psi())   { std::cerr<<"FAIL horizon_flip_psi\n"; ++fail; }
     else std::cout<<"PASS test_horizon_flip_psi\n";
+    if (!test_photon_null())  { std::cerr<<"FAIL photon_null\n";  ++fail; }
+    else std::cout<<"PASS test_photon_null\n";
     return fail;
 }
