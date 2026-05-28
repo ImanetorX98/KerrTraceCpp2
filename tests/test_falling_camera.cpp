@@ -68,6 +68,34 @@ bool test_worldline_killing_energy() {
     return true;
 }
 
+bool test_worldline_step_stays_normalized() {
+    KNdSMetric bh(1.0, 0.9, 0.0, 0.0);
+    FallingParams fp; fp.bh = bh; fp.r_start = 15.0; fp.E = 1.0; fp.L = 0.0; fp.Qc = 0.0;
+    CameraState cs = init_worldline(fp);
+    for (int i=0;i<10;++i) cs = step_worldline(cs, bh, 0.05);
+    double gLL[4][4];
+    gpg_covariant(bh, cs.x[1], cs.x[2], gLL);
+    double norm=0.0;
+    for (int mu=0;mu<4;++mu)
+        for (int nu=0;nu<4;++nu) norm += gLL[mu][nu]*cs.u[mu]*cs.u[nu];
+    if (!approx(norm, -1.0, 1e-5)) {
+        std::cerr<<"FAIL step norm="<<norm<<"\n"; return false;
+    }
+    return true;
+}
+
+bool test_worldline_r_decreases() {
+    KNdSMetric bh(1.0, 0.5, 0.0, 0.0);
+    FallingParams fp; fp.bh = bh; fp.r_start = 20.0; fp.E = 1.0; fp.L = 0.0; fp.Qc = 0.0;
+    CameraState cs = init_worldline(fp);
+    double r0 = cs.x[1];
+    for (int i=0;i<20;++i) cs = step_worldline(cs, bh, 0.1);
+    if (cs.x[1] >= r0) {
+        std::cerr<<"FAIL r did not decrease: "<<r0<<" -> "<<cs.x[1]<<"\n"; return false;
+    }
+    return true;
+}
+
 int main() {
     int fail=0;
     if (!test_gpg_metric_inverse())  { std::cerr<<"FAIL test_gpg_metric_inverse\n";  ++fail; }
@@ -78,5 +106,9 @@ int main() {
     else std::cout<<"PASS test_worldline_init_normalized\n";
     if (!test_worldline_killing_energy())  { std::cerr<<"FAIL killing_energy\n";       ++fail; }
     else std::cout<<"PASS test_worldline_killing_energy\n";
+    if (!test_worldline_step_stays_normalized()) { std::cerr<<"FAIL step_normalized\n"; ++fail; }
+    else std::cout<<"PASS test_worldline_step_stays_normalized\n";
+    if (!test_worldline_r_decreases())           { std::cerr<<"FAIL r_decreases\n";     ++fail; }
+    else std::cout<<"PASS test_worldline_r_decreases\n";
     return fail;
 }

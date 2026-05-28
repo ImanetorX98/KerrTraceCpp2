@@ -162,3 +162,94 @@ inline CameraState init_worldline(const FallingParams& fp) {
     cs.u[3] = gUU[3][0]*uT_low + gUU[3][1]*ur_low + gUU[3][3]*uph_low;
     return cs;
 }
+
+// ── Numerical Christoffel Γ^μ_{αβ} from GPG metric ───────────────────────────
+// Central finite differences. Gamma[mu][alpha][beta].
+inline void gpg_christoffel(const KNdSMetric& bh, double r, double th,
+                             double Gamma[4][4][4])
+{
+    const double hr = r  * 1e-5 + 1e-9;
+    const double ht = 1e-5;
+
+    double gp[4][4], gm[4][4], gtp[4][4], gtm[4][4];
+    gpg_covariant(bh, r+hr, th,    gp);
+    gpg_covariant(bh, r-hr, th,    gm);
+    gpg_covariant(bh, r,    th+ht, gtp);
+    gpg_covariant(bh, r,    th-ht, gtm);
+
+    // dg[coord][mu][nu]: coord=0→T(not computed,stationary), 1→r, 2→θ, 3→φ(not computed,axisymmetric)
+    double dg[4][4][4] = {};
+    for (int i=0;i<4;++i) for (int j=0;j<4;++j) {
+        dg[1][i][j] = (gp[i][j] - gm[i][j]) / (2.0*hr);
+        dg[2][i][j] = (gtp[i][j]- gtm[i][j])/ (2.0*ht);
+        // dg[0] and dg[3] remain zero (stationary + axisymmetric metric)
+    }
+
+    double gUU[4][4];
+    gpg_contravariant(bh, r, th, gUU);
+
+    for (int mu=0;mu<4;++mu)
+        for (int al=0;al<4;++al)
+            for (int be=0;be<4;++be) {
+                double s=0.0;
+                for (int nu=0;nu<4;++nu)
+                    s += gUU[mu][nu]*(dg[al][nu][be] + dg[be][nu][al] - dg[nu][al][be]);
+                Gamma[mu][al][be] = 0.5*s;
+            }
+}
+
+// ── RK4 step for worldline ────────────────────────────────────────────────────
+inline CameraState step_worldline(const CameraState& cs,
+                                   const KNdSMetric& bh, double dtau)
+{
+    auto deriv = [&](const CameraState& s, double dxdt[4], double dudt[4]) {
+        double Gamma[4][4][4];
+        gpg_christoffel(bh, s.x[1], s.x[2], Gamma);
+        for (int mu=0;mu<4;++mu) {
+            dxdt[mu] = s.u[mu];
+            double acc=0.0;
+            for (int al=0;al<4;++al)
+                for (int be=0;be<4;++be)
+                    acc -= Gamma[mu][al][be]*s.u[al]*s.u[be];
+            dudt[mu] = acc;
+        }
+    };
+
+    double dx1[4],du1[4], dx2[4],du2[4], dx3[4],du3[4], dx4[4],du4[4];
+    CameraState tmp;
+
+    deriv(cs, dx1, du1);
+    for (int i=0;i<4;++i){tmp.x[i]=cs.x[i]+0.5*dtau*dx1[i]; tmp.u[i]=cs.u[i]+0.5*dtau*du1[i];}
+    deriv(tmp, dx2, du2);
+    for (int i=0;i<4;++i){tmp.x[i]=cs.x[i]+0.5*dtau*dx2[i]; tmp.u[i]=cs.u[i]+0.5*dtau*du2[i];}
+    deriv(tmp, dx3, du3);
+    for (int i=0;i<4;++i){tmp.x[i]=cs.x[i]+dtau*dx3[i]; tmp.u[i]=cs.u[i]+dtau*du3[i];}
+    deriv(tmp, dx4, du4);
+
+    CameraState next;
+    for (int i=0;i<4;++i) {
+        next.x[i] = cs.x[i] + (dtau/6.0)*(dx1[i]+2*dx2[i]+2*dx3[i]+dx4[i]);
+        next.u[i] = cs.u[i] + (dtau/6.0)*(du1[i]+2*du2[i]+2*du3[i]+du4[i]);
+    }
+
+    // Normalization re-projection: adjust u^r so g_μν u^μ u^ν = -1
+    {
+        double gLL[4][4], gUU[4][4];
+        gpg_covariant(bh, next.x[1], next.x[2], gLL);
+        gpg_contravariant(bh, next.x[1], next.x[2], gUU);
+        double C=0.0;
+        for (int mu=0;mu<4;++mu) for (int nu=0;nu<4;++nu) {
+            if (mu==1||nu==1) continue;
+            C += gLL[mu][nu]*next.u[mu]*next.u[nu];
+        }
+        const double A2 = gLL[1][1];
+        const double B2 = 2.0*(gLL[1][0]*next.u[0]+gLL[1][2]*next.u[2]+gLL[1][3]*next.u[3]);
+        const double disc2 = B2*B2 - 4.0*A2*(C+1.0);
+        if (disc2 >= 0.0) {
+            const double ur_neg = (-B2 - std::sqrt(disc2))/(2.0*A2);
+            const double ur_pos = (-B2 + std::sqrt(disc2))/(2.0*A2);
+            next.u[1] = (next.u[1] < 0.0) ? ur_neg : ur_pos;
+        }
+    }
+    return next;
+}
