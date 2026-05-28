@@ -23,7 +23,7 @@ struct FallingCameraParams_C {
     float r_switch_factor;  // pixels with r_min < factor*r_horizon → CPU re-trace
     int   max_steps;        // hard cap (GPU path: 20000)
     int   width, height;
-    int   pad;              // 16-byte alignment
+    int   pad[3];           // pad to 16-byte boundary (148 + 12 = 160 bytes)
 };
 
 // Build FallingCameraParams_C from C++ types (casts double→float).
