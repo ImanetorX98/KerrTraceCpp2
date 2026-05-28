@@ -109,7 +109,8 @@ struct FallingParams {
     double r_disk_out  = 12.0;
     double r_escape    = 200.0;
     double r_singularity = 0.05;
-    double disk_brightness = 1.0;
+    double disk_brightness   = 1.0;
+    double r_switch_factor   = 3.0;  // CPU refinement: r_min < factor*r_h → re-trace double
 };
 
 // ── Camera state in GPG coordinates ──────────────────────────────────────────
