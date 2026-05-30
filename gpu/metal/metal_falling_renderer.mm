@@ -114,12 +114,12 @@ FallingCameraParams_C make_falling_metal_params(
     c.fov_h         = float(fp.fov_h);
     c.h0            = 0.05f;
     c.r_switch_factor = float(fp.r_switch_factor);
-    c.max_steps     = 20000;   // GPU cap (lower than CPU 50000; near-horizon pixels
-                                // are refined by CPU pass anyway)
+    c.max_steps     = 50000;   // match CPU cap; near-horizon pixels still refined by CPU
     c.width         = fp.width;
     c.height        = fp.height;
-    c.y_start       = 0;
-    c.pad[0] = c.pad[1] = 0;
+    c.y_start         = 0;
+    c.background_gray = float(fp.background_gray);
+    c.pad[0]          = 0;
     return c;
 }
 

@@ -18,7 +18,9 @@ struct FallingCameraParams {
     float M, a, Q, Lambda;
     float r_in, r_out, r_isco, r_escape, r_singularity, r_horizon;
     float disk_brightness, fov_h, h0, r_switch_factor;
-    int   max_steps, width, height, y_start, pad[2];
+    int   max_steps, width, height, y_start;
+    float background_gray;
+    int   pad[1];
 };
 
 // ── Flat 4×4 index helper ─────────────────────────────────────────────────────
@@ -212,11 +214,13 @@ static void photon_step_f(float M, float a, float Q, float Lambda,
 
 // ── shade_pixel_f: Page-Thorne shading (mirrors shade_falling_pixel in C++) ──
 static uchar4 shade_pixel_f(int outcome, float r_hit, float redshift,
-                              float r_isco, float r_out, float disk_brightness)
+                              float r_isco, float r_out, float disk_brightness,
+                              float background_gray)
 {
     uint8_t R=0, G=0, B=0;
     if (outcome == 0) {
-        R = G = B = 30;
+        uint8_t bg = (uint8_t)clamp(background_gray, 0.0f, 255.0f);
+        R = G = B = bg;
     } else if (outcome == 1) {
         float lum = 0.0f;
         if (r_hit > r_isco && r_hit <= r_out) {
@@ -364,6 +368,7 @@ kernel void trace_falling_pixel(
 
     uint idx = abs_y * uint(fp.width) + gid.x;
     rgb_out [idx] = shade_pixel_f(outcome, r_hit, redshift,
-                                   fp.r_isco, fp.r_out, fp.disk_brightness);
+                                   fp.r_isco, fp.r_out, fp.disk_brightness,
+                                   fp.background_gray);
     rmin_out[idx] = r_min;
 }

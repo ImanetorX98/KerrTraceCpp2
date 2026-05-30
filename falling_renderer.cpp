@@ -197,7 +197,7 @@ shade_falling_pixel(const FallingGeoPixel& pix, const FallingParams& fp,
 {
     uint8_t R=0, G=0, B=0;
     if (pix.outcome == 0) {
-        R = G = B = 30;
+        R = G = B = uint8_t(std::min(255.0, fp.background_gray));
     } else if (pix.outcome == 1) {
         const double r_h  = double(pix.r_hit);
         const double g_rs = double(pix.redshift);
@@ -235,11 +235,21 @@ void render_falling_frame(int frame_idx, int total_frames,
     const int W = fp.width, H = fp.height;
     std::vector<uint8_t> rgb(W * H * 3, 0);
 
-    // Build local tetrad and apply HorizonFlip roll
+    // Build local tetrad
     double e[4][4];
     build_tetrad(cs_at_frame, fp.bh, e);
-    const double psi = horizon_flip_psi(cs_at_frame.x[1], fp.bh.r_horizon());
-    apply_roll(e, psi);
+    if (fp.look_outward) {
+        // Swap e[1] (radial outward) into e[3] (forward slot).
+        // e[3] (phi/azimuthal) moves to e[1] (right slot).
+        // Skip horizon-flip roll: incompatible with outward-facing orientation.
+        double tmp[4];
+        for (int mu=0;mu<4;++mu) tmp[mu]    = e[3][mu];
+        for (int mu=0;mu<4;++mu) e[3][mu]   = e[1][mu];
+        for (int mu=0;mu<4;++mu) e[1][mu]   = tmp[mu];
+    } else {
+        const double psi = horizon_flip_psi(cs_at_frame.x[1], fp.bh.r_horizon());
+        apply_roll(e, psi);
+    }
 
     // Pre-compute disk ISCO for Phase B shading
     const double r_isco_val = fp.bh.r_isco();

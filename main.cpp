@@ -3280,6 +3280,8 @@ int main(int argc, char** argv) {
     int    fall_frames     = 120;
     double fall_dtau       = 0.1;
     double fall_r_switch   = -1.0;  // <0 → use FallingParams default (3.0)
+    double fall_bg_gray    = -1.0;  // <0 → use FallingParams default (30.0)
+    bool   fall_look_out   = false;
 
     // ── Two-phase modes ───────────────────────────────────────
     bool        geo_only    = false;
@@ -3527,6 +3529,8 @@ int main(int argc, char** argv) {
         if (arg=="--fall-frames"  && i+1<argc)  fall_frames     = std::stoi(argv[++i]);
         if (arg=="--fall-dtau"    && i+1<argc)  fall_dtau       = std::stod(argv[++i]);
         if (arg=="--fall-r-switch"&& i+1<argc)  fall_r_switch   = std::stod(argv[++i]);
+        if (arg=="--fall-bg"      && i+1<argc)  fall_bg_gray    = std::stod(argv[++i]);
+        if (arg=="--fall-look-out")              fall_look_out   = true;
     }
 
     cp.disk_brightness = std::max(0.0, cli_disk_brightness);
@@ -3779,7 +3783,9 @@ int main(int argc, char** argv) {
         fpar.dtau           = fall_dtau;
         fpar.r_disk_out     = arg_disk_out * M_bh;
         fpar.disk_brightness= cp.disk_brightness;
-        if (fall_r_switch >= 0.0) fpar.r_switch_factor = fall_r_switch;
+        if (fall_r_switch >= 0.0) fpar.r_switch_factor  = fall_r_switch;
+        if (fall_bg_gray  >= 0.0) fpar.background_gray  = fall_bg_gray;
+        fpar.look_outward = fall_look_out;
 
         const std::string fall_dir = std::string(OUT_DIR) + "/falling/" + make_ts();
         std::filesystem::create_directories(fall_dir);
