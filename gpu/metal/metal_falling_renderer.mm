@@ -118,8 +118,8 @@ FallingCameraParams_C make_falling_metal_params(
     c.width         = fp.width;
     c.height        = fp.height;
     c.y_start         = 0;
-    c.background_gray = float(fp.background_gray);
-    c.pad[0]          = 0;
+    c.background_gray      = float(fp.background_gray);
+    c.interstellar_palette = fp.interstellar_palette ? 1 : 0;
     return c;
 }
 

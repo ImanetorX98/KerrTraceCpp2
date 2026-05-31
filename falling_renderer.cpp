@@ -210,17 +210,44 @@ shade_falling_pixel(const FallingGeoPixel& pix, const FallingParams& fp,
             const double lum_peak = (1.0 - x_peak) / (r_peak*r_peak*r_peak);
             if (lum_peak > 1e-30) lum /= lum_peak;
             lum *= std::pow(std::max(g_rs, 0.0), 4.0);
-            lum  = std::min(lum * fp.disk_brightness, 1.0);
+            lum *= fp.disk_brightness;  // clamp deferred to palette branch
         }
-        const float fl = float(lum);
-        if (g_rs > 1.0) {
-            R = uint8_t(std::min(255.0f, 255.0f * fl));
-            G = uint8_t(std::min(255.0f, 210.0f * fl));
-            B = uint8_t(std::min(255.0f, 100.0f * fl));
+        if (fp.interstellar_palette) {
+            // Thermal gradient: inner warm-gold → orange → dark red outer
+            const double x_n = std::max(0.0, std::min(1.0,
+                (r_h - r_isco_val) / std::max(fp.r_disk_out - r_isco_val, 1e-12)));
+            auto ss = [](double lo, double hi, double v) -> double {
+                double t = std::max(0.0, std::min(1.0, (v - lo) / (hi - lo)));
+                return t * t * (3.0 - 2.0 * t);
+            };
+            const double t1 = ss(0.08, 0.38, x_n);
+            double cr = 1.0;
+            double cg = 0.82 + (0.32 - 0.82) * t1;
+            double cb = 0.45 + (0.06 - 0.45) * t1;
+            const double t2 = ss(0.35, 1.0, x_n);
+            cr += (0.16 - cr) * t2;
+            cg += (0.045 - cg) * t2;
+            cb += (0.018 - cb) * t2;
+            // Reinhard tonemap + gamma 2.2
+            auto tonemap_gam = [](double v) -> double {
+                double t = v / (1.0 + v);
+                return std::pow(std::max(t, 0.0), 1.0 / 2.2);
+            };
+            R = uint8_t(std::min(255.0, 255.0 * tonemap_gam(cr * lum)));
+            G = uint8_t(std::min(255.0, 255.0 * tonemap_gam(cg * lum)));
+            B = uint8_t(std::min(255.0, 255.0 * tonemap_gam(cb * lum)));
         } else {
-            R = uint8_t(std::min(255.0f, 220.0f * fl));
-            G = uint8_t(std::min(255.0f, 100.0f * fl * float(g_rs)));
-            B = 0;
+            lum = std::min(lum, 1.0);
+            const float fl = float(lum);
+            if (g_rs > 1.0) {
+                R = uint8_t(std::min(255.0f, 255.0f * fl));
+                G = uint8_t(std::min(255.0f, 210.0f * fl));
+                B = uint8_t(std::min(255.0f, 100.0f * fl));
+            } else {
+                R = uint8_t(std::min(255.0f, 220.0f * fl));
+                G = uint8_t(std::min(255.0f, 100.0f * fl * float(g_rs)));
+                B = 0;
+            }
         }
     }
     return {R, G, B};

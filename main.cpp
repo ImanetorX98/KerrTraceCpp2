@@ -3282,6 +3282,7 @@ int main(int argc, char** argv) {
     double fall_r_switch   = -1.0;  // <0 → use FallingParams default (3.0)
     double fall_bg_gray    = -1.0;  // <0 → use FallingParams default (30.0)
     bool   fall_look_out   = false;
+    bool   fall_interstellar = false;
 
     // ── Two-phase modes ───────────────────────────────────────
     bool        geo_only    = false;
@@ -3531,6 +3532,10 @@ int main(int argc, char** argv) {
         if (arg=="--fall-r-switch"&& i+1<argc)  fall_r_switch   = std::stod(argv[++i]);
         if (arg=="--fall-bg"      && i+1<argc)  fall_bg_gray    = std::stod(argv[++i]);
         if (arg=="--fall-look-out")              fall_look_out   = true;
+        if (arg=="--fall-palette"  && i+1<argc) {
+            std::string pal = argv[++i];
+            if (pal == "interstellar") fall_interstellar = true;
+        }
     }
 
     cp.disk_brightness = std::max(0.0, cli_disk_brightness);
@@ -3785,7 +3790,8 @@ int main(int argc, char** argv) {
         fpar.disk_brightness= cp.disk_brightness;
         if (fall_r_switch >= 0.0) fpar.r_switch_factor  = fall_r_switch;
         if (fall_bg_gray  >= 0.0) fpar.background_gray  = fall_bg_gray;
-        fpar.look_outward = fall_look_out;
+        fpar.look_outward         = fall_look_out;
+        fpar.interstellar_palette = fall_interstellar;
 
         const std::string fall_dir = std::string(OUT_DIR) + "/falling/" + make_ts();
         std::filesystem::create_directories(fall_dir);

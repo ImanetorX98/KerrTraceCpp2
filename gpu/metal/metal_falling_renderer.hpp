@@ -24,8 +24,8 @@ struct FallingCameraParams_C {
     int   max_steps;        // hard cap (GPU path: 20000)
     int   width, height;
     int   y_start;          // first row of this tile (tiled dispatch to avoid GPU watchdog)
-    float background_gray;  // escaped-photon brightness [0-255]
-    int   pad[1];           // pad to 16-byte boundary (156 + 4 = 160 bytes)
+    float background_gray;    // escaped-photon brightness [0-255]
+    int   interstellar_palette; // 1 → thermal gradient (gold→orange→dark red)
 };
 
 // Build FallingCameraParams_C from C++ types (casts double→float).

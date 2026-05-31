@@ -20,7 +20,7 @@ struct FallingCameraParams {
     float disk_brightness, fov_h, h0, r_switch_factor;
     int   max_steps, width, height, y_start;
     float background_gray;
-    int   pad[1];
+    int   interstellar_palette;
 };
 
 // ── Flat 4×4 index helper ─────────────────────────────────────────────────────
@@ -213,9 +213,14 @@ static void photon_step_f(float M, float a, float Q, float Lambda,
 }
 
 // ── shade_pixel_f: Page-Thorne shading (mirrors shade_falling_pixel in C++) ──
+static float ss_f(float lo, float hi, float v) {
+    float t = clamp((v - lo) / (hi - lo), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
 static uchar4 shade_pixel_f(int outcome, float r_hit, float redshift,
                               float r_isco, float r_out, float disk_brightness,
-                              float background_gray)
+                              float background_gray, int interstellar_palette)
 {
     uint8_t R=0, G=0, B=0;
     if (outcome == 0) {
@@ -231,16 +236,37 @@ static uchar4 shade_pixel_f(int outcome, float r_hit, float redshift,
             float lum_peak = (1.0f - x_peak) / (r_peak*r_peak*r_peak);
             if (lum_peak > 1e-30f) lum /= lum_peak;
             lum *= pow(max(redshift, 0.0f), 4.0f);
-            lum  = min(lum * disk_brightness, 1.0f);
+            lum *= disk_brightness;
         }
-        if (redshift > 1.0f) {
-            R = (uint8_t)min(255.0f, 255.0f * lum);
-            G = (uint8_t)min(255.0f, 210.0f * lum);
-            B = (uint8_t)min(255.0f, 100.0f * lum);
+        if (interstellar_palette) {
+            // Thermal gradient: inner warm-gold → orange → dark red outer
+            float x_n = clamp((r_hit - r_isco) / max(r_out - r_isco, 1e-12f), 0.0f, 1.0f);
+            float t1 = ss_f(0.08f, 0.38f, x_n);
+            float cr = 1.0f;
+            float cg = 0.82f + (0.32f - 0.82f) * t1;
+            float cb = 0.45f + (0.06f - 0.45f) * t1;
+            float t2 = ss_f(0.35f, 1.0f, x_n);
+            cr += (0.16f - cr) * t2;
+            cg += (0.045f - cg) * t2;
+            cb += (0.018f - cb) * t2;
+            // Reinhard tonemap + gamma 2.2
+            float vr = lum > 0.0f ? pow(cr * lum / (1.0f + cr * lum), 1.0f / 2.2f) : 0.0f;
+            float vg = lum > 0.0f ? pow(cg * lum / (1.0f + cg * lum), 1.0f / 2.2f) : 0.0f;
+            float vb = lum > 0.0f ? pow(cb * lum / (1.0f + cb * lum), 1.0f / 2.2f) : 0.0f;
+            R = (uint8_t)min(255.0f, 255.0f * vr);
+            G = (uint8_t)min(255.0f, 255.0f * vg);
+            B = (uint8_t)min(255.0f, 255.0f * vb);
         } else {
-            R = (uint8_t)min(255.0f, 220.0f * lum);
-            G = (uint8_t)min(255.0f, 100.0f * lum * redshift);
-            B = 0;
+            lum = min(lum, 1.0f);
+            if (redshift > 1.0f) {
+                R = (uint8_t)min(255.0f, 255.0f * lum);
+                G = (uint8_t)min(255.0f, 210.0f * lum);
+                B = (uint8_t)min(255.0f, 100.0f * lum);
+            } else {
+                R = (uint8_t)min(255.0f, 220.0f * lum);
+                G = (uint8_t)min(255.0f, 100.0f * lum * redshift);
+                B = 0;
+            }
         }
     }
     // outcome 2 (singularity), 3 (trapped) → black
@@ -369,6 +395,6 @@ kernel void trace_falling_pixel(
     uint idx = abs_y * uint(fp.width) + gid.x;
     rgb_out [idx] = shade_pixel_f(outcome, r_hit, redshift,
                                    fp.r_isco, fp.r_out, fp.disk_brightness,
-                                   fp.background_gray);
+                                   fp.background_gray, fp.interstellar_palette);
     rmin_out[idx] = r_min;
 }

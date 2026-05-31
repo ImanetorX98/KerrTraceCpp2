@@ -111,8 +111,9 @@ struct FallingParams {
     double r_singularity = 0.05;
     double disk_brightness   = 1.0;
     double r_switch_factor   = 3.0;  // CPU refinement: r_min < factor*r_h → re-trace double
-    double background_gray   = 30.0; // escaped-photon background brightness [0-255]
-    bool   look_outward      = false; // true → camera faces radially outward (+r), no horizon flip
+    double background_gray      = 30.0;  // escaped-photon background brightness [0-255]
+    bool   look_outward         = false; // true → camera faces radially outward (+r), no horizon flip
+    bool   interstellar_palette = false; // true → thermal gradient (gold→orange→dark red)
 };
 
 // ── Camera state in GPG coordinates ──────────────────────────────────────────
