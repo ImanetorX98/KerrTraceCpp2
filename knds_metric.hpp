@@ -325,43 +325,73 @@ public:
             double z2 = std::sqrt(3.0*ap*ap + z1*z1);
             return M*(3.0 + z2 - std::sqrt((3.0-z1)*(3.0+z1+2.0*z2)));
         }
-        // General: find innermost stable circular orbit numerically
-        // dL_circ/dr = 0  (L = specific angular momentum of circular orbit)
+        // General: find innermost stable circular orbit numerically.
+        // L_circ(r) comes from +∞ at the photon sphere, descends to a minimum
+        // at the ISCO, then rises again.  Detect the minimum by the sign change
+        // of dL/dr: negative → positive.  The old condition (L < L_prev) fired
+        // immediately after the photon sphere, returning ~3M instead of ~6M.
         double rh  = r_horizon();
         double r   = rh * 1.05;
         double dr  = 1e-4*M;
+        // keplerian_omega() returns −Ω_K (negative for a>0) to match disk_redshift
+        // convention.  L_circ needs the PHYSICAL prograde Ω_K > 0.
+        // u^t normalisation: N² = −(g_tt + 2 g_tφ Ω_K + g_φφ Ω_K²) > 0
+        // Specific angular momentum: L = u_φ = (g_tφ + g_φφ Ω_K) u^t
         auto L_circ = [&](double rr) -> double {
-            double Omega = keplerian_omega(rr);
+            const double Omega_K = -keplerian_omega(rr);   // physical prograde Ω > 0
             double gLL[4][4];
             covariant_BL(rr, M_PI/2.0, gLL);
-            double N2 = -(gLL[0][0] + 2.0*gLL[0][3]*Omega + gLL[3][3]*Omega*Omega);
+            double N2 = -(gLL[0][0] + 2.0*gLL[0][3]*Omega_K + gLL[3][3]*Omega_K*Omega_K);
             if (N2 <= 0.0) return -1e30;
             double ut = 1.0/std::sqrt(N2);
-            return -(gLL[3][0] + gLL[3][3]*Omega)*ut;
+            return (gLL[3][0] + gLL[3][3]*Omega_K)*ut;
         };
-        double L_prev = L_circ(r);
+        double L_prev  = L_circ(r);
+        double dL_prev = 0.0;
         for (; r < 30.0*M; r += dr) {
-            double L = L_circ(r + dr);
-            if (L < L_prev && L_prev > 0.0) return r; // passed the minimum
-            L_prev = L;
+            double L  = L_circ(r + dr);
+            double dL = L - L_prev;
+            if (dL_prev < 0.0 && dL >= 0.0 && L_prev > 0.0) return r;
+            dL_prev = dL;
+            L_prev  = L;
         }
         return r;  // fallback
     }
 
     /// Prograde Keplerian Ω_K  (equatorial, circular orbit)
-    //  For KNdS: Ω_K = [M − Q²/(2r) + Λar²/3] / [r^{3/2} + a·√(M − Q²/(2r))]
-    //  (reduces to standard Kerr formula for Q=Λ=0)
+    //
+    //  Circular orbit condition (r-geodesic eq., u^r=u^θ=0):
+    //    ∂_r g_φφ · Ω�� + 2∂_r g_tφ · Ω + ∂_r g_tt = 0
+    //  Prograde root: Ω_+ = (−∂_r g_tφ + √disc) / ∂_r g_φφ  (a≥0)
+    //                 Ω_− = (−∂_r g_tφ − √disc) / ∂_r g_φφ  (a<0)
+    //  Returns −Ω_K so that disk_redshift can use Omega = −keplerian_omega > 0.
+    //
+    //  For Q=Λ=0: uses the exact analytical Kerr formula (no FD overhead).
     double keplerian_omega(double r) const {
-        // Prograde (corotating with BH spin) Keplerian angular velocity.
-        // Returns s·√Meff/(r^{3/2}+|a|·√Meff), s=sign(-a).
-        // Negative for a>0 so disk_redshift negates → Ω>0 prograde.
-        // Denominator uses |a| (not s·a) per DNGR Eq. A.7: Ω=1/(r^{3/2}+a).
-        const double s = (a < 0.0) ? 1.0 : -1.0;
-        const double Meff = M - Q*Q/(2.0*r) + Lambda*a*r*r/3.0;
-        const double sq   = std::sqrt(std::max(Meff, 0.0));
-        const double den  = r*std::sqrt(r) + std::abs(a)*sq;
-        if (std::abs(den) < 1e-14) return 0.0;
-        return s * sq / den;
+        if (std::abs(Lambda) < 1e-15 && std::abs(Q) < 1e-15) {
+            // Exact Kerr formula
+            const double s  = (a < 0.0) ? 1.0 : -1.0;
+            const double sq = std::sqrt(std::max(M, 0.0));
+            const double den = r*std::sqrt(r) + std::abs(a)*sq;
+            if (std::abs(den) < 1e-14) return 0.0;
+            return s * sq / den;
+        }
+        // General KNdS: metric-derivative quadratic via central differences
+        const double eps = 1e-5 * std::max(r, M);
+        double gp[4][4], gm[4][4];
+        covariant_BL(r + eps, M_PI/2.0, gp);
+        covariant_BL(r - eps, M_PI/2.0, gm);
+        const double dg_tt   = (gp[0][0] - gm[0][0]) / (2.0*eps);
+        const double dg_tph  = (gp[0][3] - gm[0][3]) / (2.0*eps);
+        const double dg_phph = (gp[3][3] - gm[3][3]) / (2.0*eps);
+        const double disc = dg_tph*dg_tph - dg_tt*dg_phph;
+        if (disc < 0.0 || std::abs(dg_phph) < 1e-20) return 0.0;
+        const double sq = std::sqrt(disc);
+        // Prograde root corotates with spin: Ω_+ for a≥0, Ω_− for a<0
+        const double Omega_K = (a >= 0.0)
+            ? (-dg_tph + sq) / dg_phph
+            : (-dg_tph - sq) / dg_phph;
+        return -Omega_K;  // convention: disk_redshift uses Omega = -keplerian_omega
     }
 
     // ── BL ↔ KS Cartesian coordinate transforms (Λ=0) ─────────
