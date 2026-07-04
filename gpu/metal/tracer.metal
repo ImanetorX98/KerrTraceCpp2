@@ -110,13 +110,7 @@ static float Delta_th(float theta, float a, float L) {
 }
 static float Xi(float a, float L) { return 1.0f + L*a*a/3.0f; }
 
-static float keplerian_omega(float r, float M, float a, float Q, float L) {
-    const float s    = (a < 0.0f) ? 1.0f : -1.0f;
-    const float Meff = M - Q*Q/(2.0f*r) + L*a*r*r/3.0f;
-    const float sq   = sqrt(max(Meff, 0.0f));
-    const float den  = r*sqrt(r) + abs(a)*sq;  // |a| per DNGR Eq. A.7: Ω=1/(r^{3/2}+a)
-    return (abs(den) > 1e-12f) ? (s*sq/den) : 0.0f;
-}
+// keplerian_omega defined after gLL_BL (forward ref needed in MSL)
 
 // Contravariant metric g^μν components in BL
 static void gUU(float r, float theta,
@@ -478,6 +472,31 @@ static void gLL_BL(float r, float theta,
     gll[1][1] = sig/dr;
     gll[2][2] = sig/dth;
     gll[3][3] = st2*(dth*r2a2*r2a2 - dr*a*a*st2) / pre;
+}
+
+static float keplerian_omega(float r, float M, float a, float Q, float L) {
+    // Q=Λ=0: exact Kerr formula
+    if (abs(L) < 1e-15f && abs(Q) < 1e-15f) {
+        const float s   = (a < 0.0f) ? 1.0f : -1.0f;
+        const float sq  = sqrt(max(M, 0.0f));
+        const float den = r*sqrt(r) + abs(a)*sq;
+        return (abs(den) > 1e-12f) ? (s*sq/den) : 0.0f;
+    }
+    // General KNdS: circular orbit condition ∂_r g_φφ Ω² + 2∂_r g_tφ Ω + ∂_r g_tt = 0
+    const float eps = 1e-5f * max(r, M);
+    float gp[4][4], gm[4][4];
+    gLL_BL(r + eps, M_PI_2_F, M, a, Q, L, gp);
+    gLL_BL(r - eps, M_PI_2_F, M, a, Q, L, gm);
+    const float dg_tt   = (gp[0][0] - gm[0][0]) / (2.0f*eps);
+    const float dg_tph  = (gp[0][3] - gm[0][3]) / (2.0f*eps);
+    const float dg_phph = (gp[3][3] - gm[3][3]) / (2.0f*eps);
+    const float disc = dg_tph*dg_tph - dg_tt*dg_phph;
+    if (disc < 0.0f || abs(dg_phph) < 1e-20f) return 0.0f;
+    const float sq = sqrt(disc);
+    const float Omega_K = (a >= 0.0f)
+        ? (-dg_tph + sq) / dg_phph
+        : (-dg_tph - sq) / dg_phph;
+    return -Omega_K;
 }
 
 // ── Kerr-Schild (Lambda=0) helpers ────────────────────────────
