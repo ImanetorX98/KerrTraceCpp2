@@ -281,11 +281,12 @@ inline bool rk4_adaptive(const KNdSMetric& g, GeodesicState& s,
 //  k7_out (= f at accepted end) to feed as k1 of the next call.
 //  On first call set k1_fsal = {NaN,…} to trigger recomputation.
 
+// v[0]=dr  v[1]=dθ  v[2]=dp_r  v[3]=dp_θ  v[4]=dφ
 struct Vec4d {
-    double v[4];
+    double v[5];
     static Vec4d nan_init() {
         Vec4d x;
-        x.v[0] = x.v[1] = x.v[2] = x.v[3] = std::numeric_limits<double>::quiet_NaN();
+        x.v[0]=x.v[1]=x.v[2]=x.v[3]=x.v[4]=std::numeric_limits<double>::quiet_NaN();
         return x;
     }
 };
@@ -294,9 +295,10 @@ inline void eval_rhs(const KNdSMetric& g, const GeodesicState& s,
                      Vec4d& k) {
     geodesic_rhs(g, s.r, s.theta, s.pr, s.ptheta, s.pt, s.pphi,
                  k.v[0], k.v[1], k.v[2], k.v[3]);
+    k.v[4] = dphi_vel(g, s.r, s.theta, s.pt, s.pphi);
 }
 
-// Advance state by weighted sum of stages
+// Advance state by weighted sum of stages (includes φ via v[4])
 inline GeodesicState advance(const GeodesicState& s0, double h,
                               const Vec4d* ks, const double* w, int nk) {
     GeodesicState s = s0;
@@ -305,6 +307,7 @@ inline GeodesicState advance(const GeodesicState& s0, double h,
         s.theta  += h * w[i] * ks[i].v[1];
         s.pr     += h * w[i] * ks[i].v[2];
         s.ptheta += h * w[i] * ks[i].v[3];
+        s.phi    += h * w[i] * ks[i].v[4];
     }
     return s;
 }
