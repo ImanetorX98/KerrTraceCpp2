@@ -67,7 +67,7 @@ template<class T> static T clamp(T v, T lo, T hi) {
 struct RGB { uint8_t r, g, b; };
 
 // ── Colorization parameters (Phase 2 controls) ───────────────
-enum class DiskPalette { BLACKBODY, STRATIFIED, INTERSTELLAR };
+enum class DiskPalette { BLACKBODY, STRATIFIED, INTERSTELLAR, INTERSTELLAR_NASA };
 enum class DiskRadialProfile { PAGE_THORNE, PHYSICAL_NT };
 
 struct ColorParams {
@@ -556,7 +556,8 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                     if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
                         pass_through = stratified_disk_tile_transparent(
                             r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr);
-                    } else if (cp_ptr && cp_ptr->palette == DiskPalette::INTERSTELLAR) {
+                    } else if (cp_ptr && (cp_ptr->palette == DiskPalette::INTERSTELLAR ||
+                                          cp_ptr->palette == DiskPalette::INTERSTELLAR_NASA)) {
                         pass_through = interstellar_disk_soft_mask(
                             r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
                     }
@@ -867,7 +868,8 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
                     if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
                         pass_through = stratified_disk_tile_transparent(
                             r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr);
-                    } else if (cp_ptr && cp_ptr->palette == DiskPalette::INTERSTELLAR) {
+                    } else if (cp_ptr && (cp_ptr->palette == DiskPalette::INTERSTELLAR ||
+                                          cp_ptr->palette == DiskPalette::INTERSTELLAR_NASA)) {
                         pass_through = interstellar_disk_soft_mask(
                             r_hit, phi_hit, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
                     }
@@ -1836,7 +1838,8 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                     if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
                         pass_through = stratified_disk_tile_transparent(
                             r_hit, ph_hit, r_disk_in, r_disk_out, *cp_ptr);
-                    } else if (cp_ptr && cp_ptr->palette == DiskPalette::INTERSTELLAR) {
+                    } else if (cp_ptr && (cp_ptr->palette == DiskPalette::INTERSTELLAR ||
+                                          cp_ptr->palette == DiskPalette::INTERSTELLAR_NASA)) {
                         pass_through = interstellar_disk_soft_mask(
                             r_hit, ph_hit, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
                     }
@@ -2354,6 +2357,85 @@ static RGB disk_colour_interstellar(double r, double phi,
     };
 }
 
+// NASA Goddard-style accretion disk (Schnittman 2019 visualization).
+// Orange-amber palette, no Doppler (artistic symmetric choice), strong bands.
+static RGB disk_colour_interstellar_nasa(double r, double phi,
+                                         double magnif,
+                                         double r_in, double r_out,
+                                         double r_isco,
+                                         const ColorParams& cp) {
+    const double x = clamp((r - r_in) / std::max(r_out - r_in, 1e-12), 0.0, 1.0);
+    const double t = cp.interstellar_time;
+
+    const double mask = interstellar_disk_soft_mask(r, phi, r_in, r_out, cp);
+    if (mask <= 1e-6) return {0, 0, 0};
+
+    // Keplerian differential rotation advection (same as INTERSTELLAR).
+    const double omega = cp.interstellar_omega0 *
+        std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -1.5);
+    const double phit = phi - omega * t;
+
+    // Power-law only: no exponential inner_glow so the outer disk stays visible.
+    // The NASA render shows significant emission out to large r.
+    const double p = std::max(0.1, cp.interstellar_p);
+    const double profile = std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -p);
+
+    // Low turbulence: NASA viz has smooth, regular banding without swirling.
+    const double n1 = 2.0 * fbm2d(r * 0.7, phit * 5.0, 41.0, 3) - 1.0;
+    const double turb_str = cp.interstellar_turbulence_strength;
+    const double turbulence = 0.88 + turb_str * 0.18 * n1;
+
+    // Strong, regular logarithmic bands – dominant visual of NASA render.
+    const double band_strength  = cp.interstellar_band_strength;
+    const double band_frequency = cp.interstellar_band_frequency;
+    const double band_warp      = cp.interstellar_band_warp;
+    const double bands = 1.0 + band_strength *
+        std::sin(band_frequency * std::log(std::max(r / std::max(r_in, 1e-12), 1e-6))
+                 + band_warp * n1);
+
+    // NASA orange-amber palette: warm-orange core → vivid orange → deep orange-red.
+    // Match Schnittman (2019) NASA Goddard visualization: saturated, no white inner.
+    const double inner_r = 1.00, inner_g = 0.30, inner_b = 0.02;  // vivid orange
+    const double mid_r   = 0.90, mid_g   = 0.17, mid_b   = 0.008; // deep orange
+    const double out_r   = 0.55, out_g   = 0.09, out_b   = 0.003; // burnt orange-red
+
+    const double t1 = smoothstep_range(0.04, 0.25, x);
+    double cr = inner_r + (mid_r - inner_r) * t1;
+    double cg = inner_g + (mid_g - inner_g) * t1;
+    double cb = inner_b + (mid_b - inner_b) * t1;
+    const double t2 = smoothstep_range(0.22, 0.80, x);
+    cr += (out_r - cr) * t2;
+    cg += (out_g - cg) * t2;
+    cb += (out_b - cb) * t2;
+
+    const double lens = clamp(1.0 / std::max(magnif, 1e-6), 0.05, 5.0);
+
+    const double inner_taper_sigma = std::max(1e-6, cp.interstellar_inner_taper_scale * r_in);
+    const double dr_in = std::max(0.0, r - r_in);
+    const double inner_taper = 1.0 - std::exp(-0.5 * (dr_in / inner_taper_sigma) * (dr_in / inner_taper_sigma));
+
+    // No Doppler (artistic symmetric choice matching NASA/Schnittman render).
+    double intensity = mask * profile * turbulence * bands * inner_taper;
+    intensity *= lens;
+    intensity *= cp.interstellar_hdr_intensity;
+    intensity *= std::max(0.0, cp.disk_brightness);
+    if (cp.radial_ring_taper) {
+        const double r0  = cp.radial_ring_taper_use_isco ? r_isco : cp.radial_ring_taper_r0;
+        const double sig = std::max(1e-6, cp.radial_ring_taper_sigma);
+        intensity *= std::exp(-std::abs(r - r0) / sig);
+    }
+    if (cp.zero_torque_taper && r_isco > 0.0 && r > r_isco) {
+        intensity *= 1.0 - std::sqrt(r_isco / r);
+    }
+    intensity = std::max(intensity, 0.0);
+
+    return {
+        (uint8_t)(tonemap(cr * intensity, cp.exposure, cp.gamma) * 255),
+        (uint8_t)(tonemap(cg * intensity, cp.exposure, cp.gamma) * 255),
+        (uint8_t)(tonemap(cb * intensity, cp.exposure, cp.gamma) * 255)
+    };
+}
+
 static RGB disk_colour(double r, double red, double magnif,
                        double M, double a, double r_isco, double r_disk_out,
                        const ColorParams& cp,
@@ -2441,6 +2523,11 @@ static std::vector<RGB> colorize_buffer(
                                                     p.redshift, p.magnif,
                                                     r_disk_in, r_disk_out,
                                                     M_bh, r_isco, cp);
+            } else if (cp.palette == DiskPalette::INTERSTELLAR_NASA) {
+                disk_col = disk_colour_interstellar_nasa(p.r, p.phi_disk,
+                                                         p.magnif,
+                                                         r_disk_in, r_disk_out,
+                                                         r_isco, cp);
             } else {
                 disk_col = disk_colour(p.r, p.redshift, p.magnif,
                                        M_bh, a_bh, r_isco, r_disk_out, cp, flux_ref);
@@ -3386,6 +3473,10 @@ int main(int argc, char** argv) {
         if (arg=="--disk-blackbody")    cp.palette = DiskPalette::BLACKBODY;
         if (arg=="--disk-stratified")   cp.palette = DiskPalette::STRATIFIED;
         if (arg=="--disk-interstellar") cp.palette = DiskPalette::INTERSTELLAR;
+        if (arg=="--disk-nasa") {
+            cp.palette = DiskPalette::INTERSTELLAR_NASA;
+            cli_doppler_enabled = false;  // artistic symmetric choice
+        }
         if (arg=="--disk-radial-profile" && i+1<argc) {
             const std::string mode = argv[++i];
             if (mode=="physical_nt" || mode=="physical-nt" || mode=="nt")
