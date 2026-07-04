@@ -114,7 +114,7 @@ static float keplerian_omega(float r, float M, float a, float Q, float L) {
     const float s    = (a < 0.0f) ? 1.0f : -1.0f;
     const float Meff = M - Q*Q/(2.0f*r) + L*a*r*r/3.0f;
     const float sq   = sqrt(max(Meff, 0.0f));
-    const float den  = r*sqrt(r) + s*a*sq;
+    const float den  = r*sqrt(r) + abs(a)*sq;  // |a| per DNGR Eq. A.7: Ω=1/(r^{3/2}+a)
     return (abs(den) > 1e-12f) ? (s*sq/den) : 0.0f;
 }
 

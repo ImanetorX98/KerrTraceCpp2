@@ -352,12 +352,14 @@ public:
     //  For KNdS: Ω_K = [M − Q²/(2r) + Λar²/3] / [r^{3/2} + a·√(M − Q²/(2r))]
     //  (reduces to standard Kerr formula for Q=Λ=0)
     double keplerian_omega(double r) const {
-        // Screen/sign convention used in this renderer:
-        // keep observed approaching side consistent with +a on the left.
+        // Prograde (corotating with BH spin) Keplerian angular velocity.
+        // Returns s·√Meff/(r^{3/2}+|a|·√Meff), s=sign(-a).
+        // Negative for a>0 so disk_redshift negates → Ω>0 prograde.
+        // Denominator uses |a| (not s·a) per DNGR Eq. A.7: Ω=1/(r^{3/2}+a).
         const double s = (a < 0.0) ? 1.0 : -1.0;
         const double Meff = M - Q*Q/(2.0*r) + Lambda*a*r*r/3.0;
         const double sq   = std::sqrt(std::max(Meff, 0.0));
-        const double den  = r*std::sqrt(r) + s*a*sq;
+        const double den  = r*std::sqrt(r) + std::abs(a)*sq;
         if (std::abs(den) < 1e-14) return 0.0;
         return s * sq / den;
     }
