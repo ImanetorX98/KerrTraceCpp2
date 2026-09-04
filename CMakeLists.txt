@@ -1,10 +1,55 @@
 cmake_minimum_required(VERSION 3.18)
-project(KerrTracer VERSION 0.2.5 LANGUAGES CXX)
+
+# ── Apple Silicon: force a native arm64 build ─────────────────
+# cmake itself may be an x86_64 binary running under Rosetta (e.g. the Intel
+# Homebrew one in /usr/local).  CMake then reports an x86_64 host and defaults
+# the build to "-arch x86_64", producing a translated binary that stops working
+# once Rosetta is removed -- and that first fails to compile anyway, because
+# -march=native resolves to an ARM CPU name the x86_64 backend rejects.
+# hw.optional.arm64 is reported truthfully even under translation, so use it
+# instead of the host processor CMake believes it is running on.
+# Must be set before project() so the compiler checks use the right target.
+if(NOT CMAKE_OSX_ARCHITECTURES AND EXISTS "/usr/sbin/sysctl")
+    execute_process(COMMAND /usr/sbin/sysctl -in hw.optional.arm64
+                    OUTPUT_VARIABLE _kt_hw_arm64
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(_kt_hw_arm64 STREQUAL "1")
+        set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING
+            "macOS build architectures" FORCE)
+    endif()
+endif()
+
+project(KerrTracer VERSION 0.2.6 LANGUAGES CXX)
+
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    message(STATUS "macOS build architecture: ${CMAKE_OSX_ARCHITECTURES}")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
+
+# ── CPU tuning flags ──────────────────────────────────────────
+# -march=native is only valid when the compiler's target arch matches the host.
+# Probe it instead of assuming, and fall back rather than failing the build.
+include(CheckCXXCompilerFlag)
+option(KERRTRACE_NATIVE_ARCH "Tune code generation for the building machine's CPU" ON)
+set(KERRTRACE_ARCH_FLAGS "")
+if(KERRTRACE_NATIVE_ARCH)
+    check_cxx_compiler_flag("-march=native" KT_HAVE_MARCH_NATIVE)
+    if(KT_HAVE_MARCH_NATIVE)
+        set(KERRTRACE_ARCH_FLAGS -march=native)
+    else()
+        check_cxx_compiler_flag("-mcpu=native" KT_HAVE_MCPU_NATIVE)
+        if(KT_HAVE_MCPU_NATIVE)
+            set(KERRTRACE_ARCH_FLAGS -mcpu=native)
+        else()
+            message(STATUS "No usable native CPU tuning flag; building portable code")
+        endif()
+    endif()
+endif()
 
 # ── Backend selection ─────────────────────────────────────────
 option(USE_METAL "Use Metal GPU backend (macOS only)"  OFF)
@@ -55,7 +100,7 @@ target_compile_definitions(kerr_tracer PRIVATE
     OUT_DIR="${CMAKE_SOURCE_DIR}/out")
 
 target_compile_options(kerr_tracer PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>: -O3 -march=native -ffast-math
+    $<$<COMPILE_LANGUAGE:CXX>: -O3 ${KERRTRACE_ARCH_FLAGS} -ffast-math
                                 -Wall -Wextra>)
 
 # Metal framework
@@ -97,7 +142,7 @@ if(APPLE AND NOT USE_METAL)
         USE_METAL
         OUT_DIR="${CMAKE_SOURCE_DIR}/out")
     target_compile_options(kerr_tracer_metal PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -ffast-math -Wall -Wextra>)
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 ${KERRTRACE_ARCH_FLAGS} -ffast-math -Wall -Wextra>)
     target_link_libraries(kerr_tracer_metal PRIVATE
         "-framework Metal"
         "-framework Foundation"
