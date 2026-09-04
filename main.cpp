@@ -2588,6 +2588,8 @@ struct FrameParams {
     double wh_rho        = 1.0;   ///< throat areal radius ρ  [geometric units]
     double wh_a_tunnel   = 0.01;  ///< half-length of cylindrical tunnel a  (Interstellar default)
     double wh_M_lens     = 1.0;   ///< lensing parameter M
+    double wh_look_deg   = 0.0;   ///< boresight rotation away from –ê_ℓ (0=toward wormhole, 90=perpendicular)
+    double wh_sky_dist   = 1.0e4; ///< |ℓ| of the two celestial spheres (paper: ±∞)
 };
 
 // ── Wormhole (DNEG) single-ray tracer ────────────────────────
@@ -2638,8 +2640,12 @@ static std::vector<GeoPixel> trace_geodesics_wormhole(
     KGeoMeta* meta_out)
 {
     DnegParams dp{fp.wh_rho, fp.wh_a_tunnel, fp.wh_M_lens};
-    WormholeCamera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
-    const double escape_radius = fp.r_obs * 1.05;
+    WormholeCamera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H, fp.wh_look_deg);
+    // Celestial spheres live at l = ±infinity (James & Thorne 2015, Fig. 5), so the
+    // sky must be far compared with the throat and with the camera distance; the old
+    // 1.05*r_obs radius put it just past the camera and produced a fisheye artefact.
+    // 1e4 rho reproduces the 1e5 rho exit angles to <0.03 deg (sub-pixel at HD/60 deg FOV).
+    const double escape_radius = std::max(std::abs(fp.r_obs) * 20.0, fp.wh_sky_dist);
 
     if (meta_out) {
         // Store wormhole geometry in KGeoMeta — reuse existing fields:
@@ -3308,7 +3314,8 @@ int main(int argc, char** argv) {
     std::string bg_path;
 
     // ── Single-frame / base params ───────────────────────────
-    double arg_a=0.5, arg_disk_out=12.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1.0;
+    double arg_a=0.5, arg_disk_out=12.0, arg_theta=80.0, arg_phi=0.0, arg_r_obs=-1e300;
+    bool   arg_r_obs_set = false;
     double arg_Q=0.0, arg_Lam=0.0, arg_fov=30.0;
 
     // ── Wormhole params ───────────────────────────────────────
@@ -3316,6 +3323,8 @@ int main(int argc, char** argv) {
     double arg_wh_rho    = 1.0;   // throat areal radius ρ
     double arg_wh_a      = 0.01;  // half tunnel length a
     double arg_wh_M      = 1.0;   // lensing parameter M
+    double arg_wh_look   = 0.0;   // boresight rotation (deg): 0=toward wormhole, 90=perpendicular
+    double arg_wh_sky    = 1.0e4; // |l| of the two celestial spheres
     std::string bg_b_path;        // Universe B background path (--bg-b)
 
     // ── Colorization params ───────────────────────────────────
@@ -3459,7 +3468,7 @@ int main(int argc, char** argv) {
         if (arg=="--disk-out" && i+1<argc) arg_disk_out = std::stod(argv[++i]);
         if (arg=="--theta"    && i+1<argc) arg_theta    = std::stod(argv[++i]);
         if (arg=="--phi"      && i+1<argc) arg_phi      = std::stod(argv[++i]);
-        if (arg=="--r-obs"    && i+1<argc) arg_r_obs    = std::stod(argv[++i]);
+        if (arg=="--r-obs"    && i+1<argc) { arg_r_obs = std::stod(argv[++i]); arg_r_obs_set = true; }
         if (arg=="--charge"   && i+1<argc) arg_Q        = std::stod(argv[++i]);
         if (arg=="--lambda"   && i+1<argc) arg_Lam      = std::stod(argv[++i]);
         if (arg=="--fov"      && i+1<argc) arg_fov      = std::stod(argv[++i]);
@@ -3560,6 +3569,8 @@ int main(int argc, char** argv) {
         if (arg=="--wh-throat" && i+1<argc)      arg_wh_rho   = std::stod(argv[++i]);
         if (arg=="--wh-lensing"&& i+1<argc)      arg_wh_M     = std::stod(argv[++i]);
         if (arg=="--wh-tunnel" && i+1<argc)      arg_wh_a     = std::stod(argv[++i]);
+        if (arg=="--wh-look"   && i+1<argc)      arg_wh_look  = std::stod(argv[++i]);
+        if (arg=="--wh-sky-dist"&& i+1<argc)     arg_wh_sky   = std::stod(argv[++i]);
         if (arg=="--bg-b"      && i+1<argc)      bg_b_path    = argv[++i];
 
         // Two-phase modes
@@ -3681,7 +3692,10 @@ int main(int argc, char** argv) {
                 : res_720p ? 720  : hd_preview ? 480 : preview ? 270 : 1080;
 
     const double default_r_obs = 60.0;
-    const double base_r_obs    = (arg_r_obs>0) ? arg_r_obs : default_r_obs;
+    // Wormhole mode allows negative l_obs (observer in Universe B); non-wormhole needs positive r_obs.
+    const double base_r_obs = arg_r_obs_set
+        ? (arg_wormhole ? arg_r_obs : std::max(arg_r_obs, 1.0))
+        : default_r_obs;
 
     const char* res_tag = res_4k ? "4k" : res_2k ? "2k" : custom_w ? "custom"
                         : res_720p ? "720p" : hd_preview ? "hd" : preview ? "preview"
@@ -3838,6 +3852,8 @@ int main(int argc, char** argv) {
         fp.wh_rho      = arg_wh_rho;
         fp.wh_a_tunnel = arg_wh_a;
         fp.wh_M_lens   = arg_wh_M;
+        fp.wh_look_deg = arg_wh_look;
+        fp.wh_sky_dist = arg_wh_sky;
 
         // ── BAKE mode: read (theta phi) pairs from stdin, render each frame ──
         if (bake_mode) {
@@ -4044,6 +4060,8 @@ int main(int argc, char** argv) {
         fp.wh_rho      = arg_wh_rho;
         fp.wh_a_tunnel = arg_wh_a;
         fp.wh_M_lens   = arg_wh_M;
+        fp.wh_look_deg = arg_wh_look;
+        fp.wh_sky_dist = arg_wh_sky;
 
         double t_frame=get_time();
         std::cout<<"Frame "<<(frame+1)<<"/"<<anim_frames
