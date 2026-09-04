@@ -22,5 +22,18 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # Rosetta 2 is removed in macOS 28, so an x86_64 artefact would be dead on
+      # arrival. The CMake gate already refuses to emit one; assert it here too
+      # so a toolchain change on the runner cannot slip past unnoticed.
+      - name: Assert arm64 binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          archs=$(lipo -archs build/kerr_tracer)
+          echo "kerr_tracer: $archs"
+          case "$archs" in
+            *arm64*) ;;
+            *) echo "::error::kerr_tracer built for '$archs', expected arm64"; exit 1 ;;
+          esac
+
       - name: Run tests
         run: ctest --test-dir build --output-on-failure

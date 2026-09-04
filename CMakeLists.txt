@@ -1,10 +1,85 @@
 cmake_minimum_required(VERSION 3.18)
-project(KerrTracer VERSION 0.2.5 LANGUAGES CXX)
+
+# ── Apple Silicon: build arm64, never Rosetta ─────────────────
+# Rosetta 2 is supported through macOS 27 and removed in macOS 28, so an x86_64
+# build of this project would simply stop launching. The project's own sources
+# are architecture-neutral C++ -- what decides the output architecture is the
+# toolchain, and that is what needs guarding.
+#
+# The trap: cmake itself may be an x86_64 binary running under translation (the
+# Intel Homebrew one in /usr/local is a common case). CMake then believes it is
+# on an x86_64 host and defaults the build to "-arch x86_64", silently producing
+# a Rosetta-dependent binary. hw.optional.arm64 reports the truth even under
+# translation, so ask the hardware rather than the process.
+# Must run before project() so the compiler checks target the right architecture.
+set(KT_HW_ARM64 OFF)
+if(EXISTS "/usr/sbin/sysctl")
+    execute_process(COMMAND /usr/sbin/sysctl -in hw.optional.arm64
+                    OUTPUT_VARIABLE _kt_sysctl_arm64
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(_kt_sysctl_arm64 STREQUAL "1")
+        set(KT_HW_ARM64 ON)
+    endif()
+endif()
+
+if(KT_HW_ARM64 AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING
+        "macOS build architectures" FORCE)
+endif()
+
+project(KerrTracer VERSION 0.2.7 LANGUAGES CXX)
+
+# Refuse to emit a binary that would need Rosetta. Cross-compiling for Intel
+# stays possible, but only as a deliberate, explicit choice.
+option(KERRTRACE_ALLOW_X86 "Permit an x86_64 build on Apple Silicon (needs Rosetta to run)" OFF)
+if(KT_HW_ARM64 AND NOT KERRTRACE_ALLOW_X86)
+    if(NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        message(FATAL_ERROR
+            "Refusing to build for '${CMAKE_OSX_ARCHITECTURES}' on Apple Silicon: the\n"
+            "  result would require Rosetta, which macOS 28 removes.\n"
+            "  This usually means cmake itself is an x86_64 binary running under\n"
+            "  translation. Check with:  lipo -archs \"$(command -v cmake)\"\n"
+            "  and prefer a native one, e.g. /opt/homebrew/bin/cmake.\n"
+            "  To override deliberately, configure with -DKERRTRACE_ALLOW_X86=ON.")
+    endif()
+    if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        message(WARNING
+            "cmake appears to be running under Rosetta (host reported as x86_64 on "
+            "Apple Silicon hardware). The build has been pinned to arm64 and is "
+            "correct, but cmake itself will stop working on macOS 28. "
+            "Install a native cmake, e.g. 'brew install cmake' under /opt/homebrew.")
+    endif()
+endif()
+
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    message(STATUS "macOS build architecture: ${CMAKE_OSX_ARCHITECTURES}")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
+
+# ── CPU tuning flags ──────────────────────────────────────────
+# -march=native is only valid when the compiler's target arch matches the host.
+# Probe it instead of assuming, and fall back rather than failing the build.
+include(CheckCXXCompilerFlag)
+option(KERRTRACE_NATIVE_ARCH "Tune code generation for the building machine's CPU" ON)
+set(KERRTRACE_ARCH_FLAGS "")
+if(KERRTRACE_NATIVE_ARCH)
+    check_cxx_compiler_flag("-march=native" KT_HAVE_MARCH_NATIVE)
+    if(KT_HAVE_MARCH_NATIVE)
+        set(KERRTRACE_ARCH_FLAGS -march=native)
+    else()
+        check_cxx_compiler_flag("-mcpu=native" KT_HAVE_MCPU_NATIVE)
+        if(KT_HAVE_MCPU_NATIVE)
+            set(KERRTRACE_ARCH_FLAGS -mcpu=native)
+        else()
+            message(STATUS "No usable native CPU tuning flag; building portable code")
+        endif()
+    endif()
+endif()
 
 # ── Backend selection ─────────────────────────────────────────
 option(USE_METAL "Use Metal GPU backend (macOS only)"  OFF)
@@ -45,6 +120,19 @@ if(USE_CUDA)
     message(STATUS "CUDA backend enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
 endif()
 
+# ── Post-build architecture gate ──────────────────────────────
+# Verify the artefact that actually came out, not just the flags we asked for.
+function(kt_verify_arch tgt)
+    if(APPLE AND KT_HW_ARM64 AND NOT KERRTRACE_ALLOW_X86)
+        add_custom_command(TARGET ${tgt} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                    -DKT_BIN=$<TARGET_FILE:${tgt}>
+                    -P ${CMAKE_SOURCE_DIR}/cmake/verify_arch.cmake
+            COMMENT "Checking ${tgt} is arm64"
+            VERBATIM)
+    endif()
+endfunction()
+
 # ── Executable ────────────────────────────────────────────────
 add_executable(kerr_tracer ${CPU_SOURCES})
 
@@ -55,7 +143,7 @@ target_compile_definitions(kerr_tracer PRIVATE
     OUT_DIR="${CMAKE_SOURCE_DIR}/out")
 
 target_compile_options(kerr_tracer PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>: -O3 -march=native -ffast-math
+    $<$<COMPILE_LANGUAGE:CXX>: -O3 ${KERRTRACE_ARCH_FLAGS} -ffast-math
                                 -Wall -Wextra>)
 
 # Metal framework
@@ -80,6 +168,8 @@ if(USE_CUDA)
         CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
+kt_verify_arch(kerr_tracer)
+
 # OpenMP (CPU path)
 if(OpenMP_CXX_FOUND AND NOT USE_METAL AND NOT USE_CUDA)
     target_link_libraries(kerr_tracer PRIVATE OpenMP::OpenMP_CXX)
@@ -97,7 +187,7 @@ if(APPLE AND NOT USE_METAL)
         USE_METAL
         OUT_DIR="${CMAKE_SOURCE_DIR}/out")
     target_compile_options(kerr_tracer_metal PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -ffast-math -Wall -Wextra>)
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 ${KERRTRACE_ARCH_FLAGS} -ffast-math -Wall -Wextra>)
     target_link_libraries(kerr_tracer_metal PRIVATE
         "-framework Metal"
         "-framework Foundation"
@@ -107,6 +197,7 @@ if(APPLE AND NOT USE_METAL)
         target_compile_definitions(kerr_tracer_metal PRIVATE _OPENMP)
         message(STATUS "OpenMP enabled for kerr_tracer_metal fallback paths")
     endif()
+    kt_verify_arch(kerr_tracer_metal)
     message(STATUS "Metal GPU binary: kerr_tracer_metal")
 endif()
 

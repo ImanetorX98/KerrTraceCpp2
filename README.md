@@ -40,6 +40,33 @@ Requirements:
   - Metal framework (macOS)
   - CUDA Toolkit (for `USE_CUDA=ON`)
 
+### Apple Silicon: use a native arm64 toolchain
+
+Rosetta 2 is supported through macOS 27 and removed in macOS 28, so the build
+must be arm64. The sources are architecture-neutral C++ and need no changes —
+what matters is the toolchain.
+
+The pitfall is that `cmake` may itself be an x86_64 binary running under
+translation (the Intel Homebrew install in `/usr/local` is the usual culprit).
+It then reports an x86_64 host and defaults the build to `-arch x86_64`. The
+build now pins `arm64` regardless and refuses to emit an Intel binary, but check
+your tools anyway:
+
+```bash
+for t in cmake ctest git; do printf '%-6s %s\n' "$t" "$(lipo -archs "$(command -v $t)")"; done
+```
+
+Anything reporting `x86_64` alone will stop launching on macOS 28. Put the
+native Homebrew prefix ahead of `/usr/local` in your `PATH`:
+
+```bash
+eval "$(/opt/homebrew/bin/brew shellenv)"   # add to ~/.zshrc
+```
+
+Escape hatches, both off by default: `-DKERRTRACE_ALLOW_X86=ON` permits a
+deliberate Intel cross-build, and `-DKERRTRACE_NATIVE_ARCH=OFF` drops
+`-march=native` for a portable, distributable binary.
+
 ### CPU (default)
 
 ```bash

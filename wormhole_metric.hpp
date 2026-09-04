@@ -64,7 +64,9 @@ inline DnegProfile dneg_profile(double l, const DnegParams& p) {
     const double atan_x = std::atan(x);
     const double r      = p.rho + p.M_lens * (x * atan_x - 0.5 * std::log(1.0 + x * x));
     const double sgn    = l >= 0.0 ? 1.0 : -1.0;
-    const double r_prime = sgn * atan_x * (2.0 / pi_M);   // sgn(ℓ)·arctan(x)·(2/πM)
+    // dr/dℓ = (2/π)·arctan(2(|ℓ|−a)/(πM))·sgn(ℓ)   [James & Thorne 2015, note 19]
+    // NOTE: the 1/M of dx/d|ℓ| cancels against the M prefactor of r(ℓ); do NOT divide by M here.
+    const double r_prime = sgn * atan_x * (2.0 / M_PI);
     return {r, r_prime};
 }
 
@@ -210,18 +212,22 @@ inline bool rk4_adaptive_wormhole(const DnegParams& p, WormholeState& s,
 //   → p_ℓ = n_ℓ,  p_θ = r_obs·n_θ,  L = r_obs·sinθ_obs·n_φ,  E=1
 // Null condition: n_ℓ² + n_θ² + n_φ² = 1  ✓  (unit vector).
 struct WormholeCamera {
-    double l_obs;     ///< observer proper distance from throat (> 0, Universe A)
-    double theta_obs; ///< polar inclination in radians
-    double phi_obs;   ///< azimuthal angle in radians
-    double fov_h;     ///< horizontal FOV in radians
+    double l_obs;           ///< observer proper distance from throat (≥0 Universe A, <0 Universe B)
+    double theta_obs;       ///< polar inclination in radians
+    double phi_obs;         ///< azimuthal angle in radians
+    double fov_h;           ///< horizontal FOV in radians
+    double boresight_angle; ///< rotation of boresight away from –ê_ℓ toward –ê_φ (radians)
+                            ///< 0 = facing wormhole (standard); π/2 = perpendicular (Interstellar)
     int    width, height;
 
     WormholeCamera(double l_obs_, double theta_deg, double phi_deg,
-                   double fov_deg, int w, int h)
+                   double fov_deg, int w, int h,
+                   double boresight_deg = 0.0)
         : l_obs(l_obs_)
         , theta_obs(theta_deg * M_PI / 180.0)
         , phi_obs(phi_deg  * M_PI / 180.0)
         , fov_h(fov_deg    * M_PI / 180.0)
+        , boresight_angle(boresight_deg * M_PI / 180.0)
         , width(w), height(h) {}
 
     WormholeState pixel_ray(int px, int py, const DnegParams& p,
@@ -233,13 +239,19 @@ struct WormholeCamera {
         const double alpha = fov_h * (xf - 0.5*(width-1))  / span;
         const double beta  = fov_h * (0.5*(height-1) - yf) / span;
 
-        // Unit direction in observer tetrad frame
-        // (same sign convention as the BL Camera in camera.hpp)
-        const double ca = std::cos(alpha), sa = std::sin(alpha);
-        const double cb = std::cos(beta),  sb = std::sin(beta);
-        const double n_l   = -ca * cb;   // toward throat (−ê_ℓ)
-        const double n_th  = -sb;        // upward is −ê_θ direction
-        const double n_phi = -sa * cb;   // +α → left on screen
+        // Rotating boresight by `boresight_angle` away from –ê_ℓ toward –ê_φ is
+        // equivalent to shifting the pixel azimuth: α_eff = α + boresight_angle.
+        // At 0°: boresight = –ê_ℓ (wormhole straight ahead).
+        // At 90°: boresight = –ê_φ (wormhole 90° to the left; fly-past / Interstellar view).
+        // At -90°: boresight = +ê_φ (wormhole 90° to the right).
+        const double alpha_eff = alpha + boresight_angle;
+        const double ca = std::cos(alpha_eff), sa = std::sin(alpha_eff);
+        const double cb = std::cos(beta),      sb = std::sin(beta);
+        // Universe A (l≥0): boresight toward −ê_ℓ; Universe B (l<0): toward +ê_ℓ
+        const double b_sign = (l_obs >= 0.0) ? -1.0 : +1.0;
+        const double n_l   = b_sign * ca * cb;
+        const double n_th  = -sb;
+        const double n_phi = -sa * cb;
 
         // Effective r at observer
         const double r_obs_eff = dneg_profile(l_obs, p).r;
