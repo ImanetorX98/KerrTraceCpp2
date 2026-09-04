@@ -13,16 +13,22 @@
 
 namespace {
 
+// Must mirror GeoPixel in main.cpp exactly: this is a raw binary record and the
+// reader has no way to discover the writer's layout. phi_disk was inserted here
+// by v0.2.3 without a KGEO_VERSION bump, so the version check below could not
+// catch the drift -- the reader simply walked the buffer with a 24-byte stride
+// over 28-byte records and every pixel after the first was misaligned.
 struct GeoPixelRaw {
     uint8_t outcome;
     uint8_t pad[3];
     float r;
     float redshift;
     float magnif;
+    float phi_disk;
     float theta_esc;
     float phi_esc;
 };
-static_assert(sizeof(GeoPixelRaw) == 24, "GeoPixelRaw size mismatch");
+static_assert(sizeof(GeoPixelRaw) == 28, "GeoPixelRaw must match GeoPixel in main.cpp");
 
 struct GeoFrame {
     uint32_t W = 0;
@@ -72,6 +78,23 @@ bool load_kgeo(const std::filesystem::path& path, GeoFrame& out) {
     // Skip remaining KGeoMeta payload after W/H (10 doubles = 80 bytes).
     f.seekg(80, std::ios::cur);
     if (!f) return false;
+
+    // The record layout is not self-describing, so verify it against the file
+    // size before trusting a single pixel. Without this a layout change in
+    // main.cpp silently yields a misaligned buffer and nonsense statistics
+    // instead of a failure that names the problem.
+    const std::uintmax_t total = std::filesystem::file_size(path);
+    const std::uintmax_t header = 4 + 4 + 4 + 4 + 80;
+    const std::uintmax_t payload = (total > header) ? (total - header) : 0;
+    const std::uintmax_t expected =
+        std::uintmax_t(out.W) * std::uintmax_t(out.H) * sizeof(GeoPixelRaw);
+    if (payload != expected) {
+        std::cerr << "kgeo record size mismatch: " << payload << " bytes of pixel data for "
+                  << out.W << "x" << out.H << " at " << sizeof(GeoPixelRaw)
+                  << " bytes/pixel (expected " << expected << "). "
+                  << "GeoPixelRaw is out of sync with GeoPixel in main.cpp.\n";
+        return false;
+    }
 
     out.px.resize(size_t(out.W) * size_t(out.H));
     f.read(reinterpret_cast<char*>(out.px.data()),
