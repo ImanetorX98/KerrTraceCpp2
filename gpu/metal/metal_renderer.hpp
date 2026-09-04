@@ -64,6 +64,7 @@ struct CameraParams_C {
     int   radial_term_r3_decay; // 0 = off, 1 = on
     int   radial_term_relativistic; // 0 = off, 1 = on (physical NT only)
     int   radial_term_b_denom; // 0 = off, 1 = on (physical NT only)
+    int   interstellar_inner_glow; // 0 = off (physical), 1 = artistic exponential decay
 };
 
 /// Renders the image on the default Metal GPU device.

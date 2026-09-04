@@ -100,7 +100,12 @@ struct ColorParams {
     // Interstellar cinematic mode (artist-friendly controls)
     double interstellar_omega0                = 1.0;
     double interstellar_p                     = 2.2;
-    double interstellar_inner_falloff_scale   = 0.7;   // multiplied by r_in
+    // Artistic exponential brightness decay, OFF by default: no thin-disk model
+    // contains one. With scale 0.7*r_in and a near-extremal spin (r_isco~1.24M)
+    // it decays over ~0.87M while the disk extends to tens of M, killing the
+    // outer disk by ~1e7 where Novikov-Thorne asks for ~50x.
+    bool   interstellar_inner_glow            = false;
+    double interstellar_inner_falloff_scale   = 0.7;   // multiplied by r_in; only used when inner_glow is on
     double interstellar_band_strength         = 0.18;
     double interstellar_band_frequency        = 20.0;
     double interstellar_band_warp             = 2.0;
@@ -2297,7 +2302,9 @@ static RGB disk_colour_interstellar(double r, double phi,
     const double p = std::max(0.1, cp.interstellar_p);
     const double inner_falloff = std::max(1e-6, cp.interstellar_inner_falloff_scale * r_in);
     const double radial = std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -p);
-    const double inner_glow = std::exp(-(r - r_in) / inner_falloff);
+    const double inner_glow = cp.interstellar_inner_glow
+        ? std::exp(-(r - r_in) / inner_falloff)
+        : 1.0;
     const double profile = radial * inner_glow;
 
     const double n1 = 2.0 * fbm2d(r * 1.2, phit * 8.0, 41.0, 5) - 1.0;
@@ -3143,7 +3150,8 @@ static std::vector<RGB> render_image(
                            cp.radial_term_zero_torque ? 1 : 0,
                            cp.radial_term_r3_decay ? 1 : 0,
                            cp.radial_term_relativistic ? 1 : 0,
-                           cp.radial_term_b_denom ? 1 : 0};
+                           cp.radial_term_b_denom ? 1 : 0,
+                           cp.interstellar_inner_glow ? 1 : 0};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -3339,6 +3347,7 @@ int main(int argc, char** argv) {
     double cli_interstellar_omega0              = cp.interstellar_omega0;
     double cli_interstellar_p                   = cp.interstellar_p;
     double cli_interstellar_inner_falloff_scale = cp.interstellar_inner_falloff_scale;
+    bool   cli_interstellar_inner_glow = cp.interstellar_inner_glow;
     double cli_interstellar_band_strength       = cp.interstellar_band_strength;
     double cli_interstellar_band_frequency      = cp.interstellar_band_frequency;
     double cli_interstellar_band_warp           = cp.interstellar_band_warp;
@@ -3503,7 +3512,12 @@ int main(int argc, char** argv) {
         if (arg=="--disk-hue-offset" && i+1<argc) cli_disk_hue_offset = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-omega0" && i+1<argc) cli_interstellar_omega0 = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-p" && i+1<argc) cli_interstellar_p = std::stod(argv[++i]);
-        if (arg=="--disk-interstellar-inner-falloff" && i+1<argc) cli_interstellar_inner_falloff_scale = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-inner-glow") cli_interstellar_inner_glow = true;
+        // Setting the falloff only makes sense with the glow on, so imply it.
+        if (arg=="--disk-interstellar-inner-falloff" && i+1<argc) {
+            cli_interstellar_inner_falloff_scale = std::stod(argv[++i]);
+            cli_interstellar_inner_glow = true;
+        }
         if (arg=="--disk-interstellar-band-strength" && i+1<argc) cli_interstellar_band_strength = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-band-frequency" && i+1<argc) cli_interstellar_band_frequency = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-band-warp" && i+1<argc) cli_interstellar_band_warp = std::stod(argv[++i]);
@@ -3632,6 +3646,7 @@ int main(int argc, char** argv) {
         cp.interstellar_omega0 = std::max(1.0e-4, cli_interstellar_omega0);
         cp.interstellar_p = std::max(0.1, cli_interstellar_p);
         cp.interstellar_inner_falloff_scale = std::max(1.0e-4, cli_interstellar_inner_falloff_scale);
+        cp.interstellar_inner_glow = cli_interstellar_inner_glow;
         cp.interstellar_band_strength = std::max(0.0, cli_interstellar_band_strength);
         cp.interstellar_band_frequency = std::max(0.0, cli_interstellar_band_frequency);
         cp.interstellar_band_warp = std::max(0.0, cli_interstellar_band_warp);
