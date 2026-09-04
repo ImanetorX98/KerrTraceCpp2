@@ -16,6 +16,41 @@ constant float ADAPT_H_MIN = 1e-6f;
 constant float ADAPT_H_MAX = 50.0f;
 constant float ADAPT_ERR_TINY_DOPRI = 1e-12f;
 constant float ADAPT_ERR_TINY_RK4 = 1e-10f;
+// This shader is float32 throughout. Asking for a tolerance tighter than the
+// precision can express buys no accuracy at all -- measured against the float64
+// CPU renderer, tol=1e-7 and tol=1e-5 both land ~17/255 mean pixel difference,
+// because the residual is float32 itself, not truncation. It only shrinks the
+// step: ~99,500 accepted steps per ray instead of a few hundred, i.e. 103s
+// instead of 1.2s for an 854x480 frame. Floor the requested tolerance so the
+// CPU-side default of 1e-7 cannot drive the GPU integrator into that regime.
+constant float ADAPT_TOL_MIN_F32 = 1e-5f;
+
+// ── Adaptive step-size helpers (shared by every integrator here) ──────────
+// err is normalised so that err <= 1 means "accepted": each component is
+// divided by tol*(1+|y|), which keeps the criterion meaningful in float32
+// where an absolute tolerance below ~1e-6 is pure rounding noise.
+static inline float rk4_scaled_err(float4 diff, float4 y, float tol) {
+    const float4 sc = max(tol * (1.0f + abs(y)), 1e-12f);
+    const float4 e  = diff / (15.0f * sc);
+    return sqrt(dot(e, e) * 0.25f);
+}
+static inline float rk4_scaled_err(float3 diff, float3 y, float tol) {
+    const float3 sc = max(tol * (1.0f + abs(y)), 1e-12f);
+    const float3 e  = diff / (15.0f * sc);
+    return sqrt(dot(e, e) / 3.0f);
+}
+// Growth on acceptance, capped so one lucky step cannot blow the next one up.
+static inline float adapt_grow(float h, float err) {
+    const float fac = (err > 1e-8f) ? 0.9f * pow(1.0f/err, 0.2f) : 4.0f;
+    return clamp(h * min(fac, 4.0f), ADAPT_H_MIN, ADAPT_H_MAX);
+}
+// Shrink on rejection. NOTE: clamp(x, lo, hi) is min(max(x,lo),hi), so the old
+// clamp(..., ADAPT_H_MIN, h*0.5f) inverted its bounds once h*0.5 < ADAPT_H_MIN
+// and let h fall straight through the floor. Order the two limits explicitly.
+static inline float adapt_shrink(float h, float err) {
+    const float fac = isfinite(err) ? 0.9f * pow(1.0f/max(err, 1e-8f), 0.25f) : 0.5f;
+    return max(ADAPT_H_MIN, min(h * 0.5f, h * fac));
+}
 
 // ── KNdS parameters (passed as uniform) ─────────────────────
 struct KNdSParams {
@@ -300,7 +335,7 @@ static bool dopri5_adaptive_bl(thread float& r, thread float& theta, thread floa
         return true;
     }
 
-    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), ADAPT_H_MIN, h * 0.5f);
+    h = adapt_shrink(h, err);
     return false;
 }
 
@@ -311,6 +346,7 @@ static bool adaptive_step_bl(thread float& r, thread float& theta, thread float&
                              float M, float a, float Q, float L,
                              int integrator_mode,
                              float tol) {
+    tol = max(tol, ADAPT_TOL_MIN_F32);
     if (integrator_mode == 1) {
         return dopri5_adaptive_bl(r, theta, phi, pr, pth, h, pt, pphi, M, a, Q, L, tol);
     }
@@ -323,15 +359,22 @@ static bool adaptive_step_bl(thread float& r, thread float& theta, thread float&
     rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, step_used*0.5f);
     rk4(r_f, th_f, ph_f, pr_f, pth_f, pt, pphi, M, a, Q, L, step_used*0.5f);
 
-    const float err = length(float4(r_h-r_f, th_h-th_f, pr_h-pr_f, pth_h-pth_f)) / 15.0f;
-    if (err < tol || h < ADAPT_H_MIN) {
+    // Scaled (relative) error norm, matching the DOPRI5 path in this shader and
+    // the standard controller. An ABSOLUTE norm cannot work in float32: the
+    // cancellation noise of r_h - r_f at r~60 is ~|r|*eps ~ 4e-6, so err never
+    // falls below tol=1e-7, every step is rejected, h collapses to the floor and
+    // the ray creeps without ever reaching the disk, the horizon or the escape
+    // radius -- the whole frame comes out black. The CPU integrator survives the
+    // same absolute norm only because double precision puts that noise at ~1e-15.
+    const float err = rk4_scaled_err(float4(r_h-r_f, th_h-th_f, pr_h-pr_f, pth_h-pth_f),
+                                     float4(r,      theta,     pr,        pth),
+                                     tol);
+    if (err <= 1.0f || h <= ADAPT_H_MIN) {
         r = r_f; theta = th_f; phi = ph_f; pr = pr_f; pth = pth_f;
-        const float sc = (err > ADAPT_ERR_TINY_RK4) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-        h = clamp(h*sc, ADAPT_H_MIN, ADAPT_H_MAX);
+        h = adapt_grow(h, err);
         return true;
     }
-
-    h = clamp(h*0.9f*pow(tol/err, 0.25f), ADAPT_H_MIN, h*0.5f);
+    h = adapt_shrink(h, err);
     return false;
 }
 
@@ -818,7 +861,7 @@ static bool dopri5_adaptive_ks(thread float& X, thread float& Y, thread float& Z
         return true;
     }
 
-    h = clamp(h * 0.9f * pow(1.0f/err, 0.25f), ADAPT_H_MIN, h * 0.5f);
+    h = adapt_shrink(h, err);
     return false;
 }
 
@@ -828,6 +871,7 @@ static bool adaptive_step_ks(thread float& X, thread float& Y, thread float& Z,
                              float pT, float M, float a, float Q,
                              int integrator_mode,
                              float tol) {
+    tol = max(tol, ADAPT_TOL_MIN_F32);
     if (integrator_mode == 1) {
         return dopri5_adaptive_ks(X, Y, Z, pX, pY, pZ, h, pT, M, a, Q, tol);
     }
@@ -840,18 +884,19 @@ static bool adaptive_step_ks(thread float& X, thread float& Y, thread float& Z,
     rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used*0.5f);
     rk4_KS(X_f, Y_f, Z_f, pX_f, pY_f, pZ_f, pT, M, a, Q, step_used*0.5f);
 
-    const float err = sqrt(
-        (X_h-X_f)*(X_h-X_f) + (Y_h-Y_f)*(Y_h-Y_f) + (Z_h-Z_f)*(Z_h-Z_f) +
-        (pX_h-pX_f)*(pX_h-pX_f) + (pY_h-pY_f)*(pY_h-pY_f) + (pZ_h-pZ_f)*(pZ_h-pZ_f)
-    ) / 15.0f;
-    if (err < tol || h < ADAPT_H_MIN) {
+    // Same scaled norm as the BL path; see adaptive_step_bl for why an absolute
+    // norm stalls the integrator in float32.
+    const float e_pos = rk4_scaled_err(float3(X_h-X_f, Y_h-Y_f, Z_h-Z_f),
+                                       float3(X, Y, Z), tol);
+    const float e_mom = rk4_scaled_err(float3(pX_h-pX_f, pY_h-pY_f, pZ_h-pZ_f),
+                                       float3(pX, pY, pZ), tol);
+    const float err = sqrt(0.5f*(e_pos*e_pos + e_mom*e_mom));
+    if (err <= 1.0f || h <= ADAPT_H_MIN) {
         X = X_f; Y = Y_f; Z = Z_f; pX = pX_f; pY = pY_f; pZ = pZ_f;
-        const float sc = (err > ADAPT_ERR_TINY_RK4) ? 0.9f*pow(tol/err, 0.2f) : 2.0f;
-        h = clamp(h*sc, ADAPT_H_MIN, ADAPT_H_MAX);
+        h = adapt_grow(h, err);
         return true;
     }
-
-    h = clamp(h*0.9f*pow(tol/err, 0.25f), ADAPT_H_MIN, h*0.5f);
+    h = adapt_shrink(h, err);
     return false;
 }
 
