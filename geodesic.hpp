@@ -325,8 +325,12 @@ inline bool dopri5_adaptive(const KNdSMetric& g, GeodesicState& s,
 
     // ── Stage evaluations ─────────────────���────────────────
     // k2
-    const double a21 = 1.0/5.0;
-    const GeodesicState s2 = advance(s, h, &k1, (const double[]){a21}, 1);
+    // Named array rather than a compound literal: (const double[]){...} is a C99
+    // construct that Clang accepts as an extension but GCC rejects in C++ with
+    // "taking address of temporary array", which is why the Linux CI job has
+    // never built. Matches the style of the stages below.
+    const double a2[] = {1.0/5.0};
+    const GeodesicState s2 = advance(s, h, &k1, a2, 1);
     Vec4d k2; eval_rhs(g, s2, k2);
 
     // k3
