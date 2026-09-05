@@ -28,7 +28,7 @@ if(KT_HW_ARM64 AND NOT CMAKE_OSX_ARCHITECTURES)
         "macOS build architectures" FORCE)
 endif()
 
-project(KerrTracer VERSION 0.2.20 LANGUAGES CXX)
+project(KerrTracer VERSION 0.2.21 LANGUAGES CXX)
 
 # Refuse to emit a binary that would need Rosetta. Cross-compiling for Intel
 # stays possible, but only as a deliberate, explicit choice.

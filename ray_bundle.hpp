@@ -50,167 +50,206 @@
 #include <array>
 #include <cmath>
 
-// ── Hessian of H in the 4D phase space ───────────────────────
-//  z[0]=r, z[1]=θ, z[2]=p_r, z[3]=p_θ
-//  Returns the symmetric 4×4 Hessian via central finite diff.
-static void hessian_H(const KNdSMetric& g,
-                      double r, double theta,
-                      double pr, double pth,
-                      double pt, double pphi,
-                      double H[4][4]) {
-    // Step sizes proportional to coordinate magnitudes
-    const double eps[4] = {
-        1e-5 * (std::abs(r)   + 0.1),
-        1e-5,
-        1e-5 * (std::abs(pr)  + 1e-3),
-        1e-5 * (std::abs(pth) + 1e-3)
-    };
-
-    auto eval = [&](double dr, double dth, double dpr, double dpth) {
-        return g.hamiltonian(r+dr, theta+dth, pr+dpr, pth+dpth, pt, pphi);
-    };
-
-    // Diagonal:  H_aa ≈ (H(+ea) − 2H(0) + H(−ea)) / ea²
-    const double H0 = eval(0,0,0,0);
-    double z_p[4], z_m[4];
-    for (int a = 0; a < 4; ++a) {
-        z_p[a] = 0.0; z_m[a] = 0.0;
-    }
-    double H_diag[4];
-    {
-        double val[4][2];
-        double ea[4] = {eps[0],eps[1],eps[2],eps[3]};
-        (void)r; (void)theta; (void)pr; (void)pth; // suppress unused warning
-        double dz[4][4] = {};
-        // Diagonal terms
-        dz[0][0]=ea[0]; val[0][0]=eval( ea[0],0,0,0); val[0][1]=eval(-ea[0],0,0,0);
-        dz[1][1]=ea[1]; val[1][0]=eval(0, ea[1],0,0); val[1][1]=eval(0,-ea[1],0,0);
-        dz[2][2]=ea[2]; val[2][0]=eval(0,0, ea[2],0); val[2][1]=eval(0,0,-ea[2],0);
-        dz[3][3]=ea[3]; val[3][0]=eval(0,0,0, ea[3]); val[3][1]=eval(0,0,0,-ea[3]);
-        for (int a=0;a<4;a++) H_diag[a] = (val[a][0]-2.0*H0+val[a][1])/(ea[a]*ea[a]);
-    }
-    for (int a=0;a<4;a++) H[a][a] = H_diag[a];
-
-    // Off-diagonal:  H_ab ≈ (H(+ea+eb) - H(+ea-eb) - H(-ea+eb) + H(-ea-eb)) / (4 ea eb)
-    double e[4] = {eps[0],eps[1],eps[2],eps[3]};
-    auto cross = [&](int a, int b) -> double {
-        double da[4]={}, db[4]={};
-        da[a]=e[a]; db[b]=e[b];
-        double pp = eval(da[0]+db[0],da[1]+db[1],da[2]+db[2],da[3]+db[3]);
-        double pm = eval(da[0]-db[0],da[1]-db[1],da[2]-db[2],da[3]-db[3]);
-        double mp = eval(-da[0]+db[0],-da[1]+db[1],-da[2]+db[2],-da[3]+db[3]);
-        double mm = eval(-da[0]-db[0],-da[1]-db[1],-da[2]-db[2],-da[3]-db[3]);
-        return (pp - pm - mp + mm) / (4.0*e[a]*e[b]);
-    };
-    for (int a=0;a<4;a++)
-        for (int b=a+1;b<4;b++)
-            H[a][b] = H[b][a] = cross(a,b);
-}
-
-// ── Symplectic-gradient matrix  M(z)  ────────────────────────
-//  dδz/dλ = M δz
-//  z = (q₁,q₂, p₁,p₂) = (r, θ, p_r, p_θ)
+// ── Deviation operator ───────────────────────────────────────
+//  The bundle is a family of geodesics parameterised by the screen angles
+//  (alpha, beta). Its deviation obeys the variational equation of the flow, and
+//  the two things that were wrong before are both visible in the state list:
 //
-//  M = J_s · Hess(H),   J_s = [[0,I],[-I,0]] (symplectic unit)
+//    z = (r, theta, phi, p_r, p_theta),   parameters (p_t, p_phi)
 //
-//  In full:
-//    M[0..1][0..3] =  H_Hess[2..3][0..3]  (dq/dλ row)
-//    M[2..3][0..3] = -H_Hess[0..1][0..3]  (dp/dλ row)
-static void build_M(const double Hess[4][4], double M[4][4]) {
-    // Row 0,1: come from ∂H/∂p (indices 2,3 of Hess)
-    for (int j=0;j<4;j++) M[0][j] =  Hess[2][j];
-    for (int j=0;j<4;j++) M[1][j] =  Hess[3][j];
-    // Row 2,3: come from −∂H/∂q (indices 0,1 of Hess)
-    for (int j=0;j<4;j++) M[2][j] = -Hess[0][j];
-    for (int j=0;j<4;j++) M[3][j] = -Hess[1][j];
-}
-
-// ── Bundle state: main geodesic + 4×2 Jacobi matrix W ────────
-//  W[:,0] = deviation in α direction
-//  W[:,1] = deviation in β direction
-struct BundleState {
-    GeodesicState geo;
-    double W[4][2];   ///< Jacobi deviation matrix
+//  1. p_t and p_phi are conserved ALONG a ray but DIFFER BETWEEN the rays of the
+//     bundle, so they are parameters of the flow, not constants of the family.
+//     The deviation is therefore inhomogeneous:
+//
+//       d(dz)/dl = (df/dz) dz + (df/dp_t) dp_t + (df/dp_phi) dp_phi
+//
+//     with dp_t and dp_phi constant per screen direction. The previous code
+//     integrated only the homogeneous part, from the first step onward.
+//
+//  2. phi was not part of the deviation at all, yet the footprint on the disk
+//     lives in the (dr, r dphi) plane. The old code substituted dtheta, which at
+//     theta = pi/2 does not even lie in that plane.
+//
+//  Measured consequence: |det J| was ANTI-correlated with the finite-difference
+//  Jacobian d(r,phi)/d(alpha,beta) -- log-log correlation -0.416 over 16 279
+//  clean disk pixels, ratio spread 37x. See docs/PLAN-2026-09-05.md.
+//
+//  H = 1/2 g^{mu nu} p_mu p_nu is exactly quadratic in the momenta, so no
+//  Hessian of H is needed: the momentum-momentum block IS the inverse metric,
+//  and the mixed blocks are first derivatives of it contracted with p. Only
+//  g^{mu nu} and its first and second derivatives in (r, theta) are required,
+//  which is both cheaper and far better conditioned than differencing H itself.
+//
+//    r'      = g^{r nu} p_nu
+//    theta'  = g^{th nu} p_nu
+//    phi'    = g^{ph nu} p_nu
+//    p_r'    = -1/2 d_r  g^{mu nu} p_mu p_nu
+//    p_th'   = -1/2 d_th g^{mu nu} p_mu p_nu
+//
+//  Index order for the metric is BL: (t, r, theta, phi) = (0, 1, 2, 3).
+struct BundleOps {
+    double A[5][5];   ///< df/dz
+    double B[5][2];   ///< df/d(p_t, p_phi)
+    double f[5];      ///< the flow itself
 };
 
-// ── RHS for the coupled (geodesic + Jacobi) system ───────────
+static void bundle_ops(const KNdSMetric& g,
+                       double r, double theta,
+                       double pr, double pth,
+                       double pt, double pphi,
+                       BundleOps& op) {
+    const double hr = 1e-5 * (std::abs(r) + 1.0);
+    const double ht = 1e-5;
+
+    double G[4][4], Gr_p[4][4], Gr_m[4][4], Gt_p[4][4], Gt_m[4][4];
+    double Gpp[4][4], Gpm[4][4], Gmp[4][4], Gmm[4][4];
+    g.contravariant_BL(r,      theta,      G);
+    g.contravariant_BL(r + hr, theta,      Gr_p);
+    g.contravariant_BL(r - hr, theta,      Gr_m);
+    g.contravariant_BL(r,      theta + ht, Gt_p);
+    g.contravariant_BL(r,      theta - ht, Gt_m);
+    g.contravariant_BL(r + hr, theta + ht, Gpp);
+    g.contravariant_BL(r + hr, theta - ht, Gpm);
+    g.contravariant_BL(r - hr, theta + ht, Gmp);
+    g.contravariant_BL(r - hr, theta - ht, Gmm);
+
+    double dGr[4][4], dGt[4][4], d2Grr[4][4], d2Gtt[4][4], d2Grt[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            dGr[i][j]   = (Gr_p[i][j] - Gr_m[i][j]) / (2.0*hr);
+            dGt[i][j]   = (Gt_p[i][j] - Gt_m[i][j]) / (2.0*ht);
+            d2Grr[i][j] = (Gr_p[i][j] - 2.0*G[i][j] + Gr_m[i][j]) / (hr*hr);
+            d2Gtt[i][j] = (Gt_p[i][j] - 2.0*G[i][j] + Gt_m[i][j]) / (ht*ht);
+            d2Grt[i][j] = (Gpp[i][j] - Gpm[i][j] - Gmp[i][j] + Gmm[i][j])
+                        / (4.0*hr*ht);
+        }
+
+    const double p[4] = {pt, pr, pth, pphi};
+    // V_a(D) = D^{a nu} p_nu ,  Q(D) = D^{mu nu} p_mu p_nu
+    auto V = [&](const double D[4][4], int a) {
+        double s = 0.0;
+        for (int n = 0; n < 4; ++n) s += D[a][n] * p[n];
+        return s;
+    };
+    auto Q = [&](const double D[4][4]) {
+        double s = 0.0;
+        for (int m = 0; m < 4; ++m)
+            for (int n = 0; n < 4; ++n) s += D[m][n] * p[m] * p[n];
+        return s;
+    };
+
+    op.f[0] = V(G, 1);
+    op.f[1] = V(G, 2);
+    op.f[2] = V(G, 3);
+    op.f[3] = -0.5 * Q(dGr);
+    op.f[4] = -0.5 * Q(dGt);
+
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; j < 5; ++j) op.A[i][j] = 0.0;
+        op.B[i][0] = op.B[i][1] = 0.0;
+    }
+
+    // Positions: d(x^a)'/dz. Column 2 (phi) stays zero -- H is axisymmetric.
+    op.A[0][0] = V(dGr, 1);  op.A[0][1] = V(dGt, 1);
+    op.A[0][3] = G[1][1];    op.A[0][4] = G[1][2];
+    op.A[1][0] = V(dGr, 2);  op.A[1][1] = V(dGt, 2);
+    op.A[1][3] = G[2][1];    op.A[1][4] = G[2][2];
+    op.A[2][0] = V(dGr, 3);  op.A[2][1] = V(dGt, 3);
+    op.A[2][3] = G[3][1];    op.A[2][4] = G[3][2];
+
+    // Momenta: d(p_a)'/dz.
+    op.A[3][0] = -0.5 * Q(d2Grr);  op.A[3][1] = -0.5 * Q(d2Grt);
+    op.A[3][3] = -V(dGr, 1);       op.A[3][4] = -V(dGr, 2);
+    op.A[4][0] = -0.5 * Q(d2Grt);  op.A[4][1] = -0.5 * Q(d2Gtt);
+    op.A[4][3] = -V(dGt, 1);       op.A[4][4] = -V(dGt, 2);
+
+    // Forcing by the conserved parameters, which differ across the bundle.
+    op.B[0][0] = G[1][0];      op.B[0][1] = G[1][3];
+    op.B[1][0] = G[2][0];      op.B[1][1] = G[2][3];
+    op.B[2][0] = G[3][0];      op.B[2][1] = G[3][3];
+    op.B[3][0] = -V(dGr, 0);   op.B[3][1] = -V(dGr, 3);
+    op.B[4][0] = -V(dGt, 0);   op.B[4][1] = -V(dGt, 3);
+}
+
+// ── Bundle state: main geodesic + 5×2 deviation matrix W ─────
+//  W rows are (dr, dtheta, dphi, dp_r, dp_theta); columns are the two screen
+//  directions. dpt and dpphi are the constant parameter deviations of the same
+//  two directions.
+struct BundleState {
+    GeodesicState geo;
+    double W[5][2];
+    double dpt[2];
+    double dpphi[2];
+};
+
 static void bundle_rhs(const KNdSMetric& g,
                        const GeodesicState& s,
-                       const double W[4][2],
-                       double dz[4],    // out: d(r,θ,pr,pth)/dλ
-                       double dW[4][2]) // out: dW/dλ
+                       const double W[5][2],
+                       const double dpt[2],
+                       const double dpphi[2],
+                       double dz[5],
+                       double dW[5][2])
 {
-    // 1. Geodesic RHS
-    double dr,dth,dpr,dpth;
-    geodesic_rhs(g, s.r, s.theta, s.pr, s.ptheta,
-                 s.pt, s.pphi, dr, dth, dpr, dpth);
-    dz[0]=dr; dz[1]=dth; dz[2]=dpr; dz[3]=dpth;
+    BundleOps op;
+    bundle_ops(g, s.r, s.theta, s.pr, s.ptheta, s.pt, s.pphi, op);
+    for (int i = 0; i < 5; ++i) dz[i] = op.f[i];
 
-    // 2. Hessian at current point
-    double Hess[4][4];
-    hessian_H(g, s.r, s.theta, s.pr, s.ptheta, s.pt, s.pphi, Hess);
-
-    // 3. M = J_s · Hess
-    double M[4][4];
-    build_M(Hess, M);
-
-    // 4. dW/dλ = M · W
-    for (int i=0;i<4;i++)
-        for (int k=0;k<2;k++) {
-            dW[i][k] = 0.0;
-            for (int j=0;j<4;j++)
-                dW[i][k] += M[i][j]*W[j][k];
+    for (int i = 0; i < 5; ++i)
+        for (int k = 0; k < 2; ++k) {
+            double acc = op.B[i][0]*dpt[k] + op.B[i][1]*dpphi[k];
+            for (int j = 0; j < 5; ++j) acc += op.A[i][j] * W[j][k];
+            dW[i][k] = acc;
         }
 }
 
 // ── RK4 step for bundle ───────────────────────────────────────
+//  phi is now integrated as part of the state (dz[2]) rather than by a separate
+//  quadrature, so that the deviation and the ray see exactly the same phi.
 static void bundle_rk4(const KNdSMetric& g, BundleState& bs, double dlam) {
     const GeodesicState s0 = bs.geo;
+    double W0[5][2];
+    for (int i = 0; i < 5; ++i) for (int k = 0; k < 2; ++k) W0[i][k] = bs.W[i][k];
 
-    double dz1[4], dW1[4][2];
-    double dz2[4], dW2[4][2];
-    double dz3[4], dW3[4][2];
-    double dz4[4], dW4[4][2];
+    double dz[4][5], dW[4][2][2];
+    double dWs[4][5][2];
 
-    auto make_state = [](const GeodesicState& s, const double dz[4], double f,
-                         const double W[4][2], const double dW[4][2]) {
-        GeodesicState ns = s;
-        ns.r      += f*dz[0]; ns.theta  += f*dz[1];
-        ns.pr     += f*dz[2]; ns.ptheta += f*dz[3];
-        double nW[4][2];
-        for(int i=0;i<4;i++) for(int k=0;k<2;k++) nW[i][k] = W[i][k]+f*dW[i][k];
-        return std::make_pair(ns, std::array<std::array<double,2>,4>{
-            {{nW[0][0],nW[0][1]},{nW[1][0],nW[1][1]},
-             {nW[2][0],nW[2][1]},{nW[3][0],nW[3][1]}}});
+    GeodesicState st = s0;
+    double Wt[5][2];
+    const double frac[4] = {0.0, 0.5, 0.5, 1.0};
+
+    for (int stage = 0; stage < 4; ++stage) {
+        if (stage == 0) {
+            st = s0;
+            for (int i = 0; i < 5; ++i) for (int k = 0; k < 2; ++k) Wt[i][k] = W0[i][k];
+        } else {
+            const double f = frac[stage] * dlam;
+            const int prev = stage - 1;
+            st = s0;
+            st.r      = s0.r      + f*dz[prev][0];
+            st.theta  = s0.theta  + f*dz[prev][1];
+            st.phi    = s0.phi    + f*dz[prev][2];
+            st.pr     = s0.pr     + f*dz[prev][3];
+            st.ptheta = s0.ptheta + f*dz[prev][4];
+            for (int i = 0; i < 5; ++i)
+                for (int k = 0; k < 2; ++k)
+                    Wt[i][k] = W0[i][k] + f*dWs[prev][i][k];
+        }
+        bundle_rhs(g, st, Wt, bs.dpt, bs.dpphi, dz[stage], dWs[stage]);
+    }
+    (void)dW;
+
+    auto comb = [&](int i) {
+        return (dz[0][i] + 2.0*dz[1][i] + 2.0*dz[2][i] + dz[3][i]) * dlam / 6.0;
     };
-
-    bundle_rhs(g, s0, bs.W, dz1, dW1);
-
-    auto [s2,W2] = make_state(s0, dz1, 0.5*dlam, bs.W, dW1);
-    double W2a[4][2]; for(int i=0;i<4;i++) for(int k=0;k<2;k++) W2a[i][k]=W2[i][k];
-    bundle_rhs(g, s2, W2a, dz2, dW2);
-
-    auto [s3,W3] = make_state(s0, dz2, 0.5*dlam, bs.W, dW2);
-    double W3a[4][2]; for(int i=0;i<4;i++) for(int k=0;k<2;k++) W3a[i][k]=W3[i][k];
-    bundle_rhs(g, s3, W3a, dz3, dW3);
-
-    auto [s4,W4] = make_state(s0, dz3, dlam, bs.W, dW3);
-    double W4a[4][2]; for(int i=0;i<4;i++) for(int k=0;k<2;k++) W4a[i][k]=W4[i][k];
-    bundle_rhs(g, s4, W4a, dz4, dW4);
-
-    // φ integration using the same RK stage points of the pre-step state.
-    const double dp1 = dphi_vel(g, s0.r, s0.theta, s0.pt, s0.pphi);
-    const double dp2 = dphi_vel(g, s2.r, s2.theta, s0.pt, s0.pphi);
-    const double dp3 = dphi_vel(g, s3.r, s3.theta, s0.pt, s0.pphi);
-    const double dp4 = dphi_vel(g, s4.r, s4.theta, s0.pt, s0.pphi);
-
-    bs.geo.r      += dlam/6.0*(dz1[0]+2*dz2[0]+2*dz3[0]+dz4[0]);
-    bs.geo.theta  += dlam/6.0*(dz1[1]+2*dz2[1]+2*dz3[1]+dz4[1]);
-    bs.geo.pr     += dlam/6.0*(dz1[2]+2*dz2[2]+2*dz3[2]+dz4[2]);
-    bs.geo.ptheta += dlam/6.0*(dz1[3]+2*dz2[3]+2*dz3[3]+dz4[3]);
-    bs.geo.phi += dlam/6.0*(dp1 + 2*dp2 + 2*dp3 + dp4);
-    for(int i=0;i<4;i++) for(int k=0;k<2;k++)
-        bs.W[i][k] += dlam/6.0*(dW1[i][k]+2*dW2[i][k]+2*dW3[i][k]+dW4[i][k]);
+    bs.geo.r      += comb(0);
+    bs.geo.theta  += comb(1);
+    bs.geo.phi    += comb(2);
+    bs.geo.pr     += comb(3);
+    bs.geo.ptheta += comb(4);
+    for (int i = 0; i < 5; ++i)
+        for (int k = 0; k < 2; ++k)
+            bs.W[i][k] += (dWs[0][i][k] + 2.0*dWs[1][i][k]
+                         + 2.0*dWs[2][i][k] + dWs[3][i][k]) * dlam / 6.0;
 }
 
 // ── Adaptive bundle step (RK4 + step-doubling) ───────────────
@@ -273,28 +312,37 @@ struct BundleResult {
     double phi_disk    = 0.0;  ///< BL azimuthal angle at disk crossing
 };
 
-// ── Initial deviation vectors ΔΨ_α, ΔΨ_β ────────────────────
-//  Numerically: δz_α = [∂z/∂α] ≈ [z(α+ε)−z(α−ε)] / 2ε
+// ── Initial deviation of the bundle ──────────────────────────
+//  Every ray of the bundle leaves the SAME event (the camera), so the position
+//  deviations all start at zero and the whole bundle is born in the momenta:
+//
+//      dz(0) = (0, 0, 0, dp_r, dp_theta) ,  plus the constants dp_t, dp_phi.
+//
+//  dp_t and dp_phi are what the old code dropped. They are conserved along each
+//  ray but differ between rays, so they enter the deviation as a constant
+//  forcing rather than as part of the evolving vector.
 static void init_bundle(const Camera& cam,
                         double alpha, double beta,
                         const KNdSMetric& g,
-                        double W[4][2]) {
-    const double eps = cam.fov_h / cam.width * 0.5;  // half-pixel in radians
+                        double W[5][2], double dpt[2], double dpphi[2]) {
+    const double eps = cam.fov_h / cam.width * 0.5;  // half a pixel, in radians
 
-    auto s_ap = cam.angle_ray(alpha+eps, beta,   g);
-    auto s_am = cam.angle_ray(alpha-eps, beta,   g);
-    auto s_bp = cam.angle_ray(alpha,   beta+eps, g);
-    auto s_bm = cam.angle_ray(alpha,   beta-eps, g);
+    const GeodesicState s_ap = cam.angle_ray(alpha+eps, beta,   g);
+    const GeodesicState s_am = cam.angle_ray(alpha-eps, beta,   g);
+    const GeodesicState s_bp = cam.angle_ray(alpha,   beta+eps, g);
+    const GeodesicState s_bm = cam.angle_ray(alpha,   beta-eps, g);
+    const double inv = 1.0 / (2.0*eps);
 
-    W[0][0] = (s_ap.r      - s_am.r)      / (2.0*eps);
-    W[1][0] = (s_ap.theta  - s_am.theta)  / (2.0*eps);
-    W[2][0] = (s_ap.pr     - s_am.pr)     / (2.0*eps);
-    W[3][0] = (s_ap.ptheta - s_am.ptheta) / (2.0*eps);
+    for (int i = 0; i < 3; ++i) { W[i][0] = 0.0; W[i][1] = 0.0; }
+    W[3][0] = (s_ap.pr     - s_am.pr)     * inv;
+    W[4][0] = (s_ap.ptheta - s_am.ptheta) * inv;
+    W[3][1] = (s_bp.pr     - s_bm.pr)     * inv;
+    W[4][1] = (s_bp.ptheta - s_bm.ptheta) * inv;
 
-    W[0][1] = (s_bp.r      - s_bm.r)      / (2.0*eps);
-    W[1][1] = (s_bp.theta  - s_bm.theta)  / (2.0*eps);
-    W[2][1] = (s_bp.pr     - s_bm.pr)     / (2.0*eps);
-    W[3][1] = (s_bp.ptheta - s_bm.ptheta) / (2.0*eps);
+    dpt[0]   = (s_ap.pt   - s_am.pt)   * inv;
+    dpphi[0] = (s_ap.pphi - s_am.pphi) * inv;
+    dpt[1]   = (s_bp.pt   - s_bm.pt)   * inv;
+    dpphi[1] = (s_bp.pphi - s_bm.pphi) * inv;
 }
 
 // ── Main bundle trace ─────────────────────────────────────────
@@ -317,7 +365,7 @@ static BundleResult trace_bundle(int px, int py,
 
     BundleState bs;
     bs.geo = cam.angle_ray(alpha, beta, g);
-    init_bundle(cam, alpha, beta, g, bs.W);
+    init_bundle(cam, alpha, beta, g, bs.W, bs.dpt, bs.dpphi);
 
     const double rh  = g.r_horizon();
     const double rh_cut = rh * 1.03;
@@ -403,10 +451,51 @@ static BundleResult trace_bundle(int px, int py,
                 // via the disk metric: dφ ≈ (dθ/dr_disk) · W[1] ... complex.
                 // Simpler: use only the 2×2 sub-block (δr, δθ) as proxy for
                 // (δr_disk, δφ_disk)  — gives the right shape up to a constant.
-                const double J00 = bs_prev.W[0][0] + alpha*(bs.W[0][0] - bs_prev.W[0][0]);
-                const double J01 = bs_prev.W[0][1] + alpha*(bs.W[0][1] - bs_prev.W[0][1]);
-                const double J10 = bs_prev.W[1][0] + alpha*(bs.W[1][0] - bs_prev.W[1][0]);
-                const double J11 = bs_prev.W[1][1] + alpha*(bs.W[1][1] - bs_prev.W[1][1]);
+                // Footprint in the plane of the disk.
+                //
+                // Two corrections over the old code, both needed. First, the
+                // displacement of a bundle edge in the disk is (dr, r dphi), not
+                // (dr, dtheta): at theta = pi/2 the dtheta direction is normal to
+                // the disk and describes no area in it.
+                //
+                // Second, and this is the one that is easy to miss: W is the
+                // deviation at equal affine parameter, but neighbouring rays do
+                // not cross the equator at the same lambda. The footprint is the
+                // deviation on the CROSSING SURFACE, so the flow direction has to
+                // be projected out. Requiring the neighbour to be on theta = pi/2
+                // as well fixes its lambda offset,
+                //
+                //     dtheta + theta' dl = 0   =>   dl = -dtheta/theta' ,
+                //
+                // and the in-plane displacement is then
+                //
+                //     dr_surf   = dr   + r'   dl ,
+                //     dphi_surf = dphi + phi' dl .
+                //
+                // Without this the matrix mixes in the motion along the ray and
+                // its determinant is unrelated to the area the pixel covers.
+                double f_r, f_th, f_pr, f_pth;
+                geodesic_rhs(g, r_hit, M_PI/2.0, bs.geo.pr, bs.geo.ptheta,
+                             bs.geo.pt, bs.geo.pphi, f_r, f_th, f_pr, f_pth);
+                const double f_phi = dphi_vel(g, r_hit, M_PI/2.0,
+                                              bs.geo.pt, bs.geo.pphi);
+
+                auto Wi = [&](int row, int col) {
+                    return bs_prev.W[row][col]
+                         + alpha * (bs.W[row][col] - bs_prev.W[row][col]);
+                };
+                double J00 = 0.0, J01 = 0.0, J10 = 0.0, J11 = 0.0;
+                if (std::abs(f_th) > 1e-14) {
+                    const double dl_a = -Wi(1,0) / f_th;
+                    const double dl_b = -Wi(1,1) / f_th;
+                    J00 = Wi(0,0) + f_r   * dl_a;
+                    J01 = Wi(0,1) + f_r   * dl_b;
+                    J10 = r_hit * (Wi(2,0) + f_phi * dl_a);
+                    J11 = r_hit * (Wi(2,1) + f_phi * dl_b);
+                } else {
+                    J00 = Wi(0,0);            J01 = Wi(0,1);
+                    J10 = r_hit * Wi(2,0);    J11 = r_hit * Wi(2,1);
+                }
 
                 double det = std::abs(J00*J11 - J01*J10);
                 det = det < 1e-12 ? 1e-12 : det;
