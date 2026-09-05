@@ -36,22 +36,38 @@ causa.**
 
 ---
 
-## 1-bis. APERTO — la geodetica del bundle diverge da quella single-ray
+## 1-bis. ~~La geodetica del bundle diverge da quella single-ray~~ — DIAGNOSI SBAGLIATA
 
-Emerso dal confronto `.kgeo` fatto per il punto sopra. Sugli stessi pixel:
+Confrontavo bundle **in BL** con single-ray **in KS** (la carta di default). A
+parità di carta il fascio segue la geodetica centrale in modo esatto:
 
-| | valore |
-|---|---|
-| `\|Δr\|` mediano | 0.396 M |
-| `\|Δr\|` p99 | 1.52 M |
-| `\|Δr\|` max | 10.7 M |
-| disk-hit solo nel bundle | 4864 px |
-| disk-hit solo nel single-ray | 22 830 px |
+| confronto | `\|Δr\|` mediano | p99 |
+|---|---|---|
+| single KS vs bundle BL | 0.5313 | 2.531 |
+| single **BL** vs bundle **BL** | **0.0000** | 0.001 (max) |
 
-Non è colore: è accuratezza d'integrazione. Il fascio percorre una traiettoria
-diversa. Da indagare: tolleranza adattiva, interpolazione di Hermite
-all'attraversamento equatoriale, o il passo condiviso fra geodetica e campo di
-Jacobi.
+Il difetto è reale ma sta altrove → punto **1-ter**.
+
+---
+
+## 1-ter. APERTO — BL e KS non danno la stessa immagine
+
+E la differenza **non cala stringendo la tolleranza**, quindi non è errore
+d'integrazione: BL vs KS dà `|Δr|` mediano 0.5313 a `tol=1e-7` e 0.5312 a
+`tol=1e-11`, mentre ciascuna carta confrontata con se stessa a tolleranza
+diversa dà 0.0000.
+
+- KS trova 23 541 hit sul disco, BL 21 208: **2699 pixel** di differenza, situati
+  a **r ≈ 11.4**, cioè sul bordo **esterno** del disco, non vicino all'orizzonte.
+- `|Δr|` **cresce con r** (0.27 dentro 2M, 0.68 fra 4M e 8M): il contrario di
+  quello che darebbe un problema di carta vicino all'orizzonte.
+- Un riallineamento rigido porta la mediana solo da 0.53 a 0.42 → c'è anche un
+  piccolo disallineamento della camera fra le carte, ma non è la causa principale.
+- Il solver ellittico trova esattamente lo stesso insieme di hit di KS (23 541),
+  indizio a favore di KS ma debole, perché i suoi fallback girano in KS.
+
+Piano in `PLAN-2026-09-05.md`, voce **P0**. È bloccante: il bundle esiste solo in
+BL, quindi eredita la carta eventualmente sbagliata.
 
 ---
 
