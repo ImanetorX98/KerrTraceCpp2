@@ -209,8 +209,62 @@ seguito di P1 non è «mediare meglio la texture», è:
 
 - **P1b — antialiasing di copertura al bordo del disco**: usare l'impronta per
   stimare la frazione di pixel coperta dal disco e comporre con ciò che sta
-  dietro, invece della decisione binaria attuale.
+  dietro, invece della decisione binaria attuale. → **fatto, v0.2.23**
 - **P2** assorbe il filtraggio dello sfondo.
+
+---
+
+## Passo 8 — Copertura al bordo (v0.2.23)
+
+Misura preliminare, per non sbagliare bersaglio due volte: dei 1536 pixel di
+bordo, **tutti** confinano con lo sfondo e **nessuno** con l'orizzonte; 987 sono
+contro `r_out`, 459 contro `r_isco`, solo 90 sono silhouette. Quindi il 94% è
+risolvibile analiticamente contro i **bordi radiali**, senza tracciare un solo
+raggio in più. E l'impronta scavalca il bordo per costruzione: estensione
+radiale mediana 0.243 M contro una distanza mediana da `r_out` di 0.118 M.
+
+Implementato: la copertura è la frazione dell'impronta con
+`r_in ≤ r ≤ r_out`, campionata sull'ellisse; entra come `alpha` di
+composizione. E, poiché la parte scoperta del pixel vede quel che sta **dietro**,
+il raggio viene proseguito oltre il disco — altrimenti il bordo comporrebbe su
+nero e si scurirebbe invece di sfumare. Lo pagano solo i pixel di bordo, l'1.2%
+del fotogramma. 834 pixel hanno copertura < 0.999, mediana 0.796.
+
+Record da 44 a 48 byte, `KGEO_VERSION` a **3**.
+
+### Risultato
+
+| | RMSE | interno | **bordi** | sfondo |
+|---|---|---|---|---|
+| riferimento 16 spp | — | 19.93 | **80.24** | 31.14 |
+| single-ray | 11.59 | 27.46 | 152.22 | 65.10 |
+| bundle + filtro texture | 14.52 | 18.24 | 145.49 | 66.01 |
+| **bundle + copertura** | **14.06** | 18.10 | **122.61** | 65.52 |
+
+Sui bordi: **−16%**, da 145.49 a 122.61. Reale e misurato, ma il riferimento sta
+a 80.24: **non è chiuso**.
+
+### Perché resta il divario, e cosa manca
+
+Il trattamento è **unilaterale**. Un pixel il cui centro cade appena dentro il
+disco ottiene copertura < 1 e sfuma; uno il cui centro cade appena fuori non ha
+impronta — in modalità bundle un raggio che non colpisce il disco non registra
+niente — quindi resta un taglio netto. Il bordo si ammorbidisce solo dal lato
+interno ed è polarizzato verso l'interno di mezza impronta. Il riferimento a 16
+spp ha invece un bordo simmetrico.
+
+Rimedi possibili, in ordine di costo: registrare un'impronta anche al passaggio
+più vicino all'equatore per i raggi che mancano il disco; oppure
+supercampionare i soli pixel di bordo (~3% del fotogramma), che è il rimedio che
+A.3.1 stesso indica per i casi estremi (*«we can trace multiple beams per pixel
+and resample»*).
+
+### Nota sull'RMSE globale
+
+Resta ~14 perché è **dominato dallo sfondo**: 88 876 pixel di sfondo contro
+40 724 di disco, e lo sfondo sta a 65.5 contro 31.1 del riferimento. Finché non
+si filtra il campionamento del background (P2) l'RMSE globale non si muove, e
+non è la metrica giusta per giudicare il lavoro sul disco.
 
 ---
 
@@ -221,3 +275,4 @@ seguito di P1 non è «mediare meglio la texture», è:
 | v0.2.21 | `dafbad0` | ricostruzione del campo di Jacobi (passi 3–4) |
 | — | — | correzione dell'attribuzione del residuo 0.3% |
 | v0.2.22 | | impronta esportata, `KGEO_VERSION`=2, filtro sull'emissione |
+| v0.2.23 | | copertura al bordo, continuazione dietro il disco, `KGEO_VERSION`=3 |
