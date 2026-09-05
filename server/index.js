@@ -1366,7 +1366,12 @@ app.post('/api/render', (req, res) => {
       const v = Number(p.interstellar_p);
       if (Number.isFinite(v)) args.push('--disk-interstellar-p', String(v));
     }
-    if (p.interstellar_inner_falloff_scale !== undefined) {
+    // Artistic power-law radial profile instead of the Novikov-Thorne flux.
+    if (p.interstellar_physical_profile === false) args.push('--disk-interstellar-artistic-profile');
+    // Artistic exponential decay: opt-in, physically unfounded. The falloff value
+    // is only meaningful when it is enabled, so only forward it then.
+    if (p.interstellar_inner_glow === true) {
+      args.push('--disk-interstellar-inner-glow');
       const v = Number(p.interstellar_inner_falloff_scale);
       if (Number.isFinite(v)) args.push('--disk-interstellar-inner-falloff', String(v));
     }

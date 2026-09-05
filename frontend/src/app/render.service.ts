@@ -46,6 +46,8 @@ export interface RenderParams {
   disk_hue_offset: number;
   interstellar_omega0: number;
   interstellar_p: number;
+  interstellar_physical_profile: boolean;
+  interstellar_inner_glow: boolean;
   interstellar_inner_falloff_scale: number;
   interstellar_band_strength: number;
   interstellar_band_frequency: number;

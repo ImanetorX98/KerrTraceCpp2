@@ -115,6 +115,8 @@ struct CameraParams {
     int   radial_term_r3_decay; // 0 = off, 1 = on
     int   radial_term_relativistic; // 0 = off, 1 = on (physical NT only)
     int   radial_term_b_denom; // 0 = off, 1 = on (physical NT only)
+    int   interstellar_inner_glow; // 0 = off (physical), 1 = artistic exponential decay
+    int   interstellar_physical_profile; // 1 = Novikov-Thorne flux, 0 = artistic power law
 };
 
 struct RenderParams {
@@ -1854,8 +1856,14 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
 
         const float p = max(0.1f, cp.interstellar_p);
         const float inner_falloff = max(1e-6f, cp.interstellar_inner_falloff_scale * r_in);
-        const float radial = pow(max(r_hit / r_in, 1e-6f), -p);
-        const float inner_glow = exp(-(r_hit - r_in) / inner_falloff);
+        // Mirrors the CPU path: physical Novikov-Thorne flux by default.
+        const float radial = (cp.interstellar_physical_profile != 0)
+            ? disk_flux_norm_f(r_hit, r_isco, a, cp)
+            : pow(max(r_hit / r_in, 1e-6f), -p);
+        // Off by default: mirrors the CPU path. See ColorParams in main.cpp.
+        const float inner_glow = (cp.interstellar_inner_glow != 0)
+            ? exp(-(r_hit - r_in) / inner_falloff)
+            : 1.0f;
         const float profile = radial * inner_glow;
 
         const float n1 = 2.0f * fbm2d_f(r_hit * 1.2f, phit * 8.0f, 41.0f, 5) - 1.0f;
