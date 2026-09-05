@@ -371,15 +371,30 @@ static BundleResult trace_bundle(int px, int py,
                 : 0.0;
             if (crossed_equator && r_hit >= r_disk_in && r_hit <= r_disk_out) {
                 // ── Redshift ──────────────────────────────────────
-                const double Omega = g.keplerian_omega(r_hit);
-                const double b     = -bs.geo.pphi / (-bs.geo.pt);
+                // Mirrors disk_redshift() in main.cpp. keplerian_omega() returns
+                // −Ω_K by convention, so the physical prograde Ω is its negation;
+                // this code used the raw value and so evaluated the disk-frame
+                // normalisation d2 on the retrograde branch, where the 2·g_tφ·Ω
+                // cross term flips sign. d2 then turns negative inside r ≈ 1.5M
+                // and the whole inner disk fell back to red = 1, i.e. rendered as
+                // if unshifted while the correct g there is ~0.1: with the g⁴
+                // beaming that is a factor 10⁴ too bright, which was the saturated
+                // white ring around the shadow. The two sign errors (Ω and b)
+                // cancelled in the denominator, hiding the one in d2.
+                const double Omega = -g.keplerian_omega(r_hit);
+                const double b     = bs.geo.pphi / (-bs.geo.pt);
                 double gLL[4][4];
                 g.covariant_BL(r_hit, M_PI/2.0, gLL);
                 const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
                 const double dv = 1.0 - Omega*b;
-                double red = (d2 > 0.0 && std::abs(dv) > 1e-10)
-                             ? std::sqrt(d2)/dv : 1.0;
-                red = red < 0.0 ? 0.0 : red > 20.0 ? 20.0 : red;
+                // Same floors and ceiling as disk_redshift(): a photon reaching the
+                // disk has E − ΩL > 0, so flooring dv rather than special-casing it
+                // keeps g finite without inventing an unshifted value.
+                const double d2_safe = d2 > 1.0e-8 ? d2 : 1.0e-8;
+                const double dv_safe = dv > 1.0e-8 ? dv : 1.0e-8;
+                double red = std::sqrt(d2_safe)/dv_safe;
+                if (!std::isfinite(red)) red = 1.0;
+                red = red < 0.0 ? 0.0 : red > 6.0 ? 6.0 : red;
 
                 // ── Jacobi map  J: screen (α,β) → disk (r,φ) ────
                 // Project the (r,θ) sub-block of W onto the disk tangent plane.

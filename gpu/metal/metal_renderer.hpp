@@ -66,6 +66,8 @@ struct CameraParams_C {
     int   radial_term_b_denom; // 0 = off, 1 = on (physical NT only)
     int   interstellar_inner_glow; // 0 = off (physical), 1 = artistic exponential decay
     int   interstellar_physical_profile; // 1 = Novikov-Thorne flux, 0 = artistic power law
+    int   bundle_magnif_luma;   // 0 = off (physical), 1 = modulate luminance by 1/magnification
+    float bundle_magnif_max;    // soft ceiling of that factor
 };
 
 /// Renders the image on the default Metal GPU device.

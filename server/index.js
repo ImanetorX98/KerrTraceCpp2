@@ -1210,6 +1210,10 @@ app.post('/api/render', (req, res) => {
   else if (res_key === '4K')    args.push('--4k');
 
   if (p.bundles)  args.push('--bundles');
+  // Artistic: let the bundle magnification modulate the disk luminance. Off by
+  // default because surface brightness is g^4 times the emitted one regardless
+  // of the bundle footprint, so it only matters when it is explicitly asked for.
+  if (p.bundle_magnification === true) args.push('--bundle-magnification');
   if (p.anti_fireflies) args.push('--anti-fireflies');
   if (p.dopri5)   args.push('--dopri5');
   if (p.gpu_fp64) args.push('--gpu-fp64');

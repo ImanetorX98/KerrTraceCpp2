@@ -96,6 +96,11 @@ struct ColorParams {
     bool   doppler_enabled = true; // relativistic Doppler boosting toggle
     double doppler_exp     = 4.0;  // beaming exponent: 4=physical, <4=softer effect
     bool   zero_torque_taper = false; // multiply intensity by (1-sqrt(r_isco/r)): zero at ISCO, physical inner BC
+    // Artificial: let the ray-bundle magnification modulate the disk luminance.
+    // OFF by default because it is not physical for a resolved disk (see
+    // magnif_luma_scale).  When on, the value is normalised frame-wide first.
+    bool   bundle_magnif_luma = false;
+    double bundle_magnif_max  = 5.0;   // ceiling of the 1/|det J| factor when on
 
     // Interstellar cinematic mode (artist-friendly controls)
     double interstellar_omega0                = 1.0;
@@ -454,6 +459,23 @@ static double doppler_luma_scale_inverted(double redshift, double exp) {
 
 static inline double doppler_luma_scale(double redshift, const ColorParams& cp) {
     return cp.doppler_enabled ? doppler_luma_scale_inverted(redshift, cp.doppler_exp) : 1.0;
+}
+
+// Ray-bundle magnification as a luminance factor: OFF by default, because it is
+// not physical for a resolved source.  Liouville's theorem makes I_nu/nu^3 constant
+// along a null geodesic, so the observed surface brightness of the disk is exactly
+// g^4 times the emitted one and does not depend on the bundle's footprint: lensing
+// makes the disk cover more pixels, it does not make each pixel brighter.  The
+// Jacobian |det J| is the footprint area, i.e. a filtering width (which is how DNGR
+// uses it), not a flux correction.  Multiplying by 1/|det J| double-counted the
+// lensing and produced the saturated blob at the photon ring.
+//
+// Kept as an explicit artistic option, reproducing the legacy factor verbatim:
+// the raw Jacobian, clamped. No frame-wide normalisation is applied, so a pixel's
+// colour depends only on that pixel's own geodesic.
+static inline double magnif_luma_scale(double magnif, const ColorParams& cp) {
+    if (!cp.bundle_magnif_luma) return 1.0;
+    return clamp(1.0 / std::max(magnif, 1e-12), 0.05, std::max(0.05, cp.bundle_magnif_max));
 }
 
 // Continue tracing from an already-known state, but ignoring further disk hits.
@@ -2025,27 +2047,6 @@ static double inner_emission_floor_value(double r,
     return floor0 * std::exp(-t * t);
 }
 
-// |det J| from the ray bundle is a dimensional Jacobian d(r,theta)/d(alpha,beta),
-// not a magnification: its scale is set by the camera geometry, so it sits around
-// tens rather than around one. Flux depends on the dimensionless ratio against the
-// weakly-lensed value, which measurement shows is a constant of the camera setup --
-// |det J| flattens to ~23.6 over the outer disk at a=0.998, theta=82, r_obs=60 while
-// varying by 3x further in. The median over disk pixels estimates it robustly, since
-// most of the frame is not strongly lensed. Returns 1 for single-ray buffers, where
-// every magnif is already 1, so the correction is inert there.
-static double disk_magnif_reference(const std::vector<GeoPixel>& geo) {
-    std::vector<float> m;
-    m.reserve(geo.size() / 4 + 1);
-    for (const GeoPixel& g : geo)
-        if (g.outcome == 1 && std::isfinite(g.magnif) && g.magnif > 0.0f)
-            m.push_back(g.magnif);
-    if (m.empty()) return 1.0;
-    const size_t mid = m.size() / 2;
-    std::nth_element(m.begin(), m.begin() + mid, m.end());
-    const double med = double(m[mid]);
-    return (std::isfinite(med) && med > 1e-12) ? med : 1.0;
-}
-
 static double disk_flux_reference(double r_isco, double r_disk_out, double a,
                                   const ColorParams& cp) {
     if (cp.radial_profile == DiskRadialProfile::PHYSICAL_NT) {
@@ -2225,7 +2226,7 @@ static RGB disk_colour_stratified(double r, double phi,
     double I = flux / safe_ref;
     I = std::max(I, inner_emission_floor_value(r, r_isco, r_out, cp));
     I *= doppler_luma_scale(red, cp);
-    I *= clamp(1.0 / magnif, 0.05, 5.0);
+    I *= magnif_luma_scale(magnif, cp);
     I *= std::max(0.0, cp.disk_brightness);
 
     const double norm = w_total * 255.0;
@@ -2364,7 +2365,7 @@ static RGB disk_colour_interstellar(double r, double phi,
     cg += (out_g - cg) * t2;
     cb += (out_b - cb) * t2;
 
-    const double lens = clamp(1.0 / std::max(magnif, 1e-6), 0.05, 5.0);
+    const double lens = magnif_luma_scale(magnif, cp);
 
     // Gaussian taper from inner edge to suppress bright ring at r_in.
     const double inner_taper_sigma = std::max(1e-6, cp.interstellar_inner_taper_scale * r_in);
@@ -2445,7 +2446,7 @@ static RGB disk_colour_interstellar_nasa(double r, double phi,
     cg += (out_g - cg) * t2;
     cb += (out_b - cb) * t2;
 
-    const double lens = clamp(1.0 / std::max(magnif, 1e-6), 0.05, 5.0);
+    const double lens = magnif_luma_scale(magnif, cp);
 
     const double inner_taper_sigma = std::max(1e-6, cp.interstellar_inner_taper_scale * r_in);
     const double dr_in = std::max(0.0, r - r_in);
@@ -2485,7 +2486,7 @@ static RGB disk_colour(double r, double red, double magnif,
     double I = flux / safe_ref;
     I = std::max(I, inner_emission_floor_value(r, r_isco, r_disk_out, cp));
     I *= doppler_luma_scale(red, cp);
-    I *= clamp(1.0/magnif, 0.05, 5.0);
+    I *= magnif_luma_scale(magnif, cp);
     I *= std::max(0.0, cp.disk_brightness);
     if (cp.planck_emission && T > 0.0) {
         // Weight intensity by Planck B(T,λ=550nm) / B(T_ref,λ=550nm).
@@ -2526,7 +2527,6 @@ static std::vector<RGB> colorize_buffer(
 {
     std::vector<RGB> image(W*H, {0,0,0});
     const double flux_ref = disk_flux_reference(r_isco, r_disk_out, a_bh, cp);
-    const double magnif_ref = disk_magnif_reference(geo);
 
     if (debug_elliptic) {
         // Color by elliptic solver tag stored in _pad[0]:
@@ -2551,9 +2551,7 @@ static std::vector<RGB> colorize_buffer(
         const GeoPixel& p = geo[i];
         if (p.outcome == 1) {
             RGB disk_col{};
-            // Normalised once here so every palette's 1/magnif term becomes the
-            // dimensionless magnification rather than a raw Jacobian.
-            const double magnif_n = double(p.magnif) / magnif_ref;
+            const double magnif_n = double(p.magnif);
             if (cp.palette == DiskPalette::STRATIFIED) {
                 disk_col = disk_colour_stratified(p.r, p.phi_disk,
                                                   p.redshift, magnif_n,
@@ -3186,7 +3184,9 @@ static std::vector<RGB> render_image(
                            cp.radial_term_relativistic ? 1 : 0,
                            cp.radial_term_b_denom ? 1 : 0,
                            cp.interstellar_inner_glow ? 1 : 0,
-                           cp.interstellar_physical_profile ? 1 : 0};
+                           cp.interstellar_physical_profile ? 1 : 0,
+                           cp.bundle_magnif_luma ? 1 : 0,
+                           (float)cp.bundle_magnif_max};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -3578,6 +3578,10 @@ int main(int argc, char** argv) {
             cli_inner_emission_floor = std::stod(argv[++i]);
         if (arg=="--disk-inner-emission-floor-width" && i+1<argc)
             cli_inner_emission_floor_width = std::stod(argv[++i]);
+        if (arg=="--bundle-magnification")    cp.bundle_magnif_luma = true;
+        if (arg=="--no-bundle-magnification") cp.bundle_magnif_luma = false;
+        if (arg=="--bundle-magnification-max" && i+1<argc)
+            cp.bundle_magnif_max = std::max(1.0, std::stod(argv[++i]));
         if (arg=="--no-doppler") cli_doppler_enabled = false;
         if (arg=="--doppler") cli_doppler_enabled = true;
         if (arg=="--doppler-exp" && i+1<argc) cp.doppler_exp = std::max(0.0, std::stod(argv[++i]));

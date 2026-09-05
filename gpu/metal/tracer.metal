@@ -117,6 +117,8 @@ struct CameraParams {
     int   radial_term_b_denom; // 0 = off, 1 = on (physical NT only)
     int   interstellar_inner_glow; // 0 = off (physical), 1 = artistic exponential decay
     int   interstellar_physical_profile; // 1 = Novikov-Thorne flux, 0 = artistic power law
+    int   bundle_magnif_luma;   // 0 = off (physical), 1 = modulate luminance by 1/magnification
+    float bundle_magnif_max;    // soft ceiling of that factor
 };
 
 struct RenderParams {
@@ -1656,6 +1658,15 @@ static inline float doppler_intensity_scale(float redshift, int enable_doppler) 
     return pow(clamp(redshift, 0.01f, 10.0f), 4.0f);
 }
 
+// Mirrors magnif_luma_scale() in main.cpp: off by default, because Liouville's
+// theorem makes the observed surface brightness g^4 times the emitted one,
+// independent of the bundle footprint.
+static inline float magnif_luma_scale_f(float magnif, constant CameraParams_C& cp) {
+    if (cp.bundle_magnif_luma == 0) return 1.0f;
+    const float cap = max(0.05f, cp.bundle_magnif_max);
+    return clamp(1.0f / max(magnif, 1e-12f), 0.05f, cap);
+}
+
 static inline float robust_disk_redshift(float r_hit,
                                          float pt_cov,
                                          float pphi_cov,
@@ -1889,7 +1900,7 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
         cg += (out_g - cg) * t2;
         cb += (out_b - cb) * t2;
 
-        const float lens = clamp(1.0f / max(magnif, 1e-6f), 0.05f, 5.0f);
+        const float lens = magnif_luma_scale_f(magnif, cp);
 
         float intensity = mask * profile * turbulence * bands;
         // Physical g: >1 approaching side → use g^4 directly.
@@ -1915,7 +1926,7 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
     float I = disk_flux_norm_f(r_hit, r_isco, a, cp);
     I = max(I, inner_emission_floor_value_f(r_hit, r_isco, r_disk_out, cp));
     I *= doppler_intensity_scale(red, cp.enable_doppler);
-    I *= clamp(1.0f / max(magnif, 1e-12f), 0.05f, 5.0f);
+    I *= magnif_luma_scale_f(magnif, cp);
     I *= max(0.0f, cp.disk_brightness);
     const float4 bb = blackbody_rgb(T);
     const float exposure = max(cp.exposure, 0.0f);
