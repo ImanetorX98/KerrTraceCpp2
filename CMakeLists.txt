@@ -28,7 +28,7 @@ if(KT_HW_ARM64 AND NOT CMAKE_OSX_ARCHITECTURES)
         "macOS build architectures" FORCE)
 endif()
 
-project(KerrTracer VERSION 0.2.17 LANGUAGES CXX)
+project(KerrTracer VERSION 0.2.18 LANGUAGES CXX)
 
 # Refuse to emit a binary that would need Rosetta. Cross-compiling for Intel
 # stays possible, but only as a deliberate, explicit choice.
@@ -235,4 +235,14 @@ if(BUILD_TESTING)
     # Three renders of a 320x180 frame: ~6 s when correct. The ceiling is here so
     # a non-terminating bundle fails the suite instead of hanging it.
     set_tests_properties(kerrtrace.ray_bundle PROPERTIES TIMEOUT 1200)
+
+    add_executable(kerrtrace_chart_consistency_regression
+        tests/chart_consistency_regression.cpp)
+    target_include_directories(kerrtrace_chart_consistency_regression
+        PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_chart_consistency_regression PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
+    add_test(NAME kerrtrace.chart_consistency
+        COMMAND kerrtrace_chart_consistency_regression $<TARGET_FILE:kerr_tracer>)
+    set_tests_properties(kerrtrace.chart_consistency PROPERTIES TIMEOUT 900)
 endif()
