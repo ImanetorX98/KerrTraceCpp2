@@ -50,7 +50,7 @@ Il difetto è reale ma sta altrove → punto **1-ter**.
 
 ---
 
-## 1-ter. ~~BL e KS non danno la stessa immagine~~ — RISOLTO in v0.2.18
+## 1-ter. ~~BL e KS non danno la stessa immagine~~ — RISOLTO in v0.2.18 e v0.2.19
 
 Causa: `bl_covector_to_ks()` trattava Kerr-Schild ingoing come una semplice
 rietichettatura spaziale di Boyer-Lindquist. Non lo è:
@@ -81,11 +81,12 @@ Accordo fra carte: `|Δr|` mediano da 0.658 a **1.6e-5**, differenza di hit da
 Test `kerrtrace.chart_consistency`: contro il binario pre-fix fallisce 7
 controlli su 8 (passa solo BL, che era giusta).
 
-**Resta un pezzo**: `|Δφ_disk|` è ancora 0.155 rad a `a=0.998` (0.0005 a `a=0`,
-cresce con lo spin) — è la torsione `∫(a/Δ)dr` fra `φ_KS` e `φ_BL`, che
-`KS_to_BL_spatial` non applica. Non tocca `r` né `g`, solo la fase delle texture
-procedurali. Forma chiusa disponibile:
-`G(r) = a/(r₊−r₋) · ln|(r−r₊)/(r−r₋)|`.
+**Pezzo φ chiuso in v0.2.19**: la torsione `φ_KS = φ_BL + G(r)` con
+`G(r) = a/(r₊−r₋)·ln|(r−r₊)/(r−r₋)|` (limite estremale `−a/(r−M)`) ora è
+applicata in entrata e tolta in uscita. `|Δφ_disk|` a `a=0.9` da **0.1267** a
+**2.9e-5** rad, cioè lo stesso residuo numerico del caso `a=0` dove torsione non
+ce n'è. Sull'azimut di fuga l'effetto era già piccolo (G→0 all'infinito):
+da 0.00115 a 2.9e-5.
 
 ---
 

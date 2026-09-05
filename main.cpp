@@ -1650,6 +1650,32 @@ static void jacobian_bl_to_ks(double r, double theta, double phi, double a_spin,
 // chart rendered the Schwarzschild shadow 4.88% too large (7.6289 deg against the
 // analytic 7.2740 deg) while BL got it to 0.05%. The error was independent of the
 // integrator tolerance, because it is in the initial data, not the integration.
+// The azimuth of the Kerr-Schild chart is not the Boyer-Lindquist one either:
+// dphi_KS = dphi + (a/Delta_r) dr integrates to
+//
+//     phi_KS = phi_BL + G(r),   G(r) = a/(r+ - r-) ln|(r - r+)/(r - r-)| ,
+//
+// with the extremal limit G(r) = -a/(r - M) when r+ = r-. BL_to_KS_spatial takes
+// the KS azimuth (its embedding X = sin(theta)(r cos phi - a sin phi) is the
+// standard Kerr-Schild one), so a BL azimuth must be twisted on the way in and
+// untwisted on the way out. Without this the two charts disagreed on phi_disk by
+// 0.155 rad at a = 0.998 -- zero at a = 0, growing with spin -- which rotated the
+// procedural disk textures and the star field between charts. G vanishes at
+// infinity, so the effect on an escaping ray is the camera-radius value alone.
+static double ks_azimuth_twist(double r, double a_spin, double M, double Q) {
+    if (std::abs(a_spin) < 1e-15) return 0.0;
+    const double disc = M*M - a_spin*a_spin - Q*Q;
+    if (disc <= 1e-14) {                      // extremal (and near-extremal) limit
+        const double d = r - M;
+        return (std::abs(d) > 1e-12) ? (-a_spin / d) : 0.0;
+    }
+    const double root = std::sqrt(disc);
+    const double rp = M + root, rm = M - root;
+    const double num = r - rp, den = r - rm;
+    if (!(std::abs(num) > 1e-12) || !(std::abs(den) > 1e-12)) return 0.0;
+    return a_spin / (rp - rm) * std::log(std::abs(num / den));
+}
+
 static double ks_radial_covector_shift(double r, double a_spin, double M, double Q,
                                        double pt, double pphi) {
     const double Delta = r*r - 2.0*M*r + a_spin*a_spin + Q*Q;
@@ -1693,10 +1719,14 @@ static std::array<double, 3> ks_covector_to_bl(double r, double theta, double ph
 static bool init_ks_state(const GeodesicState& s_bl, const KNdSMetric& g, KSState& s_ks) {
     if (std::abs(g.Lambda) > 1e-15) return false;
 
-    KNdSMetric::BL_to_KS_spatial(s_bl.r, s_bl.theta, s_bl.phi, g.a, s_ks.X, s_ks.Y, s_ks.Z);
+    const double phi_ks = s_bl.phi + ks_azimuth_twist(s_bl.r, g.a, g.M, g.Q);
+    KNdSMetric::BL_to_KS_spatial(s_bl.r, s_bl.theta, phi_ks, g.a, s_ks.X, s_ks.Y, s_ks.Z);
     const double pr_ks = s_bl.pr + ks_radial_covector_shift(s_bl.r, g.a, g.M, g.Q,
                                                             s_bl.pt, s_bl.pphi);
-    if (!bl_covector_to_ks(s_bl.r, s_bl.theta, s_bl.phi, g.a,
+    // The Jacobian is d(X,Y,Z)/d(r,theta,phi_KS), so it is evaluated at the KS
+    // azimuth; the twist between the two azimuths is already carried by the
+    // -G' p_phi term inside ks_radial_covector_shift.
+    if (!bl_covector_to_ks(s_bl.r, s_bl.theta, phi_ks, g.a,
                            pr_ks, s_bl.ptheta, s_bl.pphi,
                            s_ks.pX, s_ks.pY, s_ks.pZ)) {
         return false;
@@ -1852,6 +1882,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
             if (!std::isfinite(dlam) || ++rejects > 64) {
                 double r_tmp, th_tmp, ph_tmp;
                 KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_tmp, th_tmp, ph_tmp);
+                ph_tmp -= ks_azimuth_twist(r_tmp, g.a, g.M, g.Q);
                 return {Outcome::ESCAPED, r_tmp, 1.0, 0.0, th_tmp, ph_tmp};
             }
         }
@@ -1894,21 +1925,24 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
 
                 double r_hit, th_hit, ph_hit;
                 KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
+                // ph_hit is the KS azimuth: the Jacobian inside ks_covector_to_bl
+                // wants it as such, everything downstream wants the BL one.
+                const double ph_hit_bl = ph_hit - ks_azimuth_twist(r_hit, g.a, g.M, g.Q);
                 if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
                     const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
                     bool pass_through = false;
                     if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
                         pass_through = stratified_disk_tile_transparent(
-                            r_hit, ph_hit, r_disk_in, r_disk_out, *cp_ptr);
+                            r_hit, ph_hit_bl, r_disk_in, r_disk_out, *cp_ptr);
                     } else if (cp_ptr && (cp_ptr->palette == DiskPalette::INTERSTELLAR ||
                                           cp_ptr->palette == DiskPalette::INTERSTELLAR_NASA)) {
                         pass_through = interstellar_disk_soft_mask(
-                            r_hit, ph_hit, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
+                            r_hit, ph_hit_bl, r_disk_in, r_disk_out, *cp_ptr) < std::max(0.0, cp_ptr->interstellar_edge_transparency);
                     }
                     if (!pass_through) {
                         disk_r_hit  = r_hit;
                         disk_red_hit = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
-                        disk_phi_hit = ph_hit;
+                        disk_phi_hit = ph_hit_bl;
                         best_alpha  = alpha;
                         best_event  = StepEvent::DISK;
                     }
@@ -1954,10 +1988,12 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                 KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
                 const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
                 // pbl[0] is the KS radial component p_r - F' p_t - G' p_phi; undo the
-                // shift to hand trace_terminal_no_disk a genuine BL momentum.
+                // shift to hand trace_terminal_no_disk a genuine BL momentum, and
+                // untwist the azimuth for the same reason.
                 const double pr_bl = pbl[0] - ks_radial_covector_shift(r_hit, g.a, g.M, g.Q,
                                                                        s_prev.pT, pbl[2]);
-                GeodesicState s_hit{r_hit, th_hit, ph_hit, pr_bl, pbl[1], s_prev.pT, pbl[2]};
+                const double ph_bl = ph_hit - ks_azimuth_twist(r_hit, g.a, g.M, g.Q);
+                GeodesicState s_hit{r_hit, th_hit, ph_bl, pr_bl, pbl[1], s_prev.pT, pbl[2]};
                 const double th_eps = 1e-6;
                 if (std::abs(s_hit.theta - M_PI/2.0) < 1e-5)
                     s_hit.theta += ((s.Z - s_prev.Z) >= 0.0 ? th_eps : -th_eps);
@@ -1982,6 +2018,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
             const double Z_esc = s_prev.Z + best_alpha * (s.Z - s_prev.Z);
             double r_esc, th_esc, ph_esc;
             KNdSMetric::KS_to_BL_spatial(X_esc, Y_esc, Z_esc, g.a, r_esc, th_esc, ph_esc);
+            ph_esc -= ks_azimuth_twist(r_esc, g.a, g.M, g.Q);
             return {Outcome::ESCAPED, r_esc, 1.0, 0.0, th_esc, ph_esc};
         }
 
@@ -1990,6 +2027,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
 
     double r_end, th_end, ph_end;
     KNdSMetric::KS_to_BL_spatial(s.X, s.Y, s.Z, g.a, r_end, th_end, ph_end);
+    ph_end -= ks_azimuth_twist(r_end, g.a, g.M, g.Q);
     return {Outcome::ESCAPED, r_end, 1.0, 0.0, th_end, ph_end};
 }
 
