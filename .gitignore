@@ -1,9 +1,13 @@
 # Build outputs
 build/
+build*/
 build-ci/
 build-cuda/
-out/*.ppm
-out/*.png
+*.tmp
+
+# Render output: PNG/PPM frames and the .kgeo geodesic buffers, which are large
+# (11 GB here) and fully regenerable from the tracer.
+out/
 
 # macOS
 .DS_Store

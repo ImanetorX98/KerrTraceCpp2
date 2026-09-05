@@ -295,7 +295,11 @@ Option (b) is already in effect via the fallback guard.
 ### Build notes (2026-04-24)
 - CPU binary: `cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu`
 - Metal binary: `cmake -B build -DUSE_METAL=ON && cmake --build build`
-- tracer.metal is loaded at runtime from `build/tracer.metal` (copied from source).
-  Changes to `gpu/metal/tracer.metal` require rebuild to copy to build dir.
+- tracer.metal is loaded at runtime from `exeDir/../gpu/metal/tracer.metal`, i.e.
+  **the source file**, not the copy in the build dir (`metal_renderer.mm:49`).
+  The `build/tracer.metal` copy made by `configure_file` is only the fallback,
+  used when the first path fails. So editing `gpu/metal/tracer.metal` takes effect
+  on the next run with no rebuild — and patching `build*/tracer.metal` does
+  nothing at all.
 - Metal elliptic-closed: `can_separable_kerr` in shader checks Q≈0, Λ≈0 (NOT chart),
   so elliptic solver runs even in KS chart mode on GPU.
