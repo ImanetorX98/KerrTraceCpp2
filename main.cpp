@@ -2025,6 +2025,27 @@ static double inner_emission_floor_value(double r,
     return floor0 * std::exp(-t * t);
 }
 
+// |det J| from the ray bundle is a dimensional Jacobian d(r,theta)/d(alpha,beta),
+// not a magnification: its scale is set by the camera geometry, so it sits around
+// tens rather than around one. Flux depends on the dimensionless ratio against the
+// weakly-lensed value, which measurement shows is a constant of the camera setup --
+// |det J| flattens to ~23.6 over the outer disk at a=0.998, theta=82, r_obs=60 while
+// varying by 3x further in. The median over disk pixels estimates it robustly, since
+// most of the frame is not strongly lensed. Returns 1 for single-ray buffers, where
+// every magnif is already 1, so the correction is inert there.
+static double disk_magnif_reference(const std::vector<GeoPixel>& geo) {
+    std::vector<float> m;
+    m.reserve(geo.size() / 4 + 1);
+    for (const GeoPixel& g : geo)
+        if (g.outcome == 1 && std::isfinite(g.magnif) && g.magnif > 0.0f)
+            m.push_back(g.magnif);
+    if (m.empty()) return 1.0;
+    const size_t mid = m.size() / 2;
+    std::nth_element(m.begin(), m.begin() + mid, m.end());
+    const double med = double(m[mid]);
+    return (std::isfinite(med) && med > 1e-12) ? med : 1.0;
+}
+
 static double disk_flux_reference(double r_isco, double r_disk_out, double a,
                                   const ColorParams& cp) {
     if (cp.radial_profile == DiskRadialProfile::PHYSICAL_NT) {
@@ -2505,6 +2526,7 @@ static std::vector<RGB> colorize_buffer(
 {
     std::vector<RGB> image(W*H, {0,0,0});
     const double flux_ref = disk_flux_reference(r_isco, r_disk_out, a_bh, cp);
+    const double magnif_ref = disk_magnif_reference(geo);
 
     if (debug_elliptic) {
         // Color by elliptic solver tag stored in _pad[0]:
@@ -2529,23 +2551,26 @@ static std::vector<RGB> colorize_buffer(
         const GeoPixel& p = geo[i];
         if (p.outcome == 1) {
             RGB disk_col{};
+            // Normalised once here so every palette's 1/magnif term becomes the
+            // dimensionless magnification rather than a raw Jacobian.
+            const double magnif_n = double(p.magnif) / magnif_ref;
             if (cp.palette == DiskPalette::STRATIFIED) {
                 disk_col = disk_colour_stratified(p.r, p.phi_disk,
-                                                  p.redshift, p.magnif,
+                                                  p.redshift, magnif_n,
                                                   r_disk_in, r_disk_out,
                                                   M_bh, a_bh, r_isco, cp, flux_ref);
             } else if (cp.palette == DiskPalette::INTERSTELLAR) {
                 disk_col = disk_colour_interstellar(p.r, p.phi_disk,
-                                                    p.redshift, p.magnif,
+                                                    p.redshift, magnif_n,
                                                     r_disk_in, r_disk_out,
                                                     M_bh, a_bh, r_isco, cp, flux_ref);
             } else if (cp.palette == DiskPalette::INTERSTELLAR_NASA) {
                 disk_col = disk_colour_interstellar_nasa(p.r, p.phi_disk,
-                                                         p.magnif,
+                                                         magnif_n,
                                                          r_disk_in, r_disk_out,
                                                          r_isco, cp);
             } else {
-                disk_col = disk_colour(p.r, p.redshift, p.magnif,
+                disk_col = disk_colour(p.r, p.redshift, magnif_n,
                                        M_bh, a_bh, r_isco, r_disk_out, cp, flux_ref);
             }
 
