@@ -28,7 +28,7 @@ if(KT_HW_ARM64 AND NOT CMAKE_OSX_ARCHITECTURES)
         "macOS build architectures" FORCE)
 endif()
 
-project(KerrTracer VERSION 0.2.15 LANGUAGES CXX)
+project(KerrTracer VERSION 0.2.16 LANGUAGES CXX)
 
 # Refuse to emit a binary that would need Rosetta. Cross-compiling for Intel
 # stays possible, but only as a deliberate, explicit choice.
@@ -223,4 +223,16 @@ if(BUILD_TESTING)
         $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
     add_test(NAME kerrtrace.spin_orientation
         COMMAND kerrtrace_spin_orientation_regression $<TARGET_FILE:kerr_tracer>)
+
+    add_executable(kerrtrace_ray_bundle_regression
+        tests/ray_bundle_regression.cpp)
+    target_include_directories(kerrtrace_ray_bundle_regression
+        PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_ray_bundle_regression PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>)
+    add_test(NAME kerrtrace.ray_bundle
+        COMMAND kerrtrace_ray_bundle_regression $<TARGET_FILE:kerr_tracer>)
+    # Three renders of a 320x180 frame: ~6 s when correct. The ceiling is here so
+    # a non-terminating bundle fails the suite instead of hanging it.
+    set_tests_properties(kerrtrace.ray_bundle PROPERTIES TIMEOUT 1200)
 endif()
