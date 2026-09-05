@@ -215,14 +215,17 @@ int main(int argc, char** argv) {
         }
 
         size_t hits_bl = 0, hits_ks = 0;
-        std::vector<float> dr, dg;
+        std::vector<float> dr, dg, dphi, dphi_esc;
         for (size_t i = 0; i < bl.px.size(); ++i) {
             if (bl.px[i].outcome == 1u) ++hits_bl;
             if (ks.px[i].outcome == 1u) ++hits_ks;
             if (bl.px[i].outcome == 1u && ks.px[i].outcome == 1u) {
                 dr.push_back(std::abs(bl.px[i].r - ks.px[i].r));
                 dg.push_back(std::abs(bl.px[i].redshift - ks.px[i].redshift));
+                dphi.push_back(std::abs(bl.px[i].phi_disk - ks.px[i].phi_disk));
             }
+            if (bl.px[i].outcome == 0u && ks.px[i].outcome == 0u)
+                dphi_esc.push_back(std::abs(bl.px[i].phi_esc - ks.px[i].phi_esc));
         }
         const double hit_diff = (hits_bl > 0)
             ? 100.0 * std::abs(double(hits_ks) - double(hits_bl)) / double(hits_bl)
@@ -249,6 +252,28 @@ int main(int argc, char** argv) {
             d << "a=" << a << ": median |dg| = " << dg_med << ", limit 0.01";
             check(std::isfinite(dg_med) && dg_med < 0.01,
                   "BL and KS agree on the redshift", d.str());
+        }
+        {   // The (a/Delta) dr twist between the two azimuths. Broken: 0.1267 rad
+            // at a=0.9 and zero at a=0, since the twist is proportional to a.
+            // Fixed: 4.2e-4 at every spin, i.e. the same residual as the
+            // untwisted a=0 case, which is numerical noise rather than a twist.
+            const double dphi_med = median_of(dphi);
+            std::ostringstream d;
+            d << "a=" << a << ": median |dphi_disk| = " << dphi_med
+              << " rad, limit 0.01";
+            check(std::isfinite(dphi_med) && dphi_med < 0.01,
+                  "BL and KS agree on the disk azimuth", d.str());
+        }
+        {   // This one did NOT discriminate the twist bug and is not claimed to:
+            // G(r) vanishes at infinity, so an escaping ray was already close to
+            // right (0.00115 rad before the fix, 2.9e-5 after). It is here as a
+            // guard on background sampling, not as a witness for that fix.
+            const double dpe_med = median_of(dphi_esc);
+            std::ostringstream d;
+            d << "a=" << a << ": median |dphi_esc| = " << dpe_med
+              << " rad over " << dphi_esc.size() << " escaping rays, limit 0.01";
+            check(std::isfinite(dpe_med) && dpe_med < 0.01,
+                  "BL and KS sample the background at the same azimuth", d.str());
         }
     }
 
