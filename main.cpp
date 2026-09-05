@@ -1631,6 +1631,34 @@ static void jacobian_bl_to_ks(double r, double theta, double phi, double a_spin,
     }
 }
 
+// Ingoing Kerr-Schild is NOT a purely spatial relabelling of Boyer-Lindquist:
+//
+//     dT       = dt   + (2Mr - Q^2)/Delta_r dr
+//     dphi_KS  = dphi + a/Delta_r          dr
+//
+// so both the BL time and the BL azimuth depend on the KS *spatial* coordinates
+// through r(X,Y,Z). The chain rule for the covector therefore carries two extra
+// terms along dr/dX^i:
+//
+//     p_{X^i} = [p_r - F' p_t - G' p_phi] dr/dX^i
+//             + p_theta dtheta/dX^i + p_phi dphi_KS/dX^i ,
+//     F' = (2Mr - Q^2)/Delta_r ,  G' = a/Delta_r ,
+//
+// which is the same 3x3 Jacobian as before applied to a corrected radial
+// component. Passing the raw p_r instead put a spurious radial momentum into the
+// KS ray: at r = 40M, a = 0, the missing F' p_t term is 5.3% of E, and the KS
+// chart rendered the Schwarzschild shadow 4.88% too large (7.6289 deg against the
+// analytic 7.2740 deg) while BL got it to 0.05%. The error was independent of the
+// integrator tolerance, because it is in the initial data, not the integration.
+static double ks_radial_covector_shift(double r, double a_spin, double M, double Q,
+                                       double pt, double pphi) {
+    const double Delta = r*r - 2.0*M*r + a_spin*a_spin + Q*Q;
+    if (!(std::abs(Delta) > 1e-14)) return 0.0;
+    const double Fp = (2.0*M*r - Q*Q) / Delta;   // dT/dr   at fixed t
+    const double Gp = a_spin / Delta;            // dphi_KS/dr at fixed phi_BL
+    return -Fp*pt - Gp*pphi;
+}
+
 static bool bl_covector_to_ks(double r, double theta, double phi, double a_spin,
                               double pr, double ptheta, double pphi,
                               double& pX, double& pY, double& pZ) {
@@ -1666,8 +1694,10 @@ static bool init_ks_state(const GeodesicState& s_bl, const KNdSMetric& g, KSStat
     if (std::abs(g.Lambda) > 1e-15) return false;
 
     KNdSMetric::BL_to_KS_spatial(s_bl.r, s_bl.theta, s_bl.phi, g.a, s_ks.X, s_ks.Y, s_ks.Z);
+    const double pr_ks = s_bl.pr + ks_radial_covector_shift(s_bl.r, g.a, g.M, g.Q,
+                                                            s_bl.pt, s_bl.pphi);
     if (!bl_covector_to_ks(s_bl.r, s_bl.theta, s_bl.phi, g.a,
-                           s_bl.pr, s_bl.ptheta, s_bl.pphi,
+                           pr_ks, s_bl.ptheta, s_bl.pphi,
                            s_ks.pX, s_ks.pY, s_ks.pZ)) {
         return false;
     }
@@ -1923,7 +1953,11 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                 double r_hit, th_hit, ph_hit;
                 KNdSMetric::KS_to_BL_spatial(Xh, Yh, Zh, g.a, r_hit, th_hit, ph_hit);
                 const auto pbl = ks_covector_to_bl(r_hit, th_hit, ph_hit, g.a, pXh, pYh, pZh);
-                GeodesicState s_hit{r_hit, th_hit, ph_hit, pbl[0], pbl[1], s_prev.pT, pbl[2]};
+                // pbl[0] is the KS radial component p_r - F' p_t - G' p_phi; undo the
+                // shift to hand trace_terminal_no_disk a genuine BL momentum.
+                const double pr_bl = pbl[0] - ks_radial_covector_shift(r_hit, g.a, g.M, g.Q,
+                                                                       s_prev.pT, pbl[2]);
+                GeodesicState s_hit{r_hit, th_hit, ph_hit, pr_bl, pbl[1], s_prev.pT, pbl[2]};
                 const double th_eps = 1e-6;
                 if (std::abs(s_hit.theta - M_PI/2.0) < 1e-5)
                     s_hit.theta += ((s.Z - s_prev.Z) >= 0.0 ? th_eps : -th_eps);

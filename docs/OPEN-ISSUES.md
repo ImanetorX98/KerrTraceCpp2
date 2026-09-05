@@ -50,7 +50,46 @@ Il difetto è reale ma sta altrove → punto **1-ter**.
 
 ---
 
-## 1-ter. APERTO — BL e KS non danno la stessa immagine
+## 1-ter. ~~BL e KS non danno la stessa immagine~~ — RISOLTO in v0.2.18
+
+Causa: `bl_covector_to_ks()` trattava Kerr-Schild ingoing come una semplice
+rietichettatura spaziale di Boyer-Lindquist. Non lo è:
+
+```
+dT      = dt   + (2Mr − Q²)/Δ_r · dr
+dφ_KS   = dφ   + a/Δ_r         · dr
+```
+
+quindi sia `t` sia `φ_BL` dipendono dalle coordinate **spaziali** KS attraverso
+`r(X,Y,Z)`, e il covettore prende due termini in più lungo `∂r/∂X^i`. Passando
+`p_r` grezzo si iniettava un momento radiale spurio: a r=40M, a=0 il termine
+mancante `(2Mr/Δ)p_t` vale il **5.3%** di E — esattamente l'ordine dell'errore
+osservato.
+
+Verifica assoluta contro la teoria (ombra di Schwarzschild, osservatore statico
+a r=40M, valore analitico 7.2740°):
+
+| | prima | dopo |
+|---|---|---|
+| BL | 7.2803° (+0.09%) | 7.2803° (+0.09%) |
+| **KS** | **7.6566° (+5.26%)** | **7.2803° (+0.09%)** |
+
+BL era sempre stata corretta; KS, **la carta di default**, sbagliava del 5%.
+Accordo fra carte: `|Δr|` mediano da 0.658 a **1.6e-5**, differenza di hit da
+10.6% a **0**, `|Δg|` da 0.0136 a **4.8e-7**.
+
+Test `kerrtrace.chart_consistency`: contro il binario pre-fix fallisce 7
+controlli su 8 (passa solo BL, che era giusta).
+
+**Resta un pezzo**: `|Δφ_disk|` è ancora 0.155 rad a `a=0.998` (0.0005 a `a=0`,
+cresce con lo spin) — è la torsione `∫(a/Δ)dr` fra `φ_KS` e `φ_BL`, che
+`KS_to_BL_spatial` non applica. Non tocca `r` né `g`, solo la fase delle texture
+procedurali. Forma chiusa disponibile:
+`G(r) = a/(r₊−r₋) · ln|(r−r₊)/(r−r₋)|`.
+
+---
+
+## 1-ter (storico). Come si presentava
 
 E la differenza **non cala stringendo la tolleranza**, quindi non è errore
 d'integrazione: BL vs KS dà `|Δr|` mediano 0.5313 a `tol=1e-7` e 0.5312 a
