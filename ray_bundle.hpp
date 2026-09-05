@@ -310,6 +310,11 @@ struct BundleResult {
     double theta_esc   = 0.0;  ///< final θ on escape (for background lookup)
     double phi_esc     = 0.0;  ///< final φ on escape
     double phi_disk    = 0.0;  ///< BL azimuthal angle at disk crossing
+    // Edge vectors of the pixel's footprint on the disk, in (r, φ), already
+    // scaled by the pixel's angular size. DNGR §2.2(iii) integrates the emission
+    // over this region rather than sampling the centre.
+    double fp_dr_a = 0.0, fp_dphi_a = 0.0;
+    double fp_dr_b = 0.0, fp_dphi_b = 0.0;
 };
 
 // ── Initial deviation of the bundle ──────────────────────────
@@ -362,6 +367,7 @@ static BundleResult trace_bundle(int px, int py,
     const double y = (double)py + pixel_offset_y;
     const double alpha = cam.fov_h*(x - 0.5*(cam.width-1))  / span;
     const double beta  = cam.fov_h*(0.5*(cam.height-1) - y) / span;
+    const double dang  = cam.fov_h / span;   // angular size of one pixel
 
     BundleState bs;
     bs.geo = cam.angle_ray(alpha, beta, g);
@@ -392,6 +398,8 @@ static BundleResult trace_bundle(int px, int py,
         double disk_red    = 1.0;
         double disk_det    = 1.0;
         double disk_phi    = 0.0;
+        double disk_fp_dr_a = 0.0, disk_fp_dphi_a = 0.0;
+        double disk_fp_dr_b = 0.0, disk_fp_dphi_b = 0.0;
 
         const double q0 = bs_prev.geo.theta - M_PI/2.0;
         const double q1 = bs.geo.theta      - M_PI/2.0;
@@ -499,6 +507,14 @@ static BundleResult trace_bundle(int px, int py,
 
                 double det = std::abs(J00*J11 - J01*J10);
                 det = det < 1e-12 ? 1e-12 : det;
+                // Per-pixel footprint: J is per unit (alpha, beta), so scale by
+                // the angular size of one pixel. J10/J11 carry a factor r_hit
+                // (they are r*dphi), which is removed to store a plain dphi.
+                const double inv_r = 1.0 / std::max(r_hit, 1e-12);
+                disk_fp_dr_a   = J00 * dang;
+                disk_fp_dphi_a = J10 * dang * inv_r;
+                disk_fp_dr_b   = J01 * dang;
+                disk_fp_dphi_b = J11 * dang * inv_r;
                 disk_r_hit  = r_hit;
                 disk_red    = red;
                 disk_det    = det;
@@ -530,7 +546,8 @@ static BundleResult trace_bundle(int px, int py,
         }
 
         if (best_event == StepEvent::DISK) {
-            return {true, disk_r_hit, disk_red, disk_det, 0.0, 0.0, disk_phi};
+            return {true, disk_r_hit, disk_red, disk_det, 0.0, 0.0, disk_phi,
+                    disk_fp_dr_a, disk_fp_dphi_a, disk_fp_dr_b, disk_fp_dphi_b};
         }
         if (best_event == StepEvent::HORIZON) {
             return {};

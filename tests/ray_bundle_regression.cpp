@@ -49,8 +49,10 @@ struct GeoPixelRaw {
     float phi_disk;
     float theta_esc;
     float phi_esc;
+    float fp_dr_a, fp_dphi_a;   // pixel footprint on the disk (bundle mode)
+    float fp_dr_b, fp_dphi_b;
 };
-static_assert(sizeof(GeoPixelRaw) == 28, "GeoPixelRaw must match GeoPixel in main.cpp");
+static_assert(sizeof(GeoPixelRaw) == 44, "GeoPixelRaw must match GeoPixel in main.cpp");
 
 struct GeoFrame {
     uint32_t W = 0;
@@ -92,7 +94,7 @@ bool load_kgeo(const std::filesystem::path& path, GeoFrame& out) {
 
     uint32_t version = 0;
     f.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (!f || version != 1) return false;
+    if (!f || version != 2) return false;
 
     f.read(reinterpret_cast<char*>(&out.W), sizeof(out.W));
     f.read(reinterpret_cast<char*>(&out.H), sizeof(out.H));
