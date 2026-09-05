@@ -81,6 +81,7 @@ export class App implements OnInit, OnDestroy {
     semi_analytic: false,
     bundles: false,
     anti_fireflies: false,
+    bundle_magnification: false,
     gpu_fp64: false,
     dopri5: false,
     max_steps: 60000,
@@ -456,6 +457,7 @@ export class App implements OnInit, OnDestroy {
     this.params.bundles = !this.params.bundles;
     if (!this.params.bundles) {
       this.params.anti_fireflies = false;
+      this.params.bundle_magnification = false;
     }
   }
 
@@ -465,6 +467,14 @@ export class App implements OnInit, OnDestroy {
       return;
     }
     this.params.anti_fireflies = !this.params.anti_fireflies;
+  }
+
+  toggleBundleMagnification() {
+    if (!this.params.bundles) {
+      this.params.bundle_magnification = false;
+      return;
+    }
+    this.params.bundle_magnification = !this.params.bundle_magnification;
   }
 
   toggleGpuFp64() {
@@ -888,6 +898,7 @@ export class App implements OnInit, OnDestroy {
     if (typeof (next as any).radial_term_r3_decay !== 'boolean') next.radial_term_r3_decay = true;
     if (typeof (next as any).radial_term_relativistic !== 'boolean') next.radial_term_relativistic = true;
     if (typeof (next as any).radial_term_b_denom !== 'boolean') next.radial_term_b_denom = true;
+    if (typeof (next as any).bundle_magnification !== 'boolean') next.bundle_magnification = false;
     this.params = next;
     this.enforceSolverConstraints();
     if (!this.params.bundles) this.params.anti_fireflies = false;

@@ -21,6 +21,7 @@ export interface RenderParams {
   semi_analytic: boolean;
   bundles: boolean;
   anti_fireflies: boolean;
+  bundle_magnification: boolean;
   gpu_fp64: boolean;
   dopri5: boolean;
   max_steps: number;

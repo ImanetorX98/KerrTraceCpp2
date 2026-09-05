@@ -242,6 +242,23 @@
                   [disabled]="!params.bundles"></button>
         </div>
         <div class="switch-row"
+             [class.disabled]="!params.bundles"
+             matTooltip="Artistica: modula la luminanza del disco con 1/|det J|. Spenta di default: la brillanza superficiale è g⁴ volte quella emessa, indipendente dal footprint del fascio."
+             [attr.tabindex]="params.bundles ? 0 : -1"
+             role="switch"
+             [attr.aria-checked]="params.bundle_magnification"
+             [attr.aria-disabled]="!params.bundles"
+             (click)="toggleBundleMagnification()"
+             (keydown.enter)="toggleBundleMagnification()"
+             (keydown.space)="$event.preventDefault(); toggleBundleMagnification()">
+          <label>Magnificazione bundle (artistica)</label>
+          <button class="switch"
+                  type="button"
+                  tabindex="-1"
+                  [class.on]="params.bundle_magnification"
+                  [disabled]="!params.bundles"></button>
+        </div>
+        <div class="switch-row"
              [class.disabled]="params.backend === 'cpu'"
              [matTooltip]="params.backend === 'cpu' ? 'Disponibile solo con backend GPU' : ''"
              [attr.tabindex]="params.backend !== 'cpu' ? 0 : -1"
