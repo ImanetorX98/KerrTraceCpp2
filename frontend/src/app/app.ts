@@ -106,6 +106,7 @@ export class App implements OnInit, OnDestroy {
     disk_hue_offset: 0.0,
     interstellar_omega0: 1.0,
     interstellar_p: 2.2,
+    interstellar_physical_profile: true,
     interstellar_inner_glow: false,
     interstellar_inner_falloff_scale: 0.7,
     interstellar_band_strength: 0.18,

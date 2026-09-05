@@ -104,6 +104,11 @@ struct ColorParams {
     // contains one. With scale 0.7*r_in and a near-extremal spin (r_isco~1.24M)
     // it decays over ~0.87M while the disk extends to tens of M, killing the
     // outer disk by ~1e7 where Novikov-Thorne asks for ~50x.
+    // Radial profile: physical Novikov-Thorne flux by default. The artistic
+    // power law (r/r_in)^-p is available but is not a disk model: the physical
+    // flux is r^-3 (1 - sqrt(r_isco/r)), which rises from the inner edge before
+    // decaying, and whose log-slope is bounded by 3.
+    bool   interstellar_physical_profile      = true;
     bool   interstellar_inner_glow            = false;
     double interstellar_inner_falloff_scale   = 0.7;   // multiplied by r_in; only used when inner_glow is on
     double interstellar_band_strength         = 0.18;
@@ -2284,10 +2289,10 @@ static double interstellar_disk_soft_mask(double r, double phi,
 static RGB disk_colour_interstellar(double r, double phi,
                                     double red, double magnif,
                                     double r_in, double r_out,
-                                    double M, double r_isco,
-                                    const ColorParams& cp) {
+                                    double M, double a, double r_isco,
+                                    const ColorParams& cp,
+                                    double flux_ref) {
     (void)M;
-    (void)r_isco;
 
     const double x = clamp((r - r_in) / std::max(r_out - r_in, 1e-12), 0.0, 1.0);
     const double t = cp.interstellar_time;
@@ -2301,7 +2306,11 @@ static RGB disk_colour_interstellar(double r, double phi,
 
     const double p = std::max(0.1, cp.interstellar_p);
     const double inner_falloff = std::max(1e-6, cp.interstellar_inner_falloff_scale * r_in);
-    const double radial = std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -p);
+    // Physical: Novikov-Thorne flux normalised to its peak, the same quantity the
+    // blackbody and stratified paths use. Artistic: bare power law, kept as an option.
+    const double radial = cp.interstellar_physical_profile
+        ? disk_flux_raw(r, r_isco, a, cp) / std::max(1.0e-12, flux_ref)
+        : std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -p);
     const double inner_glow = cp.interstellar_inner_glow
         ? std::exp(-(r - r_in) / inner_falloff)
         : 1.0;
@@ -2529,7 +2538,7 @@ static std::vector<RGB> colorize_buffer(
                 disk_col = disk_colour_interstellar(p.r, p.phi_disk,
                                                     p.redshift, p.magnif,
                                                     r_disk_in, r_disk_out,
-                                                    M_bh, r_isco, cp);
+                                                    M_bh, a_bh, r_isco, cp, flux_ref);
             } else if (cp.palette == DiskPalette::INTERSTELLAR_NASA) {
                 disk_col = disk_colour_interstellar_nasa(p.r, p.phi_disk,
                                                          p.magnif,
@@ -3151,7 +3160,8 @@ static std::vector<RGB> render_image(
                            cp.radial_term_r3_decay ? 1 : 0,
                            cp.radial_term_relativistic ? 1 : 0,
                            cp.radial_term_b_denom ? 1 : 0,
-                           cp.interstellar_inner_glow ? 1 : 0};
+                           cp.interstellar_inner_glow ? 1 : 0,
+                           cp.interstellar_physical_profile ? 1 : 0};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
@@ -3348,6 +3358,7 @@ int main(int argc, char** argv) {
     double cli_interstellar_p                   = cp.interstellar_p;
     double cli_interstellar_inner_falloff_scale = cp.interstellar_inner_falloff_scale;
     bool   cli_interstellar_inner_glow = cp.interstellar_inner_glow;
+    bool   cli_interstellar_physical_profile = cp.interstellar_physical_profile;
     double cli_interstellar_band_strength       = cp.interstellar_band_strength;
     double cli_interstellar_band_frequency      = cp.interstellar_band_frequency;
     double cli_interstellar_band_warp           = cp.interstellar_band_warp;
@@ -3512,6 +3523,7 @@ int main(int argc, char** argv) {
         if (arg=="--disk-hue-offset" && i+1<argc) cli_disk_hue_offset = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-omega0" && i+1<argc) cli_interstellar_omega0 = std::stod(argv[++i]);
         if (arg=="--disk-interstellar-p" && i+1<argc) cli_interstellar_p = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-artistic-profile") cli_interstellar_physical_profile = false;
         if (arg=="--disk-interstellar-inner-glow") cli_interstellar_inner_glow = true;
         // Setting the falloff only makes sense with the glow on, so imply it.
         if (arg=="--disk-interstellar-inner-falloff" && i+1<argc) {
@@ -3647,6 +3659,7 @@ int main(int argc, char** argv) {
         cp.interstellar_p = std::max(0.1, cli_interstellar_p);
         cp.interstellar_inner_falloff_scale = std::max(1.0e-4, cli_interstellar_inner_falloff_scale);
         cp.interstellar_inner_glow = cli_interstellar_inner_glow;
+        cp.interstellar_physical_profile = cli_interstellar_physical_profile;
         cp.interstellar_band_strength = std::max(0.0, cli_interstellar_band_strength);
         cp.interstellar_band_frequency = std::max(0.0, cli_interstellar_band_frequency);
         cp.interstellar_band_warp = std::max(0.0, cli_interstellar_band_warp);
