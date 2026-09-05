@@ -315,6 +315,13 @@ struct BundleResult {
     // over this region rather than sampling the centre.
     double fp_dr_a = 0.0, fp_dphi_a = 0.0;
     double fp_dr_b = 0.0, fp_dphi_b = 0.0;
+    /// Fraction of the pixel's footprint that actually lands on the disk. 1 in
+    /// the interior; below 1 only where the footprint straddles r_disk_in or
+    /// r_disk_out. Whether a ray hits the disk is otherwise a binary decision,
+    /// and that is what makes the silhouette alias.
+    double coverage = 1.0;
+    bool   behind_escaped = false;   ///< the uncovered part sees the background
+    double behind_theta = 0.0, behind_phi = 0.0;
 };
 
 // ── Initial deviation of the bundle ──────────────────────────
@@ -546,8 +553,57 @@ static BundleResult trace_bundle(int px, int py,
         }
 
         if (best_event == StepEvent::DISK) {
-            return {true, disk_r_hit, disk_red, disk_det, 0.0, 0.0, disk_phi,
-                    disk_fp_dr_a, disk_fp_dphi_a, disk_fp_dr_b, disk_fp_dphi_b};
+            BundleResult out{true, disk_r_hit, disk_red, disk_det, 0.0, 0.0, disk_phi,
+                             disk_fp_dr_a, disk_fp_dphi_a, disk_fp_dr_b, disk_fp_dphi_b};
+
+            // Coverage of the pixel by the disk, sampled on the same footprint.
+            // Measured at 480x270, a=0.9: all 1536 boundary pixels border the
+            // background and none the horizon, and 1446 of them sit against
+            // r_disk_out or r_disk_in rather than the silhouette -- so the
+            // radial bounds are what has to be resolved. The footprint straddles
+            // the edge by construction there: median radial extent 0.243 M
+            // against a median distance to r_out of 0.118 M.
+            {
+                const double ha_r = 0.5*disk_fp_dr_a, hb_r = 0.5*disk_fp_dr_b;
+                int inside = 0, total = 0;
+                const int N = 4;
+                for (int i = -N; i <= N; ++i)
+                    for (int j = -N; j <= N; ++j) {
+                        const double u = double(i)/double(N), v = double(j)/double(N);
+                        if (u*u + v*v > 1.0) continue;      // stay inside the ellipse
+                        const double rr = disk_r_hit + u*ha_r + v*hb_r;
+                        ++total;
+                        if (rr >= r_disk_in && rr <= r_disk_out) ++inside;
+                    }
+                out.coverage = (total > 0) ? double(inside)/double(total) : 1.0;
+            }
+
+            // If the pixel is only partly covered, the rest of it sees whatever
+            // lies beyond, so the ray has to be continued past the disk. Without
+            // this the uncovered fraction would composite against black and the
+            // rim would darken instead of blending. Only boundary pixels pay for
+            // it -- 1.2% of the frame in the measurement above.
+            if (out.coverage < 1.0 - 1e-6) {
+                BundleState cont = bs;
+                double h = std::max(step_used, 1e-8);
+                for (int j = 0; j < max_iter; ++j) {
+                    const double r_prev = cont.geo.r;
+                    int rej = 0;
+                    while (true) {
+                        if (bundle_adaptive(g, cont, h, tol)) break;
+                        if (!std::isfinite(h) || ++rej > 64) break;
+                    }
+                    if (cont.geo.r <= rh_cut) break;               // swallowed
+                    if (cont.geo.r >= r_escape || r_prev >= r_escape) {
+                        out.behind_escaped = true;
+                        out.behind_theta   = cont.geo.theta;
+                        out.behind_phi     = cont.geo.phi;
+                        break;
+                    }
+                    if (!std::isfinite(cont.geo.r)) break;
+                }
+            }
+            return out;
         }
         if (best_event == StepEvent::HORIZON) {
             return {};

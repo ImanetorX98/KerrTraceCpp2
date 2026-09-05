@@ -159,16 +159,21 @@ struct GeoPixel {
     // Zero in single-ray mode, where the pixel has no measured extent.
     float   fp_dr_a, fp_dphi_a;
     float   fp_dr_b, fp_dphi_b;
+    // Fraction of the pixel covered by the disk. 1 everywhere except where the
+    // footprint straddles the disk's radial bounds; this is what turns the
+    // binary hit/miss decision at the rim into a gradient.
+    float   coverage;
 };
-static_assert(sizeof(GeoPixel) == 44, "GeoPixel size mismatch");
+static_assert(sizeof(GeoPixel) == 48, "GeoPixel size mismatch");
 
 // ── .kgeo file format ─────────────────────────────────────────
 static const char   KGEO_MAGIC[4]  = {'K','G','E','O'};
+// 3: added the coverage fraction.
 // 2: added the disk footprint vectors to GeoPixel. Version 1 files are 28 bytes
 // per record against 44 and cannot be read; the layout is not self-describing, so
 // the version is the only guard. It was left at 1 through the v0.2.3 layout change,
 // which is what made that drift silent.
-static const uint32_t KGEO_VERSION = 2;
+static const uint32_t KGEO_VERSION = 3;
 
 struct KGeoMeta {
     uint32_t W, H;
@@ -2732,7 +2737,9 @@ static std::vector<RGB> colorize_buffer(
                              (uint8_t)clamp(acc_b + 0.5, 0.0, 255.0) };
             }
 
-            const double alpha = clamp(cp.disk_opacity, 0.0, 1.0);
+            const double cov = (cp.bundle_filter && std::isfinite(p.coverage))
+                             ? clamp(double(p.coverage), 0.0, 1.0) : 1.0;
+            const double alpha = clamp(cp.disk_opacity, 0.0, 1.0) * cov;
             if (alpha >= 1.0 - 1e-9) {
                 image[i] = disk_col;
             } else {
@@ -2873,6 +2880,7 @@ static std::vector<GeoPixel> trace_geodesics_wormhole(
             pix.r         = (float)res.r;
             pix.redshift  = 1.0f;
             pix.magnif    = 1.0f;
+            pix.coverage  = 1.0f;
             pix.phi_disk  = 0.0f;
             pix.theta_esc = (float)res.theta_esc;
             pix.phi_esc   = (float)res.phi_esc;
@@ -3038,9 +3046,16 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.fp_dphi_a = (float)res.fp_dphi_a;
                 pix.fp_dr_b   = (float)res.fp_dr_b;
                 pix.fp_dphi_b = (float)res.fp_dphi_b;
+                pix.coverage  = (float)res.coverage;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
-                pix._pad[1] = res.disk_hit ? 2 : 0;
+                // The uncovered fraction of a rim pixel sees the background, so
+                // it must be told to sample it rather than composite on black.
+                pix._pad[1] = res.disk_hit ? (res.behind_escaped ? 0 : 2) : 0;
+                if (res.disk_hit && res.behind_escaped) {
+                    pix.theta_esc = (float)res.behind_theta;
+                    pix.phi_esc   = (float)res.behind_phi;
+                }
             } else {
                 auto s   = cam.pixel_ray(px_, py, g, pixel_offset_x, pixel_offset_y);
                 TraceResult res{};
@@ -3075,6 +3090,7 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.magnif    = 1.0f;
                 pix.phi_disk  = (float)res.phi_disk;
                 pix.fp_dr_a = pix.fp_dphi_a = pix.fp_dr_b = pix.fp_dphi_b = 0.0f;
+                pix.coverage = 1.0f;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
                 if (res.out == Outcome::DISK_HIT) {
