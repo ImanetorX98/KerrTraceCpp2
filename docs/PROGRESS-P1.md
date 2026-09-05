@@ -14,9 +14,9 @@ Piano di riferimento: `PLAN-2026-09-05.md`, voce P1.
 | 2. Capire perché `\|det J\|` è sbagliato | fatto |
 | 3. Ricostruire il campo di Jacobi | **fatto, v0.2.21** |
 | 4. Validare contro differenze finite | **fatto, corr +0.9996** |
-| 5. Esportare l'impronta (semiassi, orientamento) | da fare |
-| 6. Mediare l'emissione sull'impronta | da fare |
-| 7. Verificare contro il riferimento 16 spp | da fare |
+| 5. Esportare l'impronta (semiassi, orientamento) | **fatto, v0.2.22** |
+| 6. Mediare l'emissione sull'impronta | **fatto, ma sul bersaglio sbagliato** |
+| 7. Verificare contro il riferimento 16 spp | **fatto — vedi passo 7** |
 
 ---
 
@@ -164,9 +164,60 @@ tracciare più fasci per pixel. Da tenere presente vicino all'anello di fotoni.
 
 ---
 
+## Passo 7 — La misura dice che stavo filtrando il posto sbagliato
+
+Filtro implementato: impronta esportata in `GeoPixel` (record da 28 a 44 byte,
+`KGEO_VERSION` finalmente portato a **2**), pattern di campioni a anelli
+concentrici con pesi gaussiani troncati, media fuori dalle palette così nessuna
+di esse è stata toccata. Flag `--bundle-filter` / `--no-bundle-filter`,
+`--bundle-filter-rings`, `--bundle-filter-sigma`.
+
+Effetto globale: quasi nullo. HF da 58.26 a 57.58 (eccesso +98.8% → +96.5%),
+RMSE da 14.601 a 14.521.
+
+**Perché**: scomponendo l'energia HF per regione si vede che l'aliasing non è
+nella texture del disco.
+
+| regione | riferimento 16 spp | bundle senza filtro | bundle con filtro |
+|---|---|---|---|
+| interno disco (39 188 px) | 19.93 | 19.23 | 18.24 |
+| **bordi disco** (1 536 px) | 80.24 | **159.92** | 145.49 |
+| **sfondo** (88 876 px) | 31.14 | **66.16** | 66.01 |
+
+L'interno del disco era **già** al livello del riferimento (19.23 contro 19.93):
+la texture non aliasava. Il mio filtro l'ha portato a 18.24, cioè leggermente
+**sotto** il riferimento — sovra-liscia dell'8%.
+
+L'aliasing vero sta in due posti, entrambi **doppi** rispetto al riferimento:
+
+1. **I bordi del disco** — è aliasing di *copertura*: se il pixel cade dentro o
+   fuori il disco è una decisione binaria. Nessun filtro sulla texture può
+   risolverlo; serve la **frazione dell'impronta** che effettivamente cade sul
+   disco.
+2. **Lo sfondo stellato** — è il campionamento del background, cioè esattamente
+   ciò di cui parla A.3.1 per le sorgenti non risolte. È territorio di **P2**.
+
+Dimensioni dell'impronta misurate, per contesto: `|δr|` mediano 0.076 M e
+0.152 M sui due assi, arco `r·δφ` mediano 0.031 M e 0.065 M. Sono piccole
+rispetto alla scala su cui varia la texture, il che conferma che lì non c'era
+niente da filtrare.
+
+### Conseguenza sul piano
+
+Il macchinario è corretto e validato, ma applicato al bersaglio sbagliato. Il
+seguito di P1 non è «mediare meglio la texture», è:
+
+- **P1b — antialiasing di copertura al bordo del disco**: usare l'impronta per
+  stimare la frazione di pixel coperta dal disco e comporre con ciò che sta
+  dietro, invece della decisione binaria attuale.
+- **P2** assorbe il filtraggio dello sfondo.
+
+---
+
 ## Cronologia
 
 | versione | commit | contenuto |
 |---|---|---|
 | v0.2.21 | `dafbad0` | ricostruzione del campo di Jacobi (passi 3–4) |
 | — | — | correzione dell'attribuzione del residuo 0.3% |
+| v0.2.22 | | impronta esportata, `KGEO_VERSION`=2, filtro sull'emissione |

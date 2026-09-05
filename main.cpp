@@ -101,6 +101,13 @@ struct ColorParams {
     // magnif_luma_scale).  When on, the value is normalised frame-wide first.
     bool   bundle_magnif_luma = false;
     double bundle_magnif_max  = 5.0;   // ceiling of the 1/|det J| factor when on
+    // Average the disk emission over the bundle's footprint instead of sampling
+    // its centre. This is what the ray bundle is actually for -- DNGR §2.2(iii)
+    // integrates the emission over the ellipse, and A.3.1 uses the beam shape to
+    // adapt the resampling filter against moire. On by default when bundles are.
+    bool   bundle_filter        = true;
+    int    bundle_filter_rings  = 2;    // sample rings inside the footprint
+    double bundle_filter_sigma  = 0.5;  // Gaussian sigma in footprint radii
 
     // Interstellar cinematic mode (artist-friendly controls)
     double interstellar_omega0                = 1.0;
@@ -146,12 +153,22 @@ struct GeoPixel {
     float   phi_disk;   // BL azimuthal angle at disk crossing (0 if not disk hit)
     float   theta_esc;  // direction at escape (background lookup)
     float   phi_esc;
+    // Footprint of the pixel on the disk, from the ray bundle: the two edge
+    // vectors of the parallelogram the pixel maps onto, in (r, phi). Already
+    // scaled by the pixel's angular size, so they are per-pixel, not per-radian.
+    // Zero in single-ray mode, where the pixel has no measured extent.
+    float   fp_dr_a, fp_dphi_a;
+    float   fp_dr_b, fp_dphi_b;
 };
-static_assert(sizeof(GeoPixel) == 28, "GeoPixel size mismatch");
+static_assert(sizeof(GeoPixel) == 44, "GeoPixel size mismatch");
 
 // ── .kgeo file format ─────────────────────────────────────────
 static const char   KGEO_MAGIC[4]  = {'K','G','E','O'};
-static const uint32_t KGEO_VERSION = 1;
+// 2: added the disk footprint vectors to GeoPixel. Version 1 files are 28 bytes
+// per record against 44 and cannot be read; the layout is not self-describing, so
+// the version is the only guard. It was left at 1 through the v0.2.3 layout change,
+// which is what made that drift silent.
+static const uint32_t KGEO_VERSION = 2;
 
 struct KGeoMeta {
     uint32_t W, H;
@@ -2587,6 +2604,48 @@ static RGB disk_colour(double r, double red, double magnif,
             (uint8_t)(tonemap(c.b/255.0*I, cp.exposure, cp.gamma)*255)};
 }
 
+// Truncated-Gaussian sample pattern over the pixel's footprint on the disk.
+//
+// DNGR §2.2(iii) adds up the emission from within the whole ellipse the bundle
+// covers, and A.3.1 modulates it with a truncated Gaussian, both to suppress
+// moire on extended sources and to stop a feature flickering as it crosses the
+// pixel grid. Sampling only the centre, which is what a single ray does, is the
+// thing that produces the aliasing.
+//
+// The pattern is a centre sample plus concentric rings in footprint coordinates
+// (s, t) in [-1, 1]^2, mapped to the disk by the two edge vectors. Weights are
+// exp(-d^2 / 2 sigma^2) truncated at the footprint edge, so a sample never
+// reaches beyond the region the pixel actually sees.
+struct FootprintSample { double s, t, w; };
+
+static const std::vector<FootprintSample>& footprint_pattern(int rings, double sigma) {
+    static std::vector<FootprintSample> cache;
+    static int cached_rings = -1;
+    static double cached_sigma = -1.0;
+    if (rings == cached_rings && sigma == cached_sigma) return cache;
+
+    cache.clear();
+    const int n_rings = std::max(0, rings);
+    const double sig = std::max(1e-3, sigma);
+    cache.push_back({0.0, 0.0, 1.0});
+    for (int ring = 1; ring <= n_rings; ++ring) {
+        const double rad = double(ring) / double(n_rings);
+        const int n_pts = 6 * ring;                  // denser rings further out
+        const double w = std::exp(-0.5 * (rad*rad) / (sig*sig));
+        for (int k = 0; k < n_pts; ++k) {
+            const double ang = 2.0 * M_PI * (double(k) + 0.5*double(ring % 2))
+                             / double(n_pts);
+            cache.push_back({rad * std::cos(ang), rad * std::sin(ang), w});
+        }
+    }
+    double tot = 0.0;
+    for (const FootprintSample& fs : cache) tot += fs.w;
+    if (tot > 0.0) for (FootprintSample& fs : cache) fs.w /= tot;
+    cached_rings = rings;
+    cached_sigma = sigma;
+    return cache;
+}
+
 // Phase 2: GeoPixel buffer → RGB image
 static std::vector<RGB> colorize_buffer(
     const std::vector<GeoPixel>& geo, int W, int H,
@@ -2624,24 +2683,53 @@ static std::vector<RGB> colorize_buffer(
         if (p.outcome == 1) {
             RGB disk_col{};
             const double magnif_n = double(p.magnif);
-            if (cp.palette == DiskPalette::STRATIFIED) {
-                disk_col = disk_colour_stratified(p.r, p.phi_disk,
-                                                  p.redshift, magnif_n,
+            // Evaluates the chosen palette at one point of the disk. Sampling the
+            // footprint means calling this several times; the palettes are pure
+            // functions of (r, phi) plus per-pixel scalars, so the filter lives
+            // out here and none of them had to change.
+            auto shade_at = [&](double rr, double pp) -> RGB {
+                if (cp.palette == DiskPalette::STRATIFIED)
+                    return disk_colour_stratified(rr, pp, p.redshift, magnif_n,
                                                   r_disk_in, r_disk_out,
                                                   M_bh, a_bh, r_isco, cp, flux_ref);
-            } else if (cp.palette == DiskPalette::INTERSTELLAR) {
-                disk_col = disk_colour_interstellar(p.r, p.phi_disk,
-                                                    p.redshift, magnif_n,
+                if (cp.palette == DiskPalette::INTERSTELLAR)
+                    return disk_colour_interstellar(rr, pp, p.redshift, magnif_n,
                                                     r_disk_in, r_disk_out,
                                                     M_bh, a_bh, r_isco, cp, flux_ref);
-            } else if (cp.palette == DiskPalette::INTERSTELLAR_NASA) {
-                disk_col = disk_colour_interstellar_nasa(p.r, p.phi_disk,
-                                                         magnif_n,
+                if (cp.palette == DiskPalette::INTERSTELLAR_NASA)
+                    return disk_colour_interstellar_nasa(rr, pp, magnif_n,
                                                          r_disk_in, r_disk_out,
                                                          r_isco, cp);
+                return disk_colour(rr, p.redshift, magnif_n,
+                                   M_bh, a_bh, r_isco, r_disk_out, cp, flux_ref);
+            };
+
+            const bool has_footprint =
+                cp.bundle_filter &&
+                (std::abs(p.fp_dr_a) + std::abs(p.fp_dr_b) +
+                 std::abs(p.fp_dphi_a) + std::abs(p.fp_dphi_b)) > 0.0f &&
+                std::isfinite(p.fp_dr_a) && std::isfinite(p.fp_dphi_a) &&
+                std::isfinite(p.fp_dr_b) && std::isfinite(p.fp_dphi_b);
+
+            if (!has_footprint) {
+                disk_col = shade_at(p.r, p.phi_disk);
             } else {
-                disk_col = disk_colour(p.r, p.redshift, magnif_n,
-                                       M_bh, a_bh, r_isco, r_disk_out, cp, flux_ref);
+                // Half the edge vectors: the footprint spans one pixel, so the
+                // offsets from its centre reach half a pixel each way.
+                const double ha_r = 0.5*double(p.fp_dr_a),  ha_p = 0.5*double(p.fp_dphi_a);
+                const double hb_r = 0.5*double(p.fp_dr_b),  hb_p = 0.5*double(p.fp_dphi_b);
+                const std::vector<FootprintSample>& pat =
+                    footprint_pattern(cp.bundle_filter_rings, cp.bundle_filter_sigma);
+                double acc_r = 0.0, acc_g = 0.0, acc_b = 0.0;
+                for (const FootprintSample& fs : pat) {
+                    const double rr = p.r        + fs.s*ha_r + fs.t*hb_r;
+                    const double pp = p.phi_disk + fs.s*ha_p + fs.t*hb_p;
+                    const RGB c = shade_at(rr, pp);
+                    acc_r += fs.w * c.r; acc_g += fs.w * c.g; acc_b += fs.w * c.b;
+                }
+                disk_col = { (uint8_t)clamp(acc_r + 0.5, 0.0, 255.0),
+                             (uint8_t)clamp(acc_g + 0.5, 0.0, 255.0),
+                             (uint8_t)clamp(acc_b + 0.5, 0.0, 255.0) };
             }
 
             const double alpha = clamp(cp.disk_opacity, 0.0, 1.0);
@@ -2946,6 +3034,10 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.redshift  = (float)res.redshift;
                 pix.magnif    = (float)res.magnif;
                 pix.phi_disk  = (float)res.phi_disk;
+                pix.fp_dr_a   = (float)res.fp_dr_a;
+                pix.fp_dphi_a = (float)res.fp_dphi_a;
+                pix.fp_dr_b   = (float)res.fp_dr_b;
+                pix.fp_dphi_b = (float)res.fp_dphi_b;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
                 pix._pad[1] = res.disk_hit ? 2 : 0;
@@ -2982,6 +3074,7 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.redshift  = (float)res.redshift;
                 pix.magnif    = 1.0f;
                 pix.phi_disk  = (float)res.phi_disk;
+                pix.fp_dr_a = pix.fp_dphi_a = pix.fp_dr_b = pix.fp_dphi_b = 0.0f;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
                 if (res.out == Outcome::DISK_HIT) {
@@ -3650,6 +3743,12 @@ int main(int argc, char** argv) {
             cli_inner_emission_floor = std::stod(argv[++i]);
         if (arg=="--disk-inner-emission-floor-width" && i+1<argc)
             cli_inner_emission_floor_width = std::stod(argv[++i]);
+        if (arg=="--bundle-filter")    cp.bundle_filter = true;
+        if (arg=="--no-bundle-filter") cp.bundle_filter = false;
+        if (arg=="--bundle-filter-rings" && i+1<argc)
+            cp.bundle_filter_rings = std::max(0, std::stoi(argv[++i]));
+        if (arg=="--bundle-filter-sigma" && i+1<argc)
+            cp.bundle_filter_sigma = std::max(1e-3, std::stod(argv[++i]));
         if (arg=="--bundle-magnification")    cp.bundle_magnif_luma = true;
         if (arg=="--no-bundle-magnification") cp.bundle_magnif_luma = false;
         if (arg=="--bundle-magnification-max" && i+1<argc)
