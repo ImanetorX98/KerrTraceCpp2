@@ -357,14 +357,19 @@ static BundleResult trace_bundle(int px, int py,
             geodesic_rhs(g, bs.geo.r, bs.geo.theta, bs.geo.pr, bs.geo.ptheta,
                          bs.geo.pt, bs.geo.pphi, dr1,dth1,dpr1,dpth1);
             double alpha = 0.0;
-            if (!first_event_alpha_hermite(
+            // NOT a `continue`: this block only decides whether the step crossed
+            // the disk. The horizon and escape tests live below, and skipping
+            // them left the ray unable to terminate. maybe_equator is true
+            // whenever the ray is within 0.35 rad of the equatorial plane, which
+            // for a near-equatorial camera is almost every step, so almost every
+            // ray ran to max_steps instead of stopping after a few hundred.
+            const bool crossed_equator = first_event_alpha_hermite(
                     bs_prev.geo.theta, bs.geo.theta, dth0, dth1, step_used, M_PI/2.0,
-                    alpha, 8, 8)) {
-                continue;
-            }
-            const double r_hit = hermite_interp_scalar(
-                bs_prev.geo.r, bs.geo.r, dr0, dr1, step_used, alpha);
-            if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
+                    alpha, 8, 8);
+            const double r_hit = crossed_equator
+                ? hermite_interp_scalar(bs_prev.geo.r, bs.geo.r, dr0, dr1, step_used, alpha)
+                : 0.0;
+            if (crossed_equator && r_hit >= r_disk_in && r_hit <= r_disk_out) {
                 // ── Redshift ──────────────────────────────────────
                 const double Omega = g.keplerian_omega(r_hit);
                 const double b     = -bs.geo.pphi / (-bs.geo.pt);
