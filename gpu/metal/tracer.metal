@@ -637,6 +637,36 @@ static bool solve3x3(thread float A[3][3], thread float b[3], thread float x[3])
     return true;
 }
 
+// Mirrors ks_radial_covector_shift() and ks_azimuth_twist() in main.cpp.
+// Ingoing Kerr-Schild is not a spatial relabelling of Boyer-Lindquist:
+//   dT      = dt   + (2Mr - Q^2)/Delta_r dr
+//   dphi_KS = dphi + a/Delta_r           dr
+// so t and phi_BL depend on the KS spatial coordinates through r(X,Y,Z) and the
+// covector picks up two terms along dr/dX^i. Without them the KS chart rendered
+// the Schwarzschild shadow 4.88% too large; see tests/chart_consistency_regression.cpp.
+static float ks_radial_covector_shift(float r, float a, float M, float Q,
+                                      float pt, float pphi) {
+    const float Delta = r*r - 2.0f*M*r + a*a + Q*Q;
+    if (!(fabs(Delta) > 1e-12f)) return 0.0f;
+    return -((2.0f*M*r - Q*Q)/Delta)*pt - (a/Delta)*pphi;
+}
+
+// phi_KS = phi_BL + G(r), G(r) = a/(r+ - r-) ln|(r - r+)/(r - r-)|,
+// with the extremal limit -a/(r - M).
+static float ks_azimuth_twist(float r, float a, float M, float Q) {
+    if (fabs(a) < 1e-12f) return 0.0f;
+    const float disc = M*M - a*a - Q*Q;
+    if (disc <= 1e-12f) {
+        const float d = r - M;
+        return (fabs(d) > 1e-9f) ? (-a/d) : 0.0f;
+    }
+    const float root = sqrt(disc);
+    const float rp = M + root, rm = M - root;
+    const float num = r - rp, den = r - rm;
+    if (!(fabs(num) > 1e-9f) || !(fabs(den) > 1e-9f)) return 0.0f;
+    return a/(rp - rm) * log(fabs(num/den));
+}
+
 static bool BL_covector_to_KS(float r, float theta, float phi, float a,
                               float pr, float ptheta, float pphi,
                               thread float& pX, thread float& pY, thread float& pZ) {
@@ -2200,9 +2230,11 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
     }
 
     float X, Y, Z;
-    BL_to_KS_spatial(r_obs, theta_obs, phi_obs, a, X, Y, Z);
+    const float phi_ks0 = phi_obs + ks_azimuth_twist(r_obs, a, M, Q);
+    BL_to_KS_spatial(r_obs, theta_obs, phi_ks0, a, X, Y, Z);
     float pX, pY, pZ;
-    bool ks_ok = BL_covector_to_KS(r_obs, theta_obs, phi_obs, a, pr, pth, pphi, pX, pY, pZ);
+    const float pr_ks0 = pr + ks_radial_covector_shift(r_obs, a, M, Q, pt, pphi);
+    bool ks_ok = BL_covector_to_KS(r_obs, theta_obs, phi_ks0, a, pr_ks0, pth, pphi, pX, pY, pZ);
     float pT = pt;
 
     if (ks_ok) {
@@ -2277,8 +2309,11 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                 const float pZh = interp_scalar_mode_f(prevPZ, pZ, dpZ0, dpZ1, step_used_ks, alpha_evt, intersection_mode);
                 float r_hit, th_hit, ph_hit;
                 KS_to_BL_spatial(Xh, Yh, Zh, a, r_hit, th_hit, ph_hit);
+                // ph_hit is the KS azimuth: KS_covector_to_BL wants it as such,
+                // everything downstream wants the BL one.
+                const float ph_hit_bl = ph_hit - ks_azimuth_twist(r_hit, a, M, Q);
                 if (r_hit >= r_isco && r_hit <= r_disk_out) {
-                    if (disk_tile_pass_through(r_hit, ph_hit, r_isco, r_disk_out, cp_cfg)) {
+                    if (disk_tile_pass_through(r_hit, ph_hit_bl, r_isco, r_disk_out, cp_cfg)) {
                         // Keep tracing: this Interstellar tile is intentionally transparent.
                     } else {
                     float pr_hit, pth_hit, pphi_hit;
@@ -2288,7 +2323,7 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
 
                     res.r_hit = r_hit;
                     res.redshift = red;
-                    res.phi_hit = ph_hit;
+                    res.phi_hit = ph_hit_bl;
                     best_alpha = alpha_evt;
                     best_event = 1;
                     }
@@ -2332,6 +2367,7 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
             const float Z_esc = prevZ + best_alpha*(Z - prevZ);
             float r_esc, th_esc, ph_esc;
             KS_to_BL_spatial(X_esc, Y_esc, Z_esc, a, r_esc, th_esc, ph_esc);
+            ph_esc -= ks_azimuth_twist(r_esc, a, M, Q);
             res.outcome = 0;
             res.theta_esc = th_esc;
             res.phi_esc = ph_esc;
@@ -2785,9 +2821,11 @@ static inline void trace_pixel_impl(
     const bool want_ks = (cp.chart == 1 && abs(L) <= 1e-8f);
     if (want_ks) {
         float X, Y, Z;
-        BL_to_KS_spatial(r0, th0, cp.phi_obs, a, X, Y, Z);
+        const float phi_ks0 = cp.phi_obs + ks_azimuth_twist(r0, a, M, Q);
+        BL_to_KS_spatial(r0, th0, phi_ks0, a, X, Y, Z);
         float pX, pY, pZ;
-        bool ks_ok = BL_covector_to_KS(r0, th0, cp.phi_obs, a, pr, pth, pphi, pX, pY, pZ);
+        const float pr_ks0 = pr + ks_radial_covector_shift(r0, a, M, Q, pt, pphi);
+        bool ks_ok = BL_covector_to_KS(r0, th0, phi_ks0, a, pr_ks0, pth, pphi, pX, pY, pZ);
 
         float pT = pt;
         if (ks_ok) {
@@ -2862,8 +2900,11 @@ static inline void trace_pixel_impl(
                         const float pZh = interp_scalar_mode_f(prevPZ, pZ, dpZ0, dpZ1, step_used_ks, alpha, cp.intersection_mode);
                         float r_hit, th_hit, ph_hit;
                         KS_to_BL_spatial(Xh, Yh, Zh, a, r_hit, th_hit, ph_hit);
+                        // ph_hit is the KS azimuth: KS_covector_to_BL wants it as
+                        // such, everything downstream wants the BL one.
+                        const float ph_hit_bl = ph_hit - ks_azimuth_twist(r_hit, a, M, Q);
                         if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
-                            if (disk_tile_pass_through(r_hit, ph_hit, kp.r_isco, kp.r_disk_out, cp)) {
+                            if (disk_tile_pass_through(r_hit, ph_hit_bl, kp.r_isco, kp.r_disk_out, cp)) {
                                 // Keep tracing: this Interstellar tile is intentionally transparent.
                                 continue;
                             }
@@ -2871,7 +2912,7 @@ static inline void trace_pixel_impl(
                             KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                               pr_hit, pth_hit, pphi_hit);
                             const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
-                            colour = disk_color_abgr(r_hit, ph_hit, red, 1.0f,
+                            colour = disk_color_abgr(r_hit, ph_hit_bl, red, 1.0f,
                                                      M, a, kp.r_isco, kp.r_disk_out, cp);
                             best_alpha = alpha;
                             best_event = 1;
@@ -2909,6 +2950,7 @@ static inline void trace_pixel_impl(
                     const float Z_esc = prevZ + best_alpha*(Z - prevZ);
                     float r_esc, th_esc, ph_esc;
                     KS_to_BL_spatial(X_esc, Y_esc, Z_esc, a, r_esc, th_esc, ph_esc);
+                    ph_esc -= ks_azimuth_twist(r_esc, a, M, Q);
                     float4 bgc = clamp(sample_background(bg_tex, bg_samp, th_esc, ph_esc), 0.0f, 1.0f);
                     colour = (0xFFu << 24)
                            | (uint32_t(bgc.b*255.0f) << 16)

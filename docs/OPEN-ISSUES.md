@@ -50,7 +50,7 @@ Il difetto è reale ma sta altrove → punto **1-ter**.
 
 ---
 
-## 1-ter. ~~BL e KS non danno la stessa immagine~~ — RISOLTO in v0.2.18 e v0.2.19
+## 1-ter. ~~BL e KS non danno la stessa immagine~~ — RISOLTO in v0.2.18 → v0.2.20
 
 Causa: `bl_covector_to_ks()` trattava Kerr-Schild ingoing come una semplice
 rietichettatura spaziale di Boyer-Lindquist. Non lo è:
@@ -80,6 +80,12 @@ Accordo fra carte: `|Δr|` mediano da 0.658 a **1.6e-5**, differenza di hit da
 
 Test `kerrtrace.chart_consistency`: contro il binario pre-fix fallisce 7
 controlli su 8 (passa solo BL, che era giusta).
+
+**Lo shader Metal aveva lo stesso identico difetto** (`BL_covector_to_KS` in
+`tracer.metal` non riceveva nemmeno `p_t`), quindi ogni render GPU aveva l'ombra
+del 5% troppo grande. Corretto in v0.2.20 in entrambi i kernel. Metal ora dà
+7.2803° come la CPU, e il confronto diretto GPU↔CPU a `a=0.9` dà `|Δr|` mediano
+2.8e-5 con lo stesso numero di hit (19 435).
 
 **Pezzo φ chiuso in v0.2.19**: la torsione `φ_KS = φ_BL + G(r)` con
 `G(r) = a/(r₊−r₋)·ln|(r−r₊)/(r−r₋)|` (limite estremale `−a/(r−M)`) ora è
