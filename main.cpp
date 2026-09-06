@@ -106,6 +106,7 @@ struct ColorParams {
     // integrates the emission over the ellipse, and A.3.1 uses the beam shape to
     // adapt the resampling filter against moire. On by default when bundles are.
     bool   bundle_filter        = true;
+    int    bundle_edge_grid     = 3;    // n x n beams per boundary pixel (A.3.1)
     int    bundle_filter_rings  = 2;    // sample rings inside the footprint
     double bundle_filter_sigma  = 0.5;  // Gaussian sigma in footprint radii
 
@@ -3138,6 +3139,128 @@ static std::vector<GeoPixel> trace_geodesics(
 #endif
 
     std::cerr << "\n";
+
+    // ── Edge resampling: A.3.1's own remedy ──────────────────────────────
+    //
+    // "In extreme cases these assumptions can break down, leading to a
+    //  distortion in the shape of a star's image, flickering, and aliasing
+    //  artefacts. In these cases we can trace multiple beams per pixel and
+    //  resample."  -- DNGR, Appendix A.3.1
+    //
+    // The analytic coverage from the footprint is one-sided: a pixel whose
+    // centre falls just inside the disk feathers, one whose centre falls just
+    // outside carries no footprint at all and stays a hard cut, so the rim is
+    // biased inward by half a footprint. Tracing a grid of beams across the
+    // pixel measures the coverage from both sides instead of inferring it from
+    // one, and it costs only what the boundary costs: a pixel is resampled only
+    // when its four-neighbourhood disagrees about whether the disk is there.
+    if (eff_use_bundles && cp_ptr && cp_ptr->bundle_filter && cp_ptr->bundle_edge_grid > 1) {
+        const int n = cp_ptr->bundle_edge_grid;
+        std::vector<uint32_t> edge;
+        edge.reserve(size_t(W) * 2);
+        for (int py = 0; py < H; ++py)
+            for (int px_ = 0; px_ < W; ++px_) {
+                const uint8_t here = geo[size_t(py)*W + px_].outcome;
+                bool differs = false;
+                for (int k = 0; k < 4 && !differs; ++k) {
+                    static const int dxs[4] = {1,-1,0,0}, dys[4] = {0,0,1,-1};
+                    const int qx = px_ + dxs[k], qy = py + dys[k];
+                    if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue;
+                    const uint8_t there = geo[size_t(qy)*W + qx].outcome;
+                    // Only the disk silhouette needs this; horizon against
+                    // background is already a hard edge in the reference too.
+                    if ((here == 1) != (there == 1)) differs = true;
+                }
+                if (differs) edge.push_back(uint32_t(size_t(py)*W + px_));
+            }
+
+        std::cerr << "Edge resampling: " << edge.size() << " pixels ("
+                  << std::fixed << std::setprecision(2)
+                  << (100.0 * double(edge.size()) / double(W*H)) << "% of frame), "
+                  << n << "x" << n << " beams each\n";
+
+        std::vector<GeoPixel> resolved(edge.size());
+        auto resample_one = [&](size_t idx) {
+            const uint32_t flat = edge[idx];
+            const int py = int(flat / uint32_t(W));
+            const int px_ = int(flat % uint32_t(W));
+            GeoPixel out = geo[flat];
+
+            int hits = 0, escapes = 0;
+            double acc_r = 0.0, acc_red = 0.0, acc_cov = 0.0;
+            double acc_phi_c = 0.0, acc_phi_s = 0.0;
+            double acc_fp[4] = {0,0,0,0};
+            double acc_th_e = 0.0, acc_ph_ec = 0.0, acc_ph_es = 0.0;
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < n; ++i) {
+                    const double ox = (double(i) + 0.5) / double(n) - 0.5;
+                    const double oy = (double(j) + 0.5) / double(n) - 0.5;
+                    const auto sub = trace_bundle(px_, py, cam, g,
+                                                  r_disk_in, r_disk_out, r_escape,
+                                                  ctl.max_steps, ctl.step_init, ctl.tol,
+                                                  ox, oy);
+                    if (sub.disk_hit) {
+                        ++hits;
+                        acc_r   += sub.r_hit;
+                        acc_red += sub.redshift;
+                        acc_cov += sub.coverage;
+                        acc_phi_c += std::cos(sub.phi_disk);
+                        acc_phi_s += std::sin(sub.phi_disk);
+                        acc_fp[0] += sub.fp_dr_a;   acc_fp[1] += sub.fp_dphi_a;
+                        acc_fp[2] += sub.fp_dr_b;   acc_fp[3] += sub.fp_dphi_b;
+                        if (sub.behind_escaped) {
+                            ++escapes;
+                            acc_th_e   += sub.behind_theta;
+                            acc_ph_ec  += std::cos(sub.behind_phi);
+                            acc_ph_es  += std::sin(sub.behind_phi);
+                        }
+                    } else {
+                        ++escapes;
+                        acc_th_e  += sub.theta_esc;
+                        acc_ph_ec += std::cos(sub.phi_esc);
+                        acc_ph_es += std::sin(sub.phi_esc);
+                    }
+                }
+
+            const int total = n*n;
+            if (hits == 0) {
+                out.outcome  = geo[flat].outcome == 2u ? 2u : 0u;
+                out.coverage = 0.0f;
+            } else {
+                const double inv = 1.0 / double(hits);
+                out.outcome   = 1u;
+                out.r         = float(acc_r * inv);
+                out.redshift  = float(acc_red * inv);
+                // Azimuths are averaged as unit vectors: a plain mean would be
+                // wrong for any pixel straddling the phi = pi branch cut.
+                out.phi_disk  = float(std::atan2(acc_phi_s, acc_phi_c));
+                out.fp_dr_a   = float(acc_fp[0] * inv);
+                out.fp_dphi_a = float(acc_fp[1] * inv);
+                out.fp_dr_b   = float(acc_fp[2] * inv);
+                out.fp_dphi_b = float(acc_fp[3] * inv);
+                // Coverage measured from both sides: the fraction of beams that
+                // land on the disk, times each beam's own partial coverage.
+                out.coverage  = float(clamp((acc_cov / double(total)), 0.0, 1.0));
+                out._pad[1]   = escapes > 0 ? 0 : 2;
+                if (escapes > 0) {
+                    const double einv = 1.0 / double(escapes);
+                    out.theta_esc = float(acc_th_e * einv);
+                    out.phi_esc   = float(std::atan2(acc_ph_es, acc_ph_ec));
+                }
+            }
+            resolved[idx] = out;
+        };
+
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (long long idx = 0; idx < (long long)edge.size(); ++idx)
+            resample_one(size_t(idx));
+#else
+        for (size_t idx = 0; idx < edge.size(); ++idx) resample_one(idx);
+#endif
+        for (size_t idx = 0; idx < edge.size(); ++idx) geo[edge[idx]] = resolved[idx];
+    }
+
     if (track_elliptic_fallbacks) {
         const uint64_t total = elliptic_total_rays.load(std::memory_order_relaxed);
         const uint64_t fb = elliptic_fallback_rays.load(std::memory_order_relaxed);
@@ -3759,6 +3882,8 @@ int main(int argc, char** argv) {
             cli_inner_emission_floor = std::stod(argv[++i]);
         if (arg=="--disk-inner-emission-floor-width" && i+1<argc)
             cli_inner_emission_floor_width = std::stod(argv[++i]);
+        if (arg=="--bundle-edge-grid" && i+1<argc)
+            cp.bundle_edge_grid = std::max(1, std::stoi(argv[++i]));
         if (arg=="--bundle-filter")    cp.bundle_filter = true;
         if (arg=="--no-bundle-filter") cp.bundle_filter = false;
         if (arg=="--bundle-filter-rings" && i+1<argc)
