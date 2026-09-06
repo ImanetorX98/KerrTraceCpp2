@@ -17,6 +17,8 @@ Piano di riferimento: `PLAN-2026-09-05.md`, voce P1.
 | 5. Esportare l'impronta (semiassi, orientamento) | **fatto, v0.2.22** |
 | 6. Mediare l'emissione sull'impronta | **fatto, ma sul bersaglio sbagliato** |
 | 7. Verificare contro il riferimento 16 spp | **fatto — vedi passo 7** |
+| 8. Copertura analitica al bordo | **fatto, v0.2.23** |
+| 9. Resampling di bordo (A.3.1) | **fatto, v0.2.24** |
 
 ---
 
@@ -257,7 +259,53 @@ Rimedi possibili, in ordine di costo: registrare un'impronta anche al passaggio
 più vicino all'equatore per i raggi che mancano il disco; oppure
 supercampionare i soli pixel di bordo (~3% del fotogramma), che è il rimedio che
 A.3.1 stesso indica per i casi estremi (*«we can trace multiple beams per pixel
-and resample»*).
+and resample»*). → **fatto, v0.2.24, passo 9**
+
+---
+
+## Passo 9 — Il rimedio di A.3.1 (v0.2.24)
+
+> *«In extreme cases these assumptions can break down, leading to a distortion in
+> the shape of a star's image, flickering, and aliasing artefacts. In these cases
+> we can trace multiple beams per pixel and resample.»* — A.3.1
+
+Seconda passata dopo la fase 1: un pixel viene ricampionato **solo** se il suo
+vicinato a quattro disagrees sul fatto che il disco ci sia. Su 480×270 sono
+**3048 pixel, il 2.35% del fotogramma**, con una griglia 3×3 di fasci ciascuno
+(`--bundle-edge-grid`, default 3).
+
+Il risultato di ogni pixel di bordo viene ricostruito dai sotto-fasci:
+copertura = frazione di fasci che colpiscono il disco pesata per la copertura
+parziale di ciascuno; `r` e `redshift` mediati sui fasci che colpiscono;
+`theta_esc`/`phi_esc` sui fasci che sfuggono. **Gli azimut sono mediati come
+vettori unitari**, non aritmeticamente: un pixel a cavallo del taglio a `φ=π`
+darebbe altrimenti una media priva di senso.
+
+Questo rende la copertura **bilaterale**: la misura da entrambi i lati invece di
+inferirla da uno solo, che era il limite del passo 8. 2239 pixel escono con
+copertura parziale (mediana 0.612, minimo 0.002) contro gli 834 di prima.
+
+### Risultato
+
+Maschere ricalcolate sul buffer finale, quindi confrontabili riga per riga:
+
+| | RMSE | interno | **bordi** | sfondo |
+|---|---|---|---|---|
+| riferimento 16 spp | — | 23.74 | **63.32** | 30.69 |
+| single-ray | 11.59 | 35.17 | 127.83 | 64.59 |
+| copertura analitica (passo 8) | 14.06 | 26.48 | 122.18 | 64.50 |
+| **+ resampling A.3.1** | **13.80** | **24.13** | **79.51** | 64.47 |
+
+Bordi: eccesso sul riferimento da **+93% a +26%**. Interno: 24.13 contro 23.74,
+cioè **allineato** (+1.6%). Lo sfondo non si muove, ed è atteso: è P2.
+
+### Costo
+
+Trace da 2.07 s a 3.82 s sullo stesso fotogramma, cioè **+85%** di tempo per
++21% di raggi. Lo scarto è perché i pixel di bordo sono i più cari — stanno
+vicino all'anello di fotoni, dove il paper stesso avverte che i render sono
+molto più lenti — e perché la seconda passata parallelizza peggio (282% di CPU
+contro 586% della prima). Riducibile abbassando `--bundle-edge-grid` a 2.
 
 ### Nota sull'RMSE globale
 
@@ -276,3 +324,4 @@ non è la metrica giusta per giudicare il lavoro sul disco.
 | — | — | correzione dell'attribuzione del residuo 0.3% |
 | v0.2.22 | | impronta esportata, `KGEO_VERSION`=2, filtro sull'emissione |
 | v0.2.23 | | copertura al bordo, continuazione dietro il disco, `KGEO_VERSION`=3 |
+| v0.2.24 | | resampling dei pixel di bordo (A.3.1), copertura bilaterale |
