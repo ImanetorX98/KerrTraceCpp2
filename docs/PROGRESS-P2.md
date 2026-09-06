@@ -92,4 +92,4 @@ sfuggono.
 
 | versione | commit | contenuto |
 |---|---|---|
-| v0.2.26 | | impronta sulla sfera celeste, filtro della lookup di sfondo |
+| v0.2.26 | `b816dc5` → `523c8e8` | impronta sulla sfera celeste, filtro della lookup di sfondo |
