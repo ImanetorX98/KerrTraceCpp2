@@ -327,12 +327,16 @@ struct BundleResult {
     // Edge vectors of the pixel's footprint on the disk, in (r, φ), already
     // scaled by the pixel's angular size. DNGR §2.2(iii) integrates the emission
     // over this region rather than sampling the centre.
-    // Footprint of the pixel, per pixel rather than per radian. Which surface it
-    // lives on depends on how the ray ended, and the two cases are exclusive:
-    //   disk_hit  -> (dr, dphi) in the equatorial plane
-    //   escape    -> (dtheta, dphi) on the celestial sphere
+    // Footprint of the pixel, per pixel rather than per radian.
+    //   fp_*  : (dr, dphi) in the equatorial plane, at a disk hit
+    //   sky_* : (dtheta, dphi) on the celestial sphere, where the ray escapes
+    // A rim pixel that is only partly covered needs BOTH: the disk footprint to
+    // shade and to measure coverage, the sky footprint to filter the background
+    // it composites behind itself.
     double fp_dr_a = 0.0, fp_dphi_a = 0.0;
     double fp_dr_b = 0.0, fp_dphi_b = 0.0;
+    double sky_dth_a = 0.0, sky_dph_a = 0.0;
+    double sky_dth_b = 0.0, sky_dph_b = 0.0;
     /// Fraction of the pixel's footprint that actually lands on the disk. 1 in
     /// the interior; below 1 only where the footprint straddles r_disk_in or
     /// r_disk_out. Whether a ray hits the disk is otherwise a binary decision,
@@ -373,6 +377,29 @@ static void init_bundle(const Camera& cam,
     dpphi[0] = (s_ap.pphi - s_am.pphi) * inv;
     dpt[1]   = (s_bp.pt   - s_bm.pt)   * inv;
     dpphi[1] = (s_bp.pphi - s_bm.pphi) * inv;
+}
+
+// Footprint on the celestial sphere: same projection as at the disk, with
+// r = r_escape as the crossing surface. Neighbouring rays reach it at different
+// affine parameter, so the flow along the ray is projected out first:
+//     dr + r' dl = 0  =>  dl = -dr/r' ,
+//     dtheta_sky = dtheta + theta' dl ,   dphi_sky = dphi + phi' dl .
+static void sky_footprint(const KNdSMetric& g, const GeodesicState& st,
+                          const double W[5][2], double dang,
+                          double& dth_a, double& dph_a,
+                          double& dth_b, double& dph_b) {
+    dth_a = dph_a = dth_b = dph_b = 0.0;
+    double f_r, f_th, f_pr, f_pth;
+    geodesic_rhs(g, st.r, st.theta, st.pr, st.ptheta, st.pt, st.pphi,
+                 f_r, f_th, f_pr, f_pth);
+    if (!(std::abs(f_r) > 1e-14)) return;
+    const double f_phi = dphi_vel(g, st.r, st.theta, st.pt, st.pphi);
+    const double dl_a = -W[0][0] / f_r;
+    const double dl_b = -W[0][1] / f_r;
+    dth_a = (W[1][0] + f_th  * dl_a) * dang;
+    dph_a = (W[2][0] + f_phi * dl_a) * dang;
+    dth_b = (W[1][1] + f_th  * dl_b) * dang;
+    dph_b = (W[2][1] + f_phi * dl_b) * dang;
 }
 
 // ── Main bundle trace ─────────────────────────────────────────
@@ -624,6 +651,13 @@ static BundleResult trace_bundle(int px, int py,
                         out.behind_escaped = true;
                         out.behind_theta   = cont.geo.theta;
                         out.behind_phi     = cont.geo.phi;
+                        // The uncovered part of the pixel looks at the sky, so it
+                        // needs the sky footprint as much as a fully escaping
+                        // ray does; without it the background behind the rim was
+                        // the only thing left point-sampled.
+                        sky_footprint(g, cont.geo, cont.W, dang,
+                                      out.sky_dth_a, out.sky_dph_a,
+                                      out.sky_dth_b, out.sky_dph_b);
                         break;
                     }
                     if (!std::isfinite(cont.geo.r)) break;
@@ -638,38 +672,14 @@ static BundleResult trace_bundle(int px, int py,
             const double th_esc = bs_prev.geo.theta + best_alpha * (bs.geo.theta - bs_prev.geo.theta);
             const double ph_esc = bs_prev.geo.phi   + best_alpha * (bs.geo.phi   - bs_prev.geo.phi);
             BundleResult out{false, r_escape, 1.0, 1.0, th_esc, ph_esc};
-
-            // Footprint of the pixel on the celestial sphere, the same
-            // construction as at the disk but with r = r_escape as the crossing
-            // surface: neighbouring rays reach it at different affine parameter,
-            // so the flow along the ray is projected out before reading the
-            // angular deviation.
-            //
-            //     dr + r' dl = 0  =>  dl = -dr/r' ,
-            //     dtheta_sky = dtheta + theta' dl ,  dphi_sky = dphi + phi' dl .
-            //
             // The background is an equirectangular bitmap, i.e. a resolved
             // texture, so what it needs from the beam is a resampling footprint
             // -- A.3.1's treatment of extended structures. The magnification
             // factor in the same appendix is for unresolved point stars, which
             // this renderer does not have.
-            double f_r, f_th, f_pr, f_pth;
-            geodesic_rhs(g, bs.geo.r, bs.geo.theta, bs.geo.pr, bs.geo.ptheta,
-                         bs.geo.pt, bs.geo.pphi, f_r, f_th, f_pr, f_pth);
-            const double f_phi = dphi_vel(g, bs.geo.r, bs.geo.theta,
-                                          bs.geo.pt, bs.geo.pphi);
-            auto Wi = [&](int row, int col) {
-                return bs_prev.W[row][col]
-                     + best_alpha * (bs.W[row][col] - bs_prev.W[row][col]);
-            };
-            if (std::abs(f_r) > 1e-14) {
-                const double dl_a = -Wi(0,0) / f_r;
-                const double dl_b = -Wi(0,1) / f_r;
-                out.fp_dr_a   = (Wi(1,0) + f_th  * dl_a) * dang;   // dtheta_sky
-                out.fp_dphi_a = (Wi(2,0) + f_phi * dl_a) * dang;   // dphi_sky
-                out.fp_dr_b   = (Wi(1,1) + f_th  * dl_b) * dang;
-                out.fp_dphi_b = (Wi(2,1) + f_phi * dl_b) * dang;
-            }
+            sky_footprint(g, bs.geo, bs.W, dang,
+                          out.sky_dth_a, out.sky_dph_a,
+                          out.sky_dth_b, out.sky_dph_b);
             return out;
         }
     }
