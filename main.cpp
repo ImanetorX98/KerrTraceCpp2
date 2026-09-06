@@ -3026,6 +3026,27 @@ static std::vector<GeoPixel> trace_geodesics(
         };
     }
 
+    // Same predicate the single-ray tracers apply, handed to the bundle tracer so
+    // both agree on what counts as a hit. Without it the bundle stopped on the
+    // faded rim of the Interstellar disk and rendered it black.
+    struct BundleTranspCtx { const ColorParams* cp; double r_in, r_out; };
+    const BundleTranspCtx transp_ctx{cp_ptr, r_disk_in, r_disk_out};
+    DiskTransparency disk_transp{};
+    if (cp_ptr) {
+        disk_transp.ctx = &transp_ctx;
+        disk_transp.fn = [](double rr, double pp, const void* vctx) -> bool {
+            const BundleTranspCtx* c = static_cast<const BundleTranspCtx*>(vctx);
+            if (!c || !c->cp) return false;
+            if (c->cp->palette == DiskPalette::STRATIFIED)
+                return stratified_disk_tile_transparent(rr, pp, c->r_in, c->r_out, *c->cp);
+            if (c->cp->palette == DiskPalette::INTERSTELLAR ||
+                c->cp->palette == DiskPalette::INTERSTELLAR_NASA)
+                return interstellar_disk_soft_mask(rr, pp, c->r_in, c->r_out, *c->cp)
+                       < std::max(0.0, c->cp->interstellar_edge_transparency);
+            return false;
+        };
+    }
+
     std::vector<GeoPixel> geo(W*H);
     std::atomic<int> rows_done{0};
     const double t0_geo = get_time();
@@ -3037,7 +3058,7 @@ static std::vector<GeoPixel> trace_geodesics(
             if (eff_use_bundles) {
                 auto res = trace_bundle(px_, py, cam, g, r_disk_in, r_disk_out, r_escape,
                                         ctl.max_steps, ctl.step_init, ctl.tol,
-                                        pixel_offset_x, pixel_offset_y);
+                                        pixel_offset_x, pixel_offset_y, disk_transp);
                 pix.outcome   = res.disk_hit ? 1 : 0;
                 pix.r         = res.disk_hit ? (float)res.r_hit : 0.0f;
                 pix.redshift  = (float)res.redshift;
@@ -3198,7 +3219,7 @@ static std::vector<GeoPixel> trace_geodesics(
                     const auto sub = trace_bundle(px_, py, cam, g,
                                                   r_disk_in, r_disk_out, r_escape,
                                                   ctl.max_steps, ctl.step_init, ctl.tol,
-                                                  ox, oy);
+                                                  ox, oy, disk_transp);
                     if (sub.disk_hit) {
                         ++hits;
                         acc_r   += sub.r_hit;

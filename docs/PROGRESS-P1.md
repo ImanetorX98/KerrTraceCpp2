@@ -325,3 +325,50 @@ non è la metrica giusta per giudicare il lavoro sul disco.
 | v0.2.22 | | impronta esportata, `KGEO_VERSION`=2, filtro sull'emissione |
 | v0.2.23 | | copertura al bordo, continuazione dietro il disco, `KGEO_VERSION`=3 |
 | v0.2.24 | | resampling dei pixel di bordo (A.3.1), copertura bilaterale |
+| v0.2.25 | | trasparenza del disco onorata anche dal fascio |
+
+
+---
+
+## Passo 10 — Il bordo nero: difetto preesistente, non introdotto (v0.2.25)
+
+Segnalato guardando il render. **Non l'avevo introdotto io**: il primo render
+bundle della sessione (`20260905-232400`, v0.2.20, prima di qualunque modifica a
+P1) ha già luminanza **0.0** nel punto incriminato.
+
+**Causa**: `trace_bundle` non applicava la trasparenza parziale del disco che i
+tracciatori single-ray onorano da sempre. Le palette Interstellar sfumano il
+disco verso il bordo e trattano tutto ciò che sta sotto
+`--disk-interstellar-edge-transparency` come un buco da attraversare; la palette
+stratified ha vuoti veri fra le piastrelle. Il fascio si fermava alla prima
+intersezione con l'equatore comunque, e rendeva la maschera sbiadita come nero.
+
+**Prova**: rendendo il single-ray con `--disk-interstellar-edge-transparency 0`
+si ottengono **esattamente** i numeri del bundle:
+
+| x | single normale | single trasp=0 | bundle |
+|---|---|---|---|
+| 398 | 170.3 | 3.7 | 3.7 |
+| 401 | 195.0 | 0.0 | 0.0 |
+| 405 | 192.0 | 0.0 | 0.0 |
+
+**Fix**: il predicato di trasparenza viaggia verso `trace_bundle` come callback
+(`DiskTransparency`), così le due strade concordano su cosa conti come impatto.
+Vive in `main.cpp` con le palette, senza trascinare `ColorParams` dentro
+`ray_bundle.hpp`.
+
+| x | 16 spp | single | bundle prima | bundle dopo |
+|---|---|---|---|---|
+| 398 | 148.0 | 170.3 | 3.7 | **119.7** |
+| 401 | 195.3 | 195.0 | 0.0 | **194.3** |
+| 405 | 191.3 | 192.0 | 0.0 | **192.0** |
+
+RMSE contro il riferimento da **14.60 a 11.96**, contro l'11.59 del single-ray.
+Pixel più scuri di 25 livelli: da 4256 a 3546, e di questi **3181 sono sfondo**
+(aliasing dello starfield, cioè P2) — il single-ray ne ha 3689, quindi su quel
+fronte il bundle è ora migliore. Restano 365 pixel di disco a `r≈11.6` con
+copertura 0.662: bordo esterno parzialmente coperto.
+
+**Nota**: la linea scura dove il disco incontra l'ombra c'è **anche nel
+riferimento a 16 spp**. Quella è fisica — bordo interno fortemente spostato
+verso il rosso — e non va tolta.
