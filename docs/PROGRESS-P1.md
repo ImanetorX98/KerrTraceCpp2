@@ -137,7 +137,38 @@ Candidati non esclusi: i passi `hr`/`ht` delle derivate della metrica in
 di Hermite di `r`; il passo `eps` in `init_bundle`.
 
 Irrilevante per scegliere la larghezza di un filtro. **Da spiegare prima di
-P2**, dove la magnificazione entra direttamente nella luminosità delle stelle.
+P2b**, dove la magnificazione entrerebbe direttamente nella luminosità.
+
+### Tentativo di spiegazione (2026-09-06): non riuscito, ma tre cause escluse
+
+**1. I passi `hr`/`ht` delle derivate della metrica in `bundle_ops`.** Escluso.
+Variandoli su tre ordini di grandezza lo scarto non si muove; a 1e-7 comincia
+solo a degradare per arrotondamento:
+
+| h | scarto da 1 | spread |
+|---|---|---|
+| 1e-4 | +0.304% | 1.0086× |
+| 1e-5 | +0.303% | 1.0082× |
+| 1e-6 | +0.305% | 1.0082× |
+| 1e-7 | +0.286% | 1.0113× |
+
+**2. Bias di Jensen dal rumore della referenza.** Escluso. Il rapporto delle
+*mediane* (1.00331) è grande quanto la mediana dei *rapporti* (1.00303), e
+`mediana(detJ/m)` = 0.99698 è esattamente `1/1.00303`: è uno scostamento
+moltiplicativo pulito, non un artefatto di distribuzione. Il rumore relativo di
+`detJ` contro una media 3×3 è dello 0.04% mediano, due ordini sotto.
+
+**3. Selezione del campione.** Escluso con un controllo a maschera fissa.
+
+**Quel che resta, e non torna.** Allargando lo stencil della referenza lo scarto
+**cala** — a parità di pixel: +0.2516% (k=1), +0.2374% (k=2), +0.1774% (k=3).
+Un errore di troncamento O(k²h²) crescerebbe di 9× da k=1 a k=3, non
+diminuirebbe. Quindi la referenza a stencil stretto è *più lontana* dal fascio di
+quella a stencil largo, il che è il contrario di quanto ci si aspetta se il
+fascio fosse esatto e la referenza approssimata.
+
+Non ho una spiegazione. Lo scarto è **0.18%–0.30% a seconda di come si misura la
+referenza**, sistematico e moltiplicativo. Resta annotato come non capito.
 
 ---
 
