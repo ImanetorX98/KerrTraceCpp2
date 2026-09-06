@@ -327,6 +327,10 @@ struct BundleResult {
     // Edge vectors of the pixel's footprint on the disk, in (r, φ), already
     // scaled by the pixel's angular size. DNGR §2.2(iii) integrates the emission
     // over this region rather than sampling the centre.
+    // Footprint of the pixel, per pixel rather than per radian. Which surface it
+    // lives on depends on how the ray ended, and the two cases are exclusive:
+    //   disk_hit  -> (dr, dphi) in the equatorial plane
+    //   escape    -> (dtheta, dphi) on the celestial sphere
     double fp_dr_a = 0.0, fp_dphi_a = 0.0;
     double fp_dr_b = 0.0, fp_dphi_b = 0.0;
     /// Fraction of the pixel's footprint that actually lands on the disk. 1 in
@@ -633,7 +637,40 @@ static BundleResult trace_bundle(int px, int py,
         if (best_event == StepEvent::ESCAPE) {
             const double th_esc = bs_prev.geo.theta + best_alpha * (bs.geo.theta - bs_prev.geo.theta);
             const double ph_esc = bs_prev.geo.phi   + best_alpha * (bs.geo.phi   - bs_prev.geo.phi);
-            return {false, r_escape, 1.0, 1.0, th_esc, ph_esc};
+            BundleResult out{false, r_escape, 1.0, 1.0, th_esc, ph_esc};
+
+            // Footprint of the pixel on the celestial sphere, the same
+            // construction as at the disk but with r = r_escape as the crossing
+            // surface: neighbouring rays reach it at different affine parameter,
+            // so the flow along the ray is projected out before reading the
+            // angular deviation.
+            //
+            //     dr + r' dl = 0  =>  dl = -dr/r' ,
+            //     dtheta_sky = dtheta + theta' dl ,  dphi_sky = dphi + phi' dl .
+            //
+            // The background is an equirectangular bitmap, i.e. a resolved
+            // texture, so what it needs from the beam is a resampling footprint
+            // -- A.3.1's treatment of extended structures. The magnification
+            // factor in the same appendix is for unresolved point stars, which
+            // this renderer does not have.
+            double f_r, f_th, f_pr, f_pth;
+            geodesic_rhs(g, bs.geo.r, bs.geo.theta, bs.geo.pr, bs.geo.ptheta,
+                         bs.geo.pt, bs.geo.pphi, f_r, f_th, f_pr, f_pth);
+            const double f_phi = dphi_vel(g, bs.geo.r, bs.geo.theta,
+                                          bs.geo.pt, bs.geo.pphi);
+            auto Wi = [&](int row, int col) {
+                return bs_prev.W[row][col]
+                     + best_alpha * (bs.W[row][col] - bs_prev.W[row][col]);
+            };
+            if (std::abs(f_r) > 1e-14) {
+                const double dl_a = -Wi(0,0) / f_r;
+                const double dl_b = -Wi(0,1) / f_r;
+                out.fp_dr_a   = (Wi(1,0) + f_th  * dl_a) * dang;   // dtheta_sky
+                out.fp_dphi_a = (Wi(2,0) + f_phi * dl_a) * dang;   // dphi_sky
+                out.fp_dr_b   = (Wi(1,1) + f_th  * dl_b) * dang;
+                out.fp_dphi_b = (Wi(2,1) + f_phi * dl_b) * dang;
+            }
+            return out;
         }
     }
     return {false, bs.geo.r, 1.0, 1.0};
