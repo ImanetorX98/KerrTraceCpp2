@@ -150,3 +150,44 @@ resta a 3, che è la migliore delle tre misurate.
 |---|---|---|
 | v0.2.26 | `b816dc5` → `523c8e8` | impronta sulla sfera celeste, filtro della lookup di sfondo |
 | v0.2.27 | `2e21cb9` → `4a5d11f` | campi `sky_*` separati, `KGEO_VERSION`=4, sfondo filtrato anche dietro il bordo |
+
+---
+
+## Fuori piano — la cucitura verticale (v0.2.29)
+
+Segnalata guardando i frame a 720p: una linea verticale netta a metà immagine.
+La supposizione ragionevole era che riguardasse il disco, e in effetti è così, ma
+la causa non è nella geometria.
+
+**Non è nel tracciamento.** Scandendo le colonne dei campi geometrici, al centro
+il salto vale 0.2×–1.3× la mediana, cioè niente: i massimi veri (4×–118×) stanno
+a `x≈520-550`, sul bordo dell'ombra, dove una discontinuità è fisica.
+
+**È il taglio di ramo di φ.** `phi_disk` fa un salto **grezzo** di 4.7 rad in una
+sola colonna, `x=637` su 1280 con `phi_obs=0`. Le texture procedurali del disco
+sono funzioni dell'azimut, e il rumore a reticolo che usano **non è periodico**:
+attraverso il taglio legge un valore del tutto scorrelato.
+
+Due sorgenti indipendenti, entrambe sistemate:
+
+- `interstellar_disk_soft_mask`: `fbm2d(phi_norm*3, …)` e `*2` — i bordi interno
+  ed esterno del disco scalinavano al taglio.
+- la turbolenza: `fbm2d(r*1.2, phit*8, …)` e `fbm2d(r*5, phit*25 + 2n₁, …)`.
+
+**Rimedio**: rumore piastrellabile. `value_noise2d_tiled` avvolge l'indice di
+reticolo modulo un periodo intero, `fbm2d_tiled` raddoppia il periodo a ogni
+ottava insieme alla frequenza. La coordinata angolare viene avvolta e riscalata a
+un numero **intero** di celle per giro: 2π·8 = 50.3 → 50, 2π·25 = 157.1 → 157,
+quindi la scala visiva resta praticamente identica.
+
+Misura, salto medio fra colonne alla colonna 637 contro il fondo locale
+(colonne 625–650, esclusa la 637):
+
+| | colonna 637 | fondo locale | eccesso |
+|---|---|---|---|
+| prima, fotogramma intero | 2.667 | 1.217 | 2.19× |
+| prima, banda del disco | 2.707 | 0.395 | **6.85×** |
+| dopo, fotogramma intero | 1.215 | 1.219 | 1.00× |
+| dopo, banda del disco | 0.387 | 0.394 | **0.98×** |
+
+La colonna è ora indistinguibile dalle vicine.

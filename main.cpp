@@ -2403,6 +2403,52 @@ static double value_noise2d(double x, double y, double seed) {
     return nx0 + (nx1 - nx0) * uy;
 }
 
+// Tileable variants: the lattice index is wrapped modulo an integer period, so
+// the noise is exactly periodic in that axis. Needed because the disk textures
+// are functions of the azimuth, which has a branch cut: phi_disk jumps by 2*pi
+// down one column of the image (x = 637 in a 1280-wide frame at phi_obs = 0),
+// and untiled lattice noise reads a completely unrelated value across it. That
+// was the vertical seam through the disk.
+static double value_noise2d_tiled(double x, double y, double seed,
+                                  int per_x, int per_y) {
+    const double ix = std::floor(x), iy = std::floor(y);
+    const double fx = x - ix,        fy = y - iy;
+    const double ux = fx * fx * (3.0 - 2.0 * fx);
+    const double uy = fy * fy * (3.0 - 2.0 * fy);
+
+    auto wrap = [](double v, int per) {
+        if (per <= 0) return v;
+        const double p = double(per);
+        double m = std::fmod(v, p);
+        if (m < 0.0) m += p;
+        return m;
+    };
+    auto H = [&](double gx, double gy) {
+        return hash2d(wrap(gx, per_x), wrap(gy, per_y), seed);
+    };
+
+    const double n00 = H(ix, iy),       n10 = H(ix + 1.0, iy);
+    const double n01 = H(ix, iy + 1.0), n11 = H(ix + 1.0, iy + 1.0);
+    const double nx0 = n00 + (n10 - n00) * ux;
+    const double nx1 = n01 + (n11 - n01) * ux;
+    return nx0 + (nx1 - nx0) * uy;
+}
+
+// Each octave doubles the frequency, so its period in lattice cells doubles too.
+static double fbm2d_tiled(double x, double y, double seed, int octaves,
+                          int per_x, int per_y) {
+    double sum = 0.0, amp = 0.5, freq = 1.0, norm = 0.0;
+    for (int i = 0; i < octaves; ++i) {
+        const int px = (per_x > 0) ? int(std::lround(per_x * freq)) : 0;
+        const int py = (per_y > 0) ? int(std::lround(per_y * freq)) : 0;
+        sum += amp * value_noise2d_tiled(x * freq, y * freq, seed + 17.0 * i, px, py);
+        norm += amp;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    return (norm > 0.0) ? (sum / norm) : 0.0;
+}
+
 static double fbm2d(double x, double y, double seed, int octaves = 5) {
     double sum = 0.0;
     double amp = 0.5;
@@ -2423,8 +2469,10 @@ static double interstellar_disk_soft_mask(double r, double phi,
     const double phi_norm = fract01(phi / (2.0 * M_PI));
     const double t = cp.interstellar_time;
 
-    const double edgeInNoise = 2.0 * fbm2d(phi_norm * 3.0, t * 0.10, 11.0, 4) - 1.0;
-    const double edgeOutNoise = 2.0 * fbm2d(phi_norm * 2.0, t * 0.07, 29.0, 4) - 1.0;
+    // phi_norm already wraps into [0,1); the noise must wrap with it, or the
+    // disk's inner and outer edges step at the branch cut.
+    const double edgeInNoise = 2.0 * fbm2d_tiled(phi_norm * 3.0, t * 0.10, 11.0, 4, 3, 0) - 1.0;
+    const double edgeOutNoise = 2.0 * fbm2d_tiled(phi_norm * 2.0, t * 0.07, 29.0, 4, 2, 0) - 1.0;
 
     const double rin_local = r_in * (1.0 + 0.03 * edgeInNoise);
     const double rout_local = r_out * (1.0 + 0.06 * edgeOutNoise);
@@ -2471,8 +2519,12 @@ static RGB disk_colour_interstellar(double r, double phi,
         : 1.0;
     const double profile = radial * inner_glow;
 
-    const double n1 = 2.0 * fbm2d(r * 1.2, phit * 8.0, 41.0, 5) - 1.0;
-    const double n2 = 2.0 * fbm2d(r * 5.0, phit * 25.0 + 2.0 * n1, 73.0, 4) - 1.0;
+    // The angular coordinate is wrapped and scaled to a whole number of noise
+    // cells per revolution: 2*pi*8 = 50.3 becomes 50 and 2*pi*25 = 157.1 becomes
+    // 157, so the texture tiles with essentially the same visual scale as before.
+    const double phit_w = fract01(phit / (2.0 * M_PI));
+    const double n1 = 2.0 * fbm2d_tiled(r * 1.2, phit_w * 50.0, 41.0, 5, 0, 50) - 1.0;
+    const double n2 = 2.0 * fbm2d_tiled(r * 5.0, phit_w * 157.0 + 2.0 * n1, 73.0, 4, 0, 157) - 1.0;
     const double turb_str = cp.interstellar_turbulence_strength;
     const double turbulence = 0.75 + turb_str * (0.35 * n1 + 0.12 * n2);
 
