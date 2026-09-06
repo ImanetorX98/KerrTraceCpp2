@@ -301,6 +301,20 @@ static bool bundle_adaptive(const KNdSMetric& g, BundleState& bs,
     return accepted;
 }
 
+// Partial transparency of the disk, as the single-ray tracers already honour it.
+// The Interstellar palettes fade the disk out towards its rim and treat anything
+// below --disk-interstellar-edge-transparency as a hole to see through; the
+// stratified palette has literal gaps between tiles. A ray that stops at the
+// first equator crossing regardless renders the faded mask as black, which is
+// what put a dark rim around the disk in bundle mode. The predicate lives in
+// main.cpp with the palettes, so it arrives as a callback rather than dragging
+// ColorParams into this header.
+struct DiskTransparency {
+    bool (*fn)(double r, double phi, const void* ctx) = nullptr;
+    const void* ctx = nullptr;
+    bool see_through(double r, double phi) const { return fn && fn(r, phi, ctx); }
+};
+
 // ── Bundle result ─────────────────────────────────────────────
 struct BundleResult {
     bool   disk_hit    = false;
@@ -368,7 +382,8 @@ static BundleResult trace_bundle(int px, int py,
                                   double step_init = 1.0,
                                   double tol = 1e-7,
                                   double pixel_offset_x = 0.0,
-                                  double pixel_offset_y = 0.0) {
+                                  double pixel_offset_y = 0.0,
+                                  DiskTransparency transp = DiskTransparency{}) {
     const int span = (cam.width > 1) ? (cam.width - 1) : 1;
     const double x = (double)px + pixel_offset_x;
     const double y = (double)py + pixel_offset_y;
@@ -432,7 +447,14 @@ static BundleResult trace_bundle(int px, int py,
             const double r_hit = crossed_equator
                 ? hermite_interp_scalar(bs_prev.geo.r, bs.geo.r, dr0, dr1, step_used, alpha)
                 : 0.0;
-            if (crossed_equator && r_hit >= r_disk_in && r_hit <= r_disk_out) {
+            const double phi_cross = crossed_equator
+                ? bs_prev.geo.phi + alpha * (bs.geo.phi - bs_prev.geo.phi) : 0.0;
+            // A transparent patch is not a hit: keep going, exactly as the
+            // single-ray tracers do, or the fade at the rim renders as black.
+            const bool see_through = crossed_equator &&
+                                     transp.see_through(r_hit, phi_cross);
+            if (crossed_equator && !see_through &&
+                r_hit >= r_disk_in && r_hit <= r_disk_out) {
                 // ── Redshift ──────────────────────────────────────
                 // Mirrors disk_redshift() in main.cpp. keplerian_omega() returns
                 // −Ω_K by convention, so the physical prograde Ω is its negation;
