@@ -6,7 +6,7 @@ Piano di riferimento: `PLAN-2026-09-05.md`, voce P1.
 
 ---
 
-## Stato: metà fatta
+## Stato: P1 sostanzialmente chiuso sul disco, aperto sullo sfondo
 
 | passo | stato |
 |---|---|
@@ -19,6 +19,12 @@ Piano di riferimento: `PLAN-2026-09-05.md`, voce P1.
 | 7. Verificare contro il riferimento 16 spp | **fatto — vedi passo 7** |
 | 8. Copertura analitica al bordo | **fatto, v0.2.23** |
 | 9. Resampling di bordo (A.3.1) | **fatto, v0.2.24** |
+| 10. Trasparenza del disco nel fascio | **fatto, v0.2.25** |
+
+**Dove siamo**, RMSE contro il riferimento a 16 spp: single-ray 11.59, bundle
+**11.96** (era 14.61 all'inizio di P1). Dei 3546 pixel ancora più scuri di 25
+livelli, **3181 sono sfondo** — il single-ray ne ha 3689, quindi sul disco il
+bundle è ormai davanti e il residuo è quasi tutto **P2**.
 
 ---
 
@@ -320,12 +326,12 @@ non è la metrica giusta per giudicare il lavoro sul disco.
 
 | versione | commit | contenuto |
 |---|---|---|
-| v0.2.21 | `dafbad0` | ricostruzione del campo di Jacobi (passi 3–4) |
+| v0.2.21 | `dafbad0` → `2dce7e0` | ricostruzione del campo di Jacobi (passi 3–4) |
 | — | — | correzione dell'attribuzione del residuo 0.3% |
-| v0.2.22 | | impronta esportata, `KGEO_VERSION`=2, filtro sull'emissione |
-| v0.2.23 | | copertura al bordo, continuazione dietro il disco, `KGEO_VERSION`=3 |
-| v0.2.24 | | resampling dei pixel di bordo (A.3.1), copertura bilaterale |
-| v0.2.25 | | trasparenza del disco onorata anche dal fascio |
+| v0.2.22 | `861be72` → `deccc8a` | impronta esportata, `KGEO_VERSION`=2, filtro sull'emissione |
+| v0.2.23 | `ab36883` → `f92aaf3` | copertura al bordo, continuazione dietro il disco, `KGEO_VERSION`=3 |
+| v0.2.24 | `7dec149` → `e5ebc73` | resampling dei pixel di bordo (A.3.1), copertura bilaterale |
+| v0.2.25 | `a25960b` → `6dd00f0` | trasparenza del disco onorata anche dal fascio |
 
 
 ---
