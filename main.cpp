@@ -74,6 +74,13 @@ struct ColorParams {
     double exposure    = 1.0;   // intensity multiplier before tonemapping
     double gamma       = 2.2;   // gamma correction exponent
     double temp_scale  = 1.0;   // disk blackbody temperature scale
+    // A redshifted blackbody is still a blackbody, at T_obs = g * T_emit, so the
+    // colour temperature should follow g all the way down. The old code floored g
+    // at 0.2 before that multiplication, which rendered the innermost, most
+    // redshifted ring orange instead of deep red. Off by default; opt in to
+    // reproduce older frames.
+    bool   temp_redshift_clamp = false;
+    double temp_redshift_floor = 0.2;
     double disk_brightness = 1.0; // common accretion-disk brightness multiplier
     double disk_opacity = 1.0; // common disk opacity [0,1], shared by all palettes
     DiskPalette palette    = DiskPalette::BLACKBODY;
@@ -2668,8 +2675,16 @@ static RGB disk_colour(double r, double red, double magnif,
                        double M, double a, double r_isco, double r_disk_out,
                        const ColorParams& cp,
                        double flux_ref) {
-    // Physical g: >1 on approaching side → hotter temperature there.
-    const double red_phys = clamp(red, 0.2, 5.0);
+    // Physical g: >1 on approaching side → hotter temperature there, and no floor
+    // on the cold side. blackbody() already clamps T to [800, 40000] K, so a very
+    // small g simply lands on the deepest red the ramp has rather than producing
+    // a degenerate colour. Measured at a=0.998, theta=82, r_obs=60: g reaches
+    // 0.0295 and 4.72% of disk pixels sat below the old 0.2 floor (7.29% at
+    // theta=88, r_obs=30; only 0.34% at a=0.9). Where it bit, at r ~ 1.6M, it
+    // turned (255,0,0) into (255,119,13).
+    const double red_phys = cp.temp_redshift_clamp
+        ? clamp(red, cp.temp_redshift_floor, 5.0)
+        : std::max(red, 0.0);
     double T = 6500.0 * cp.temp_scale * std::sqrt(6.0*M/r) * red_phys;
     const double flux = disk_flux_raw(r, r_isco, a, cp);
     const double safe_ref = std::max(1.0e-12, flux_ref);
@@ -4033,6 +4048,11 @@ int main(int argc, char** argv) {
             cli_inner_emission_floor_width = std::stod(argv[++i]);
         if (arg=="--bundle-edge-grid" && i+1<argc)
             cp.bundle_edge_grid = std::max(1, std::stoi(argv[++i]));
+        if (arg=="--disk-temp-clamp") cp.temp_redshift_clamp = true;
+        if (arg=="--disk-temp-clamp-floor" && i+1<argc) {
+            cp.temp_redshift_clamp = true;
+            cp.temp_redshift_floor = std::max(0.0, std::stod(argv[++i]));
+        }
         if (arg=="--bundle-filter")    cp.bundle_filter = true;
         if (arg=="--no-bundle-filter") cp.bundle_filter = false;
         if (arg=="--bundle-filter-rings" && i+1<argc)
