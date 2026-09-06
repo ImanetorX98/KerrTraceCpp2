@@ -79,6 +79,14 @@ struct ColorParams {
     // at 0.2 before that multiplication, which rendered the innermost, most
     // redshifted ring orange instead of deep red. Off by default; opt in to
     // reproduce older frames.
+    // Exposure gain for the NASA palette alone. Its levels were calibrated when
+    // that palette dropped the relativistic beaming altogether; switching the
+    // beaming on in v0.2.28 multiplied the disk by g^4, whose median over the
+    // disk runs 0.28 (edge-on, near-extremal) to 0.43 (mild), and the palette
+    // went dark. This gain restores the overall level so the beaming shows up as
+    // contrast rather than as an overall dimming. It is an exposure calibration,
+    // not a physical term: the ratio between any two pixels is untouched.
+    double nasa_gain = 3.5;
     bool   temp_redshift_clamp = false;
     double temp_redshift_floor = 0.2;
     double disk_brightness = 1.0; // common accretion-disk brightness multiplier
@@ -2651,6 +2659,7 @@ static RGB disk_colour_interstellar_nasa(double r, double phi,
     // choice, so it is now --disk-nasa-symmetric rather than the default.
     double intensity = mask * profile * turbulence * bands * inner_taper;
     intensity *= doppler_luma_scale(red, cp);
+    intensity *= std::max(0.0, cp.nasa_gain);
     intensity *= lens;
     intensity *= cp.interstellar_hdr_intensity;
     intensity *= std::max(0.0, cp.disk_brightness);
@@ -4048,6 +4057,8 @@ int main(int argc, char** argv) {
             cli_inner_emission_floor_width = std::stod(argv[++i]);
         if (arg=="--bundle-edge-grid" && i+1<argc)
             cp.bundle_edge_grid = std::max(1, std::stoi(argv[++i]));
+        if (arg=="--disk-nasa-gain" && i+1<argc)
+            cp.nasa_gain = std::max(0.0, std::stod(argv[++i]));
         if (arg=="--disk-temp-clamp") cp.temp_redshift_clamp = true;
         if (arg=="--disk-temp-clamp-floor" && i+1<argc) {
             cp.temp_redshift_clamp = true;
