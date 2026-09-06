@@ -164,17 +164,24 @@ struct GeoPixel {
     // footprint straddles the disk's radial bounds; this is what turns the
     // binary hit/miss decision at the rim into a gradient.
     float   coverage;
+    // Footprint on the celestial sphere, for filtering the background. A rim
+    // pixel needs this as well as the disk footprint above: it shades the disk
+    // over one and composites the sky over the other.
+    float   sky_dth_a, sky_dph_a;
+    float   sky_dth_b, sky_dph_b;
 };
-static_assert(sizeof(GeoPixel) == 48, "GeoPixel size mismatch");
+static_assert(sizeof(GeoPixel) == 64, "GeoPixel size mismatch");
 
 // ── .kgeo file format ─────────────────────────────────────────
 static const char   KGEO_MAGIC[4]  = {'K','G','E','O'};
+// 4: split the sky footprint out of the disk footprint, so a partly covered rim
+//    pixel can carry both.
 // 3: added the coverage fraction.
 // 2: added the disk footprint vectors to GeoPixel. Version 1 files are 28 bytes
 // per record against 44 and cannot be read; the layout is not self-describing, so
 // the version is the only guard. It was left at 1 through the v0.2.3 layout change,
 // which is what made that drift silent.
-static const uint32_t KGEO_VERSION = 3;
+static const uint32_t KGEO_VERSION = 4;
 
 struct KGeoMeta {
     uint32_t W, H;
@@ -2720,14 +2727,14 @@ static std::vector<RGB> colorize_buffer(
     auto sample_sky = [&](const BackgroundImage& img, const GeoPixel& p) -> RGB {
         const bool has_fp =
             cp.bundle_filter &&
-            (std::abs(p.fp_dr_a) + std::abs(p.fp_dphi_a) +
-             std::abs(p.fp_dr_b) + std::abs(p.fp_dphi_b)) > 0.0f &&
-            std::isfinite(p.fp_dr_a) && std::isfinite(p.fp_dphi_a) &&
-            std::isfinite(p.fp_dr_b) && std::isfinite(p.fp_dphi_b);
+            (std::abs(p.sky_dth_a) + std::abs(p.sky_dph_a) +
+             std::abs(p.sky_dth_b) + std::abs(p.sky_dph_b)) > 0.0f &&
+            std::isfinite(p.sky_dth_a) && std::isfinite(p.sky_dph_a) &&
+            std::isfinite(p.sky_dth_b) && std::isfinite(p.sky_dph_b);
         if (!has_fp) return img.sample(p.theta_esc, p.phi_esc);
         return img.sample_footprint(p.theta_esc, p.phi_esc,
-                                    p.fp_dr_a, p.fp_dphi_a,
-                                    p.fp_dr_b, p.fp_dphi_b,
+                                    p.sky_dth_a, p.sky_dph_a,
+                                    p.sky_dth_b, p.sky_dph_b,
                                     footprint_pattern(cp.bundle_filter_rings,
                                                       cp.bundle_filter_sigma));
     };
@@ -2795,10 +2802,10 @@ static std::vector<RGB> colorize_buffer(
                 RGB behind{0,0,0};
                 const uint8_t behind_code = p._pad[1];
                 if (behind_code == 0) {
-                    if (!bg.px.empty()) behind = bg.sample(p.theta_esc, p.phi_esc);
+                    if (!bg.px.empty()) behind = sample_sky(bg, p);
                 } else if (behind_code == 3) {
                     const BackgroundImage& bgB = (bg_b && !bg_b->px.empty()) ? *bg_b : bg;
-                    if (!bgB.px.empty()) behind = bgB.sample(p.theta_esc, p.phi_esc);
+                    if (!bgB.px.empty()) behind = sample_sky(bgB, p);
                 }
                 const double ia = 1.0 - alpha;
                 image[i] = {
@@ -2930,6 +2937,7 @@ static std::vector<GeoPixel> trace_geodesics_wormhole(
             pix.redshift  = 1.0f;
             pix.magnif    = 1.0f;
             pix.coverage  = 1.0f;
+            pix.sky_dth_a = pix.sky_dph_a = pix.sky_dth_b = pix.sky_dph_b = 0.0f;
             pix.phi_disk  = 0.0f;
             pix.theta_esc = (float)res.theta_esc;
             pix.phi_esc   = (float)res.phi_esc;
@@ -3117,6 +3125,10 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.fp_dr_b   = (float)res.fp_dr_b;
                 pix.fp_dphi_b = (float)res.fp_dphi_b;
                 pix.coverage  = (float)res.coverage;
+                pix.sky_dth_a = (float)res.sky_dth_a;
+                pix.sky_dph_a = (float)res.sky_dph_a;
+                pix.sky_dth_b = (float)res.sky_dth_b;
+                pix.sky_dph_b = (float)res.sky_dph_b;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
                 // The uncovered fraction of a rim pixel sees the background, so
@@ -3160,6 +3172,7 @@ static std::vector<GeoPixel> trace_geodesics(
                 pix.magnif    = 1.0f;
                 pix.phi_disk  = (float)res.phi_disk;
                 pix.fp_dr_a = pix.fp_dphi_a = pix.fp_dr_b = pix.fp_dphi_b = 0.0f;
+                pix.sky_dth_a = pix.sky_dph_a = pix.sky_dth_b = pix.sky_dph_b = 0.0f;
                 pix.coverage = 1.0f;
                 pix.theta_esc = (float)res.theta_esc;
                 pix.phi_esc   = (float)res.phi_esc;
@@ -3260,6 +3273,7 @@ static std::vector<GeoPixel> trace_geodesics(
             double acc_phi_c = 0.0, acc_phi_s = 0.0;
             double acc_fp[4] = {0,0,0,0};
             double acc_th_e = 0.0, acc_ph_ec = 0.0, acc_ph_es = 0.0;
+            double acc_sky[4] = {0,0,0,0};
             for (int j = 0; j < n; ++j)
                 for (int i = 0; i < n; ++i) {
                     const double ox = (double(i) + 0.5) / double(n) - 0.5;
@@ -3282,12 +3296,16 @@ static std::vector<GeoPixel> trace_geodesics(
                             acc_th_e   += sub.behind_theta;
                             acc_ph_ec  += std::cos(sub.behind_phi);
                             acc_ph_es  += std::sin(sub.behind_phi);
+                            acc_sky[0] += sub.sky_dth_a; acc_sky[1] += sub.sky_dph_a;
+                            acc_sky[2] += sub.sky_dth_b; acc_sky[3] += sub.sky_dph_b;
                         }
                     } else {
                         ++escapes;
                         acc_th_e  += sub.theta_esc;
                         acc_ph_ec += std::cos(sub.phi_esc);
                         acc_ph_es += std::sin(sub.phi_esc);
+                        acc_sky[0] += sub.sky_dth_a; acc_sky[1] += sub.sky_dph_a;
+                        acc_sky[2] += sub.sky_dth_b; acc_sky[3] += sub.sky_dph_b;
                     }
                 }
 
@@ -3315,6 +3333,10 @@ static std::vector<GeoPixel> trace_geodesics(
                     const double einv = 1.0 / double(escapes);
                     out.theta_esc = float(acc_th_e * einv);
                     out.phi_esc   = float(std::atan2(acc_ph_es, acc_ph_ec));
+                    out.sky_dth_a = float(acc_sky[0] * einv);
+                    out.sky_dph_a = float(acc_sky[1] * einv);
+                    out.sky_dth_b = float(acc_sky[2] * einv);
+                    out.sky_dph_b = float(acc_sky[3] * einv);
                 }
             }
             resolved[idx] = out;

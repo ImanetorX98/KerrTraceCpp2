@@ -77,14 +77,70 @@ il fascio vale il suo costo.
 Interno e bordi non si muovono, come atteso: il filtro tocca solo i raggi che
 sfuggono.
 
-### Cosa resta
+### Cosa restava
 
-- Il caso misto: un pixel di bordo con copertura parziale porta nei campi `fp_*`
-  l'impronta **del disco**, quindi la parte di sfondo che compone dietro resta
-  campionata senza filtro. Sono i 365 pixel del residuo di P1.
+- Il caso misto: un pixel di bordo con copertura parziale portava nei campi
+  `fp_*` l'impronta **del disco**, quindi lo sfondo composto dietro restava
+  campionato senza filtro. → affrontato in v0.2.27, sotto.
 - **P2b** resta non applicabile finché non esistono stelle puntiformi.
 - Il costo: 3.92 s contro 3.75 s, cioè +4%. Il filtro dello sfondo è quasi
   gratis perché non traccia raggi, campiona solo la texture più volte.
+
+---
+
+## P2b-bis — I pixel misti del bordo (v0.2.27)
+
+### Quanto pesavano
+
+Non 365 come avevo detto — quello era il conteggio dei pixel *molto* più scuri.
+I pixel di disco a copertura parziale che compongono sfondo dietro sono **1630**,
+l'1.26% del fotogramma, ma valevano il **16.2%** dell'errore quadratico totale
+(RMSE locale 24.32 contro 6.77 globale). Da qui la decisione di allargare il
+record invece di lasciar perdere.
+
+### Fatto
+
+Campi `sky_*` separati da `fp_*`: un pixel di bordo ne ha bisogno di **entrambi**
+— l'impronta sul disco per ombreggiare e misurare la copertura, quella sul cielo
+per filtrare lo sfondo che compone dietro di sé. Record da 48 a 64 byte,
+`KGEO_VERSION` a **4**. La continuazione oltre il disco ora registra anche la sua
+impronta di cielo, e il resampling di bordo la media sui sotto-fasci che sfuggono.
+
+| | RMSE totale | RMSE sui misti | contributo |
+|---|---|---|---|
+| prima | 6.769 | 24.32 | 16.2% |
+| dopo | **6.728** | **22.95** | 14.6% |
+
+### Il guadagno è reale ma piccolo, e so perché
+
+Avevo stimato che azzerare l'errore su quei pixel avrebbe portato l'RMSE da 6.769
+a 6.195. Ne abbiamo recuperato **6.728**, cioè circa il **7%** del recuperabile.
+Il campionamento dello sfondo non era la causa principale del loro errore.
+
+Infittire la griglia di sotto-fasci **non aiuta** — peggiora:
+
+| griglia | RMSE totale | RMSE sui misti |
+|---|---|---|
+| 3×3 | **6.728** | **22.95** |
+| 5×5 | 6.763 | 23.82 |
+| 7×7 | 6.764 | 23.84 |
+
+Non è rumore di campionamento: è **sistematico**. La causa è strutturale nel
+modo in cui compongo. Per un pixel di bordo faccio
+
+```
+colore = copertura · disco(r̄, φ̄) + (1−copertura) · sfondo(θ̄, φ̄)
+```
+
+cioè **medio la geometria e poi ombreggio una volta sola**. Il riferimento
+ombreggia ogni sotto-campione e poi media i colori. Le palette non sono lineari,
+quindi le due cose non coincidono, e infittire la griglia rende la geometria
+media più precisa senza avvicinare il risultato.
+
+Per chiudere davvero servirebbe ombreggiare in fase 1, cioè rompere la
+separazione in due fasi su cui è costruito il renderer (e il formato `.kgeo`).
+Non lo faccio adesso: è una scelta d'architettura, non un ritocco. La griglia
+resta a 3, che è la migliore delle tre misurate.
 
 ---
 
@@ -93,3 +149,4 @@ sfuggono.
 | versione | commit | contenuto |
 |---|---|---|
 | v0.2.26 | `b816dc5` → `523c8e8` | impronta sulla sfera celeste, filtro della lookup di sfondo |
+| v0.2.27 | | campi `sky_*` separati, `KGEO_VERSION`=4, sfondo filtrato anche dietro il bordo |
