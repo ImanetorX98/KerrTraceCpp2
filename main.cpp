@@ -215,6 +215,11 @@ static bool load_kgeo(const char* path,
     return f.good();
 }
 
+// One sample of the pixel's footprint, in footprint coordinates (s, t) inside
+// [-1,1]^2 with a truncated-Gaussian weight. Declared here because both the
+// background sampler and the disk shading use the same pattern.
+struct FootprintSample { double s, t, w; };
+
 // ── Background HDRI ───────────────────────────────────────────
 struct BackgroundImage {
     int w = 0, h = 0;
@@ -227,6 +232,32 @@ struct BackgroundImage {
         px.assign(data, data + (size_t)w*h*3);
         stbi_image_free(data);
         return true;
+    }
+
+    // Averages the lookup over the beam's footprint on the celestial sphere.
+    // The background is a resolved texture, so what the bundle gives it is a
+    // resampling kernel: A.3.1 minimises moire on extended structures "by
+    // adapting the resampling filter according to the shape of the beam". With
+    // a single bilinear tap the star field aliases badly wherever the lensing
+    // stretches or compresses the sky -- measured at twice the reference's
+    // high-frequency energy, and 3181 of the 3546 pixels still off the 16-spp
+    // reference after the disk work of P1.
+    RGB sample_footprint(double theta, double phi,
+                         double dth_a, double dph_a,
+                         double dth_b, double dph_b,
+                         const std::vector<FootprintSample>& pat) const {
+        if (px.empty()) return {0,0,0};
+        const double ha_t = 0.5*dth_a, ha_p = 0.5*dph_a;
+        const double hb_t = 0.5*dth_b, hb_p = 0.5*dph_b;
+        double ar = 0.0, ag = 0.0, ab = 0.0;
+        for (const FootprintSample& fs : pat) {
+            const RGB c = sample(theta + fs.s*ha_t + fs.t*hb_t,
+                                 phi   + fs.s*ha_p + fs.t*hb_p);
+            ar += fs.w * c.r; ag += fs.w * c.g; ab += fs.w * c.b;
+        }
+        return { (uint8_t)clamp(ar + 0.5, 0.0, 255.0),
+                 (uint8_t)clamp(ag + 0.5, 0.0, 255.0),
+                 (uint8_t)clamp(ab + 0.5, 0.0, 255.0) };
     }
 
     RGB sample(double theta, double phi) const {
@@ -2622,7 +2653,6 @@ static RGB disk_colour(double r, double red, double magnif,
 // (s, t) in [-1, 1]^2, mapped to the disk by the two edge vectors. Weights are
 // exp(-d^2 / 2 sigma^2) truncated at the footprint edge, so a sample never
 // reaches beyond the region the pixel actually sees.
-struct FootprintSample { double s, t, w; };
 
 static const std::vector<FootprintSample>& footprint_pattern(int rings, double sigma) {
     static std::vector<FootprintSample> cache;
@@ -2683,6 +2713,24 @@ static std::vector<RGB> colorize_buffer(
         }
         return image;
     }
+
+    // For an escaping ray the footprint fields hold (dtheta, dphi) on the
+    // celestial sphere, so the background can be averaged over the area the
+    // pixel really sees instead of point-sampled at its centre.
+    auto sample_sky = [&](const BackgroundImage& img, const GeoPixel& p) -> RGB {
+        const bool has_fp =
+            cp.bundle_filter &&
+            (std::abs(p.fp_dr_a) + std::abs(p.fp_dphi_a) +
+             std::abs(p.fp_dr_b) + std::abs(p.fp_dphi_b)) > 0.0f &&
+            std::isfinite(p.fp_dr_a) && std::isfinite(p.fp_dphi_a) &&
+            std::isfinite(p.fp_dr_b) && std::isfinite(p.fp_dphi_b);
+        if (!has_fp) return img.sample(p.theta_esc, p.phi_esc);
+        return img.sample_footprint(p.theta_esc, p.phi_esc,
+                                    p.fp_dr_a, p.fp_dphi_a,
+                                    p.fp_dr_b, p.fp_dphi_b,
+                                    footprint_pattern(cp.bundle_filter_rings,
+                                                      cp.bundle_filter_sigma));
+    };
 
     for (int i = 0; i < W*H; ++i) {
         const GeoPixel& p = geo[i];
@@ -2763,9 +2811,9 @@ static std::vector<RGB> colorize_buffer(
             // Universe B — use secondary background if provided, else bg
             const BackgroundImage& bgB = (bg_b && !bg_b->px.empty()) ? *bg_b : bg;
             if (!bgB.px.empty())
-                image[i] = bgB.sample(p.theta_esc, p.phi_esc);
+                image[i] = sample_sky(bgB, p);
         } else if (p.outcome == 0 && !bg.px.empty())
-            image[i] = bg.sample(p.theta_esc, p.phi_esc);
+            image[i] = sample_sky(bg, p);
     }
     return image;
 }
