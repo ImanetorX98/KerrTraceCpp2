@@ -149,4 +149,4 @@ resta a 3, che è la migliore delle tre misurate.
 | versione | commit | contenuto |
 |---|---|---|
 | v0.2.26 | `b816dc5` → `523c8e8` | impronta sulla sfera celeste, filtro della lookup di sfondo |
-| v0.2.27 | | campi `sky_*` separati, `KGEO_VERSION`=4, sfondo filtrato anche dietro il bordo |
+| v0.2.27 | `2e21cb9` → `4a5d11f` | campi `sky_*` separati, `KGEO_VERSION`=4, sfondo filtrato anche dietro il bordo |
