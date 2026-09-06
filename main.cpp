@@ -2531,7 +2531,7 @@ static RGB disk_colour_interstellar(double r, double phi,
 // NASA Goddard-style accretion disk (Schnittman 2019 visualization).
 // Orange-amber palette, no Doppler (artistic symmetric choice), strong bands.
 static RGB disk_colour_interstellar_nasa(double r, double phi,
-                                         double magnif,
+                                         double red, double magnif,
                                          double r_in, double r_out,
                                          double r_isco,
                                          const ColorParams& cp) {
@@ -2585,8 +2585,13 @@ static RGB disk_colour_interstellar_nasa(double r, double phi,
     const double dr_in = std::max(0.0, r - r_in);
     const double inner_taper = 1.0 - std::exp(-0.5 * (dr_in / inner_taper_sigma) * (dr_in / inner_taper_sigma));
 
-    // No Doppler (artistic symmetric choice matching NASA/Schnittman render).
+    // Relativistic beaming, on unless explicitly switched off. This palette used
+    // to drop it unconditionally -- the factor was not even a parameter of the
+    // function, so --doppler silently did nothing here and the disk came out
+    // uniformly bright with no approaching side. A symmetric disk is an artistic
+    // choice, so it is now --disk-nasa-symmetric rather than the default.
     double intensity = mask * profile * turbulence * bands * inner_taper;
+    intensity *= doppler_luma_scale(red, cp);
     intensity *= lens;
     intensity *= cp.interstellar_hdr_intensity;
     intensity *= std::max(0.0, cp.disk_brightness);
@@ -2758,7 +2763,7 @@ static std::vector<RGB> colorize_buffer(
                                                     r_disk_in, r_disk_out,
                                                     M_bh, a_bh, r_isco, cp, flux_ref);
                 if (cp.palette == DiskPalette::INTERSTELLAR_NASA)
-                    return disk_colour_interstellar_nasa(rr, pp, magnif_n,
+                    return disk_colour_interstellar_nasa(rr, pp, p.redshift, magnif_n,
                                                          r_disk_in, r_disk_out,
                                                          r_isco, cp);
                 return disk_colour(rr, p.redshift, magnif_n,
@@ -3922,9 +3927,10 @@ int main(int argc, char** argv) {
         if (arg=="--disk-blackbody")    cp.palette = DiskPalette::BLACKBODY;
         if (arg=="--disk-stratified")   cp.palette = DiskPalette::STRATIFIED;
         if (arg=="--disk-interstellar") cp.palette = DiskPalette::INTERSTELLAR;
-        if (arg=="--disk-nasa") {
+        if (arg=="--disk-nasa") cp.palette = DiskPalette::INTERSTELLAR_NASA;
+        if (arg=="--disk-nasa-symmetric") {
             cp.palette = DiskPalette::INTERSTELLAR_NASA;
-            cli_doppler_enabled = false;  // artistic symmetric choice
+            cli_doppler_enabled = false;  // artistic: no approaching side
         }
         if (arg=="--disk-radial-profile" && i+1<argc) {
             const std::string mode = argv[++i];
