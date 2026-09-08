@@ -30,3 +30,7 @@ frontend/.angular/
 .idea/
 *.swp
 .worktrees/
+
+# Handoff locale per analisi esterna: non versionato di proposito, contiene
+# valutazioni di processo che non appartengono alla storia del repo.
+HANDOFF-ASTRA.md
