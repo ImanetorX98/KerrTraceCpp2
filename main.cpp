@@ -86,7 +86,12 @@ struct ColorParams {
     // went dark. This gain restores the overall level so the beaming shows up as
     // contrast rather than as an overall dimming. It is an exposure calibration,
     // not a physical term: the ratio between any two pixels is untouched.
-    double nasa_gain = 3.5;
+    // Set to 10 by preference: 5.5 restores the pre-beaming level exactly on an
+    // edge-on near-extremal scene, and 10 goes brighter than that on purpose.
+    // Nothing clips -- the Reinhard curve compresses the highlights -- but on a
+    // mild-redshift view it lands well above the old level; use --disk-nasa-gain
+    // to dial it back there.
+    double nasa_gain = 10.0;
     bool   temp_redshift_clamp = false;
     double temp_redshift_floor = 0.2;
     double disk_brightness = 1.0; // common accretion-disk brightness multiplier
