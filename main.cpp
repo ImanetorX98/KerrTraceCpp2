@@ -2619,7 +2619,12 @@ static RGB disk_colour_interstellar_nasa(double r, double phi,
     const double profile = std::pow(std::max(r / std::max(r_in, 1e-12), 1e-6), -p);
 
     // Low turbulence: NASA viz has smooth, regular banding without swirling.
-    const double n1 = 2.0 * fbm2d(r * 0.7, phit * 5.0, 41.0, 3) - 1.0;
+    // Same azimuthal wrap as the Interstellar palette: 2*pi*5 = 31.4 cells per
+    // revolution becomes 31, so the texture closes on itself at the phi branch
+    // cut. v0.2.29 tiled the shared soft mask and the Interstellar turbulence but
+    // missed this one, which is why the seam survived in NASA frames.
+    const double phit_w = fract01(phit / (2.0 * M_PI));
+    const double n1 = 2.0 * fbm2d_tiled(r * 0.7, phit_w * 31.0, 41.0, 3, 0, 31) - 1.0;
     const double turb_str = cp.interstellar_turbulence_strength;
     const double turbulence = 0.88 + turb_str * 0.18 * n1;
 
