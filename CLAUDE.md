@@ -7,6 +7,12 @@ ray-bundle antialiasing.  Target: publication-quality images like DNGR/Interstel
 
 ---
 
+## Mappa del progetto
+
+**Vedi `docs/ARCHITETTURA.md`** per l'albero dei file, il flusso a due fasi, il
+contratto `GeoPixel`, quale tracciatore corre quando, e le trappole ricorrenti.
+Leggilo prima di esplorare il sorgente: evita di rileggere 12 000 righe.
+
 ## Codebase Map
 
 | File | Role |
