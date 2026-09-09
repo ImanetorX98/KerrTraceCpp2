@@ -167,13 +167,14 @@ clamp `kGMax=6`.
 
 ---
 
-## 5. `KGEO_VERSION` è ancora 1
+## 5. KGEO: versione corretta, formato autodescrittivo ancora da progettare
 
-Il layout del record `.kgeo` è cambiato in v0.2.3 senza bump. La guardia aggiunta
-protegge il test, non altri eventuali lettori. Rimedio: incrementare la versione,
-o meglio scrivere il passo del record nell'header — entrambi invalidano la cache
-in `out/` (oltre 1200 file). Il server non parsa i record, usa i `.kgeo` solo
-come nomi di file, quindi non è esposto.
+Il formato attuale è v4, con record da 64 byte. Dalla v0.2.34 il lettore reale
+controlla header, overflow delle dimensioni e lunghezza completa prima di
+allocare; i fallimenti di scrittura vengono propagati. Resta da introdurre un
+header con passo del record, tipo di metrica e provenienza della geometria.
+Le cache v4 precedenti rimangono leggibili ma conservano il vecchio redshift:
+occorre ritracciarle per applicare la normalizzazione dell'osservatore finito.
 
 ---
 

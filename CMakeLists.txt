@@ -28,7 +28,7 @@ if(KT_HW_ARM64 AND NOT CMAKE_OSX_ARCHITECTURES)
         "macOS build architectures" FORCE)
 endif()
 
-project(KerrTracer VERSION 0.2.33 LANGUAGES CXX)
+project(KerrTracer VERSION 0.2.34 LANGUAGES CXX)
 
 # Refuse to emit a binary that would need Rosetta. Cross-compiling for Intel
 # stays possible, but only as a deliberate, explicit choice.
@@ -143,7 +143,7 @@ target_compile_definitions(kerr_tracer PRIVATE
     OUT_DIR="${CMAKE_SOURCE_DIR}/out")
 
 target_compile_options(kerr_tracer PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>: -O3 ${KERRTRACE_ARCH_FLAGS} -ffast-math
+    $<$<COMPILE_LANGUAGE:CXX>: -O3 ${KERRTRACE_ARCH_FLAGS}
                                 -Wall -Wextra>)
 
 # Metal framework
@@ -187,7 +187,7 @@ if(APPLE AND NOT USE_METAL)
         USE_METAL
         OUT_DIR="${CMAKE_SOURCE_DIR}/out")
     target_compile_options(kerr_tracer_metal PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-O3 ${KERRTRACE_ARCH_FLAGS} -ffast-math -Wall -Wextra>)
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 ${KERRTRACE_ARCH_FLAGS} -Wall -Wextra>)
     target_link_libraries(kerr_tracer_metal PRIVATE
         "-framework Metal"
         "-framework Foundation"
@@ -245,4 +245,32 @@ if(BUILD_TESTING)
     add_test(NAME kerrtrace.chart_consistency
         COMMAND kerrtrace_chart_consistency_regression $<TARGET_FILE:kerr_tracer>)
     set_tests_properties(kerrtrace.chart_consistency PROPERTIES TIMEOUT 900)
+    add_executable(kerrtrace_audit_regression tests/audit_regression.cpp)
+    target_include_directories(kerrtrace_audit_regression PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_audit_regression PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wextra -Wno-unused-function>)
+    add_test(NAME kerrtrace.audit COMMAND kerrtrace_audit_regression)
+    set_tests_properties(kerrtrace.audit PROPERTIES TIMEOUT 120)
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME kerrtrace.cli COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/cli_regression.py $<TARGET_FILE:kerr_tracer>)
+        set_tests_properties(kerrtrace.cli PROPERTIES TIMEOUT 180)
+    endif()
+    if(APPLE)
+        add_executable(kerrtrace_metal_render_test tests/metal_render_regression.mm
+            gpu/metal/metal_renderer.mm)
+        target_compile_definitions(kerrtrace_metal_render_test PRIVATE USE_METAL)
+        target_compile_options(kerrtrace_metal_render_test PRIVATE -O2 -Wno-unused-function)
+        target_link_libraries(kerrtrace_metal_render_test PRIVATE
+            "-framework Metal" "-framework Foundation" "-framework CoreGraphics")
+        add_test(NAME kerrtrace.metal_render COMMAND kerrtrace_metal_render_test)
+        set_tests_properties(kerrtrace.metal_render PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        add_executable(kerrtrace_metal_shader_test tests/metal_shader_test.mm)
+        target_link_libraries(kerrtrace_metal_shader_test PRIVATE
+            "-framework Metal" "-framework Foundation")
+        add_test(NAME kerrtrace.metal_shader COMMAND kerrtrace_metal_shader_test
+            ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
+        set_tests_properties(kerrtrace.metal_shader PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    endif()
 endif()

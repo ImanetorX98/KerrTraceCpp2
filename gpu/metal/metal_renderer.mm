@@ -115,7 +115,7 @@ std::vector<uint32_t> metal_render(
     int bg_h)
 {
     // ── Ensure cached device / compiled library / PSOs ────────
-    bool precise_math = false;
+    bool precise_math = true;
     if (const char* env = std::getenv("KERR_METAL_PRECISE_MATH"))
         precise_math = (std::atoi(env) != 0);
 

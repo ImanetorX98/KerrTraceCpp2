@@ -8,12 +8,21 @@
 //  (recommended: let CMake handle CUDA architectures/toolchain)
 // ============================================================
 #include "tracer.cuh"
+#ifndef KERRTRACE_CUDA_HOST_TEST
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#else
+#define __device__ inline
+#endif
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
+
+#ifdef KERRTRACE_CUDA_HOST_TEST
+using std::isfinite;
+inline double rsqrt(double x) { return 1.0/std::sqrt(x); }
+#endif
 
 // ── CUDA error helper ─────────────────────────────────────────
 #define CUDA_CHECK(x) do { \
@@ -35,11 +44,9 @@ __device__ double d_Delta_th(double theta, double a, double L) {
 __device__ double d_Xi(double a, double L) { return 1.0 + L*a*a/3.0; }
 
 __device__ double d_keplerian_omega(double r, double M, double a, double Q, double L) {
-    const double s    = (a < 0.0) ? -1.0 : 1.0;
-    const double Meff = M - Q*Q/(2.0*r) + L*a*r*r/3.0;
-    const double sq   = sqrt(fmax(Meff, 0.0));
-    const double den  = r*sqrt(r) + s*a*sq;
-    return (fabs(den) > 1e-14) ? (s*sq/den) : 0.0;
+    (void)Q; (void)L;
+    const double sign = (a < 0.0) ? -1.0 : 1.0;
+    return sign * sqrt(M) / (r*sqrt(r) + fabs(a)*sqrt(M));
 }
 
 __device__ void d_gLL(double r, double theta,
@@ -49,7 +56,7 @@ __device__ void d_gLL(double r, double theta,
 __device__ double d_robust_disk_redshift(double r_hit,
                                          double pt_cov,
                                          double pphi_cov,
-                                         double M, double a, double Q, double L) {
+                                         double M, double a, double Q, double L, double observer_ut) {
     // Frequency-shift factor used by colour pipeline.
     constexpr double kRadicandFloor = 1.0e-8;
     constexpr double kDenomFloor  = 1.0e-8;
@@ -59,10 +66,10 @@ __device__ double d_robust_disk_redshift(double r_hit,
     d_gLL(r_hit, M_PI/2.0, M, a, Q, L, gl2);
     const double d2 = -(gl2[0][0] + 2.0*gl2[0][3]*Omega + gl2[3][3]*Omega*Omega);
     const double ut = rsqrt(fmax(d2, kRadicandFloor));
-    const double denom = -(pt_cov * ut - pphi_cov * Omega * ut);
+    const double denom = -(pt_cov * ut + pphi_cov * Omega * ut);
     const double denom_safe = fmax(denom, kDenomFloor);
-    const double g_factor = (-pt_cov) / denom_safe;
-    if (!isfinite(g_factor)) return 1.0;
+    const double g_factor = (-pt_cov) * observer_ut / denom_safe;
+    if (!isfinite(g_factor)) return 0.0;
     return fmax(0.0, fmin(kRedMax, g_factor));
 }
 
@@ -99,7 +106,7 @@ __device__ void d_rhs(double r, double theta, double pr, double pth,
     double gu[4][4]; d_gUU(r, theta, M, a, Q, L, gu);
     dr  = gu[1][1]*pr;
     dth = gu[2][2]*pth;
-    double er  = 1e-5*(fabs(r)+0.1);
+    double er  = 1e-5*fmax(fabs(r),0.01);
     double eth = 1e-6;
     dpr  = -(d_H(r+er,theta,pr,pth,pt,pphi,M,a,Q,L)
            - d_H(r-er,theta,pr,pth,pt,pphi,M,a,Q,L))/(2.0*er);
@@ -107,7 +114,13 @@ __device__ void d_rhs(double r, double theta, double pr, double pth,
            - d_H(r,theta-eth,pr,pth,pt,pphi,M,a,Q,L))/(2.0*eth);
 }
 
-__device__ void d_rk4(double& r, double& theta, double& pr, double& pth,
+__device__ double d_phi_velocity(double r, double th, double pt, double pp,
+                                        double M, double a, double Q, double L) {
+    double gu[4][4]; d_gUU(r,th,M,a,Q,L,gu);
+    return gu[3][0]*pt + gu[3][3]*pp;
+}
+
+__device__ void d_rk4(double& r, double& theta, double& phi, double& pr, double& pth,
                       double pt, double pphi, double M, double a, double Q, double L,
                       double dlam) {
     double dr1,dth1,dpr1,dpth1, dr2,dth2,dpr2,dpth2;
@@ -116,6 +129,11 @@ __device__ void d_rk4(double& r, double& theta, double& pr, double& pth,
     d_rhs(r+.5*dlam*dr1,theta+.5*dlam*dth1,pr+.5*dlam*dpr1,pth+.5*dlam*dpth1,pt,pphi,M,a,Q,L,dr2,dth2,dpr2,dpth2);
     d_rhs(r+.5*dlam*dr2,theta+.5*dlam*dth2,pr+.5*dlam*dpr2,pth+.5*dlam*dpth2,pt,pphi,M,a,Q,L,dr3,dth3,dpr3,dpth3);
     d_rhs(r+   dlam*dr3,theta+   dlam*dth3,pr+   dlam*dpr3,pth+   dlam*dpth3,pt,pphi,M,a,Q,L,dr4,dth4,dpr4,dpth4);
+    phi += dlam/6.0 * (
+        d_phi_velocity(r,theta,pt,pphi,M,a,Q,L)
+        + 2.0*d_phi_velocity(r+.5*dlam*dr1,theta+.5*dlam*dth1,pt,pphi,M,a,Q,L)
+        + 2.0*d_phi_velocity(r+.5*dlam*dr2,theta+.5*dlam*dth2,pt,pphi,M,a,Q,L)
+        + d_phi_velocity(r+dlam*dr3,theta+dlam*dth3,pt,pphi,M,a,Q,L));
     r    +=dlam/6.0*(dr1  +2*dr2  +2*dr3  +dr4);
     theta+=dlam/6.0*(dth1 +2*dth2 +2*dth3 +dth4);
     pr   +=dlam/6.0*(dpr1 +2*dpr2 +2*dpr3 +dpr4);
@@ -151,8 +169,8 @@ __device__ void d_BL_to_KS_spatial(double r, double theta, double phi, double a,
                                    double& X, double& Y, double& Z) {
     const double st = sin(theta), ct = cos(theta);
     const double sf = sin(phi),   cf = cos(phi);
-    X = st * (r*cf + a*sf);
-    Y = st * (r*sf - a*cf);
+    X = st * (r*cf - a*sf);
+    Y = st * (r*sf + a*cf);
     Z = r * ct;
 }
 
@@ -177,8 +195,8 @@ __device__ void d_jacobian_BL_to_KS(double r, double theta, double phi, double a
                                     double J[3][3]) {
     const double st = sin(theta), ct = cos(theta);
     const double sf = sin(phi),   cf = cos(phi);
-    const double rcfa = r*cf + a*sf;
-    const double rsfa = r*sf - a*cf;
+    const double rcfa = r*cf - a*sf;
+    const double rsfa = r*sf + a*cf;
 
     // Columns: (dr, dtheta, dphi), rows: (X,Y,Z)
     J[0][0] = st * cf;
@@ -232,6 +250,7 @@ __device__ bool d_solve3x3(double A[3][3], double b[3], double x[3]) {
 
 __device__ bool d_BL_covector_to_KS(double r, double theta, double phi, double a,
                                     double pr, double ptheta, double pphi,
+                                    double pt, double M, double Q,
                                     double& pX, double& pY, double& pZ) {
     double J[3][3];
     d_jacobian_BL_to_KS(r, theta, phi, a, J);
@@ -242,7 +261,9 @@ __device__ bool d_BL_covector_to_KS(double r, double theta, double phi, double a
         for (int i = 0; i < 3; ++i)
             A[j][i] = J[i][j];
 
-    double b[3] = {pr, ptheta, pphi};
+    const double delta = r*r + a*a - 2.0*M*r + Q*Q;
+    const double shifted_pr = pr - ((2.0*M*r-Q*Q)*pt + a*pphi)/delta;
+    double b[3] = {shifted_pr, ptheta, pphi};
     double x[3];
     if (!d_solve3x3(A, b, x)) return false;
     pX = x[0]; pY = x[1]; pZ = x[2];
@@ -251,6 +272,7 @@ __device__ bool d_BL_covector_to_KS(double r, double theta, double phi, double a
 
 __device__ void d_KS_covector_to_BL(double r, double theta, double phi, double a,
                                     double pX, double pY, double pZ,
+                                    double pt, double M, double Q,
                                     double& pr, double& ptheta, double& pphi) {
     double J[3][3];
     d_jacobian_BL_to_KS(r, theta, phi, a, J);
@@ -263,6 +285,8 @@ __device__ void d_KS_covector_to_BL(double r, double theta, double phi, double a
         if (j == 1) ptheta = s;
         if (j == 2) pphi = s;
     }
+    const double delta = r*r + a*a - 2.0*M*r + Q*Q;
+    pr += ((2.0*M*r-Q*Q)*pt + a*pphi)/delta;
 }
 
 __device__ void d_gUU_KS(double X, double Y, double Z, double M, double a, double Q,
@@ -347,278 +371,166 @@ __device__ void d_rk4_KS(double& X, double& Y, double& Z,
     pZ += dlam/6.0*(dpZ1 +2.0*dpZ2 +2.0*dpZ3 +dpZ4);
 }
 
-// ── Colour ────────────────────────────────────────────────────
-__device__ uchar4 d_blackbody(double T) {
-    T = fmax(800.0, fmin(4e4, T));
-    double t = log10(T/800.0)/log10(4e4/800.0);
-    double R,G,B;
-    if(t<0.25){R=1;G=t/0.25*0.4;B=0;}
-    else if(t<0.5){double f=(t-0.25)/0.25;R=1;G=0.4+f*0.4;B=f*0.3;}
-    else if(t<0.75){double f=(t-0.5)/0.25;R=1;G=0.8+f*0.2;B=0.3+f*0.5;}
-    else{double f=(t-0.75)/0.25;R=1-f*0.2;G=1;B=0.8+f*0.2;}
-    return {(unsigned char)(fmin(R,1.0)*255),
-            (unsigned char)(fmin(G,1.0)*255),
-            (unsigned char)(fmin(B,1.0)*255), 255};
+// The same function is exercised by CPU CI and called by the CUDA kernel.
+// No shading here: CUDA hands geometry to the shared colorize_buffer().
+__device__ double d_twist(double r, double a, double M, double Q) {
+    if (fabs(a) < 1e-15) return 0.0;
+    const double disc = M*M-a*a-Q*Q;
+    if (disc > 1e-14*M*M) {
+        const double root=sqrt(disc), rp=M+root, rm=M-root;
+        return a/(2.0*root)*log(fabs((r-rp)/(r-rm)));
+    }
+    return -a/(r-M);
 }
 
-// ── Main kernel (one thread = one pixel) ─────────────────────
-__global__ void trace_kernel(uint32_t*              output,
-                              const KNdSParams_CUDA  kp,
-                              const CameraParams_CUDA cp) {
-    const int px = blockIdx.x*blockDim.x + threadIdx.x;
-    const int py = blockIdx.y*blockDim.y + threadIdx.y;
-    if(px >= cp.width || py >= cp.height) return;
-
-    double M=kp.M, a=kp.a, Q=kp.Q, L=kp.Lambda;
-
-    int span = (cp.width > 1) ? (cp.width - 1) : 1;
-    double alpha = cp.fov_h*(px - 0.5*(cp.width-1)) / span;
-    double beta  = cp.fov_h*(0.5*(cp.height-1) - py) / span;
-
-    double r0=cp.r_obs, th0=cp.theta_obs;
-    double gl[4][4]; d_gLL(r0, th0, M, a, Q, L, gl);
-    double gu[4][4]; d_gUU(r0, th0, M, a, Q, L, gu);
-
-    double ca=cos(alpha),sa=sin(alpha),cb=cos(beta),sb=sin(beta);
-    double pUr   =-ca*cb/sqrt(fabs(gl[1][1]));
-    double pUth  =-sb    /sqrt(fabs(gl[2][2]));
-    double pUphi =-sa*cb /sqrt(fabs(gl[3][3]));
-    double pt    = gl[0][0]+gl[0][3]*pUphi;
-    double pr    = gl[1][1]*pUr;
-    double pth   = gl[2][2]*pUth;
-    double pphi  = gl[3][0]+gl[3][3]*pUphi;
-
-    // Null correction
-    double A=gu[0][0], B=2.0*gu[0][3]*pphi;
-    double C=gu[1][1]*pr*pr+gu[2][2]*pth*pth+gu[3][3]*pphi*pphi;
-    double disc=B*B-4.0*A*C;
-    if(disc>=0.0 && fabs(A)>1e-15){
-        double sq=sqrt(disc);
-        double pt1=(-B-sq)/(2.0*A), pt2=(-B+sq)/(2.0*A);
-        pt=(pt1<0.0)?pt1:pt2;
-        if(pt>0.0) pt=fmin(pt1,pt2);
-    }
-
-    double r=r0, theta=th0, dlam=1.0;
-    double prev_r=r0;
-    double prev_cos=cos(th0);
-    uint32_t colour=0xFF000000u;
-
-    // ── KS chart path (Lambda=0 only) ─────────────────────────
-    const bool want_ks = (cp.chart == 1 && fabs(L) <= 1e-12);
-    if (want_ks) {
-        double X, Y, Z;
-        d_BL_to_KS_spatial(r0, th0, cp.phi_obs, a, X, Y, Z);
-        double pX, pY, pZ;
-        bool ks_ok = d_BL_covector_to_KS(r0, th0, cp.phi_obs, a, pr, pth, pphi, pX, pY, pZ);
-
-        double pT = pt;
-        if (ks_ok) {
-            double gu_ks[4][4];
-            d_gUU_KS(X, Y, Z, M, a, Q, gu_ks);
-            const double Aks = gu_ks[0][0];
-            const double Bks = 2.0 * (gu_ks[0][1]*pX + gu_ks[0][2]*pY + gu_ks[0][3]*pZ);
-            const double Cks = gu_ks[1][1]*pX*pX + gu_ks[2][2]*pY*pY + gu_ks[3][3]*pZ*pZ
-                             + 2.0*gu_ks[1][2]*pX*pY + 2.0*gu_ks[1][3]*pX*pZ + 2.0*gu_ks[2][3]*pY*pZ;
-            const double dks = Bks*Bks - 4.0*Aks*Cks;
-            if (dks >= 0.0 && fabs(Aks) > 1e-15) {
-                const double sq = sqrt(dks);
-                const double pT1 = (-Bks - sq)/(2.0*Aks);
-                const double pT2 = (-Bks + sq)/(2.0*Aks);
-                pT = (pT1 < 0.0) ? pT1 : pT2;
-                if (pT > 0.0) pT = fmin(pT1, pT2);
-                ks_ok = isfinite(pT);
-            } else {
-                ks_ok = false;
+__device__ double d_hermite(double y0,double y1,double f0,double f1,double h,double t) {
+    double t2=t*t,t3=t2*t;
+    return (2*t3-3*t2+1)*y0+(t3-2*t2+t)*h*f0+(-2*t3+3*t2)*y1+(t3-t2)*h*f1;
+}
+__device__ double d_crossing(double y0,double y1,double f0,double f1,double h,int mode) {
+    if (mode==0) return y0*y1<=0.0 ? fabs(y0)/(fabs(y0)+fabs(y1)+1e-12) : -1.0;
+    double prev=y0,lo=0.0;
+    if (fabs(prev)<=1e-12) return 0.0;
+    for(int b=1;b<=8;++b) {
+        double hi=double(b)/8.0,cur=d_hermite(y0,y1,f0,f1,h,hi);
+        if(fabs(cur)<=1e-12) return hi;
+        if(prev*cur<=0.0) {
+            for(int k=0;k<8;++k) {
+                double mid=(lo+hi)*.5,val=d_hermite(y0,y1,f0,f1,h,mid);
+                if(prev*val<=0.0) hi=mid; else lo=mid;
             }
+            return .5*(lo+hi);
         }
+        lo=hi;prev=cur;
+    }
+    return -1.0;
+}
 
-        if (ks_ok) {
-            double dlam_ks = 1.0;
-            double prevX = X, prevY = Y, prevZ = Z;
-            double prevPX = pX, prevPY = pY, prevPZ = pZ;
-
-            for(int iter=0; iter<200000; ++iter) {
-                // Step-doubling
-                double Xh=X,Yh=Y,Zh=Z,pXh=pX,pYh=pY,pZh=pZ;
-                d_rk4_KS(Xh,Yh,Zh,pXh,pYh,pZh,pT,M,a,Q,dlam_ks);
-                double Xf=X,Yf=Y,Zf=Z,pXf=pX,pYf=pY,pZf=pZ;
-                d_rk4_KS(Xf,Yf,Zf,pXf,pYf,pZf,pT,M,a,Q,dlam_ks*0.5);
-                d_rk4_KS(Xf,Yf,Zf,pXf,pYf,pZf,pT,M,a,Q,dlam_ks*0.5);
-
-                const double err = sqrt((Xh-Xf)*(Xh-Xf) + (Yh-Yf)*(Yh-Yf) + (Zh-Zf)*(Zh-Zf)
-                                      + (pXh-pXf)*(pXh-pXf) + (pYh-pYf)*(pYh-pYf) + (pZh-pZf)*(pZh-pZf))/15.0;
-                const double tol = 1e-7;
-                if(err<tol||dlam_ks<1e-10){
-                    X=Xf;Y=Yf;Z=Zf;pX=pXf;pY=pYf;pZ=pZf;
-                    double sc=(err>1e-12)?0.9*pow(tol/err,0.2):2.0;
-                    dlam_ks=fmin(fmax(dlam_ks*sc,1e-10),100.0);
-                } else {
-                    dlam_ks=fmax(dlam_ks*0.9*pow(tol/err,0.25),1e-10);
-                    continue;
-                }
-
-                if (!(isfinite(X) && isfinite(Y) && isfinite(Z) &&
-                      isfinite(pX) && isfinite(pY) && isfinite(pZ))) break;
-
-                const double r_now = d_r_KS(X, Y, Z, a);
-                if (r_now < kp.r_horizon*1.03) break;
-                if (r_now > cp.r_obs*1.05) break;
-
-                if(prevZ*Z<=0.0){
-                    double denom = prevZ - Z;
-                    double w = (fabs(denom) > 1e-12) ? (prevZ / denom) : 0.5;
-                    w = fmax(0.0, fmin(1.0, w));
-                    double Xhit = prevX + w*(X - prevX);
-                    double Yhit = prevY + w*(Y - prevY);
-                    double Zhit = prevZ + w*(Z - prevZ);
-                    double pXhit = prevPX + w*(pX - prevPX);
-                    double pYhit = prevPY + w*(pY - prevPY);
-                    double pZhit = prevPZ + w*(pZ - prevPZ);
-
-                    double r_hit, th_hit, ph_hit;
-                    d_KS_to_BL_spatial(Xhit, Yhit, Zhit, a, r_hit, th_hit, ph_hit);
-                    if(!(r_hit>=kp.r_isco && r_hit<=kp.r_disk_out)){
-                        prevX = X; prevY = Y; prevZ = Z;
-                        prevPX = pX; prevPY = pY; prevPZ = pZ;
-                        continue;
+__device__ GeoPixel d_trace_one(int px,int py,KNdSParams_CUDA kp,CameraParams_CUDA cp) {
+    GeoPixel result{};
+    result.redshift=1.0f; result.magnif=1.0f; result.coverage=1.0f;result._pad[1]=2;
+    const double M=kp.M,a=kp.a,Q=kp.Q,L=kp.Lambda;
+    const double span=cp.width>1?cp.width-1:1;
+    const double alpha=cp.fov_h*(px+cp.pixel_offset_x-.5*(cp.width-1))/span;
+    const double beta=cp.fov_h*(.5*(cp.height-1)-py-cp.pixel_offset_y)/span;
+    double gl[4][4];d_gLL(cp.r_obs,cp.theta_obs,M,a,Q,L,gl);
+    const double obs_ut=rsqrt(-gl[0][0]);
+    const double nph=-sin(alpha)*cos(beta);
+    const double ep=rsqrt(gl[3][3]-gl[0][3]*gl[0][3]/gl[0][0]);
+    const double put=obs_ut-nph*gl[0][3]/gl[0][0]*ep;
+    const double puphi=nph*ep;
+    const double pt=gl[0][0]*put+gl[0][3]*puphi;
+    const double pp=gl[3][0]*put+gl[3][3]*puphi;
+    double r=cp.r_obs,th=cp.theta_obs,ph=cp.phi_obs;
+    double pr=-cos(alpha)*cos(beta)*sqrt(gl[1][1]),pth=-sin(beta)*sqrt(gl[2][2]);
+    double h=cp.step_init;
+    const double tol=cp.tolerance,rh=kp.r_horizon*1.03,re=cp.r_obs*1.05;
+    if(cp.chart==1) {
+        double X,Y,Z,pX,pY,pZ;
+        const double phi_ks=ph+d_twist(r,a,M,Q);
+        d_BL_to_KS_spatial(r,th,phi_ks,a,X,Y,Z);
+        if(!d_BL_covector_to_KS(r,th,phi_ks,a,pr,pth,pp,pt,M,Q,pX,pY,pZ)) return result;
+        int rejects=0;
+        for(int step=0;step<cp.max_steps;++step) {
+            const double x0=X,y0=Y,z0=Z,px0=pX,py0=pY,pz0=pZ,r0=d_r_KS(X,Y,Z,a),used=h;
+            double xh=X,yh=Y,zh=Z,pxh=pX,pyh=pY,pzh=pZ;
+            d_rk4_KS(xh,yh,zh,pxh,pyh,pzh,pt,M,a,Q,h);
+            double xf=X,yf=Y,zf=Z,pxf=pX,pyf=pY,pzf=pZ;
+            d_rk4_KS(xf,yf,zf,pxf,pyf,pzf,pt,M,a,Q,h*.5);
+            d_rk4_KS(xf,yf,zf,pxf,pyf,pzf,pt,M,a,Q,h*.5);
+            const double err=sqrt((xh-xf)*(xh-xf)+(yh-yf)*(yh-yf)+(zh-zf)*(zh-zf)
+                +(pxh-pxf)*(pxh-pxf)+(pyh-pyf)*(pyh-pyf)+(pzh-pzf)*(pzh-pzf))/15.0;
+            if(!isfinite(err) || !(err<tol || h<1e-10)) {
+                h=fmax(1e-10,isfinite(err)?fmin(h*.5,h*.9*pow(tol/err,.25)):h*.5);
+                if(++rejects>64) break; --step;continue;
+            }
+            rejects=0;X=xf;Y=yf;Z=zf;pX=pxf;pY=pyf;pZ=pzf;
+            h=fmax(1e-10,fmin(100.0,h*(err>1e-14?.9*pow(tol/err,.2):4.0)));
+            double rnow=d_r_KS(X,Y,Z,a),event=2.0;int outcome=-1;
+            if(rnow<=rh) {event=fmax(0.0,fmin(1.0,(r0-rh)/(r0-rnow)));outcome=2;}
+            if(rnow>=re) {double t=fmax(0.0,fmin(1.0,(re-r0)/(rnow-r0)));if(t<event){event=t;outcome=0;}}
+            if(z0*Z<=0.0 || fmin(fabs(z0),fabs(Z))<.35) {
+                double dx0,dy0,dz0,dpx0,dpy0,dpz0,dx1,dy1,dz1,dpx1,dpy1,dpz1;
+                d_rhs_KS(x0,y0,z0,pt,px0,py0,pz0,M,a,Q,dx0,dy0,dz0,dpx0,dpy0,dpz0);
+                d_rhs_KS(X,Y,Z,pt,pX,pY,pZ,M,a,Q,dx1,dy1,dz1,dpx1,dpy1,dpz1);
+                double t=d_crossing(z0,Z,dz0,dz1,used,cp.intersection_mode);
+                if(t>=0.0 && t<event) {
+                    double xx=d_hermite(x0,X,dx0,dx1,used,t),yy=d_hermite(y0,Y,dy0,dy1,used,t),zz=d_hermite(z0,Z,dz0,dz1,used,t);
+                    if(cp.intersection_mode==0) {xx=x0+t*(X-x0);yy=y0+t*(Y-y0);zz=z0+t*(Z-z0);}
+                    double rr,tt,ff;d_KS_to_BL_spatial(xx,yy,zz,a,rr,tt,ff);
+                    if(rr>=kp.r_isco && rr<=kp.r_disk_out) {
+                        result.outcome=1;result.r=float(rr);result.phi_disk=float(ff-d_twist(rr,a,M,Q));
+                        result.redshift=float(d_robust_disk_redshift(rr,pt,pp,M,a,Q,L,obs_ut));return result;
                     }
-
-                    double pr_hit, pth_hit, pphi_hit;
-                    d_KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXhit, pYhit, pZhit,
-                                        pr_hit, pth_hit, pphi_hit);
-                    double red=d_robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
-
-                    double T0=2e6*pow(r_hit/(6.0*M),-0.75);
-                    double T =T0*fmax(0.1,fmin(10.0,red));
-                    double I =fmax(0.0,fmin(2.5,pow(red,4.0)*pow(6.0*M/r_hit,3.0)));
-
-                    uchar4 c=d_blackbody(T);
-                    double R=fmin(c.x*I/255.0,1.0)*255;
-                    double G=fmin(c.y*I/255.0,1.0)*255;
-                    double B2=fmin(c.z*I/255.0,1.0)*255;
-                    colour=(0xFFu<<24)|((uint32_t)B2<<16)|((uint32_t)G<<8)|(uint32_t)R;
-                    break;
                 }
-
-                prevX = X; prevY = Y; prevZ = Z;
-                prevPX = pX; prevPY = pY; prevPZ = pZ;
             }
-            output[py*cp.width+px]=colour;
-            return;
+            if(outcome>=0) {
+                X=x0+event*(X-x0);Y=y0+event*(Y-y0);Z=z0+event*(Z-z0);
+                result.outcome=uint8_t(outcome);break;
+            }
+        }
+        d_KS_to_BL_spatial(X,Y,Z,a,r,th,ph);ph-=d_twist(r,a,M,Q);
+    } else {
+        int rejects=0;
+        for(int step=0;step<cp.max_steps;++step) {
+            double r0=r,t0=th,f0=ph,pr0=pr,pt0=pth,used=h;
+            double ra=r,ta=th,fa=ph,pra=pr,pta=pth;
+            d_rk4(ra,ta,fa,pra,pta,pt,pp,M,a,Q,L,h);
+            double rb=r,tb=th,fb=ph,prb=pr,ptb=pth;
+            d_rk4(rb,tb,fb,prb,ptb,pt,pp,M,a,Q,L,h*.5);
+            d_rk4(rb,tb,fb,prb,ptb,pt,pp,M,a,Q,L,h*.5);
+            double err=sqrt((ra-rb)*(ra-rb)+(ta-tb)*(ta-tb)+(pra-prb)*(pra-prb)+(pta-ptb)*(pta-ptb))/15.0;
+            if(!isfinite(err) || !(err<tol || h<1e-10)) {
+                h=fmax(1e-10,isfinite(err)?fmin(h*.5,h*.9*pow(tol/err,.25)):h*.5);
+                if(++rejects>64) break;--step;continue;
+            }
+            rejects=0;r=rb;th=tb;ph=fb;pr=prb;pth=ptb;
+            h=fmax(1e-10,fmin(100.0,h*(err>1e-14?.9*pow(tol/err,.2):4.0)));
+            double event=2.0;int outcome=-1;
+            if(r<=rh){event=fmax(0.0,fmin(1.0,(r0-rh)/(r0-r)));outcome=2;}
+            if(r>=re){double t=fmax(0.0,fmin(1.0,(re-r0)/(r-r0)));if(t<event){event=t;outcome=0;}}
+            if((t0-M_PI/2)*(th-M_PI/2)<=0.0 || fmin(fabs(t0-M_PI/2),fabs(th-M_PI/2))<.35) {
+                double dr0,dt0,dpr0,dpt0,dr1,dt1,dpr1,dpt1;
+                d_rhs(r0,t0,pr0,pt0,pt,pp,M,a,Q,L,dr0,dt0,dpr0,dpt0);
+                d_rhs(r,th,pr,pth,pt,pp,M,a,Q,L,dr1,dt1,dpr1,dpt1);
+                double t=d_crossing(t0-M_PI/2,th-M_PI/2,dt0,dt1,used,cp.intersection_mode);
+                if(t>=0.0 && t<event) {
+                    double rr=cp.intersection_mode?d_hermite(r0,r,dr0,dr1,used,t):r0+t*(r-r0);
+                    if(rr>=kp.r_isco && rr<=kp.r_disk_out) {
+                        result.outcome=1;result.r=float(rr);result.phi_disk=float(f0+t*(ph-f0));
+                        result.redshift=float(d_robust_disk_redshift(rr,pt,pp,M,a,Q,L,obs_ut));return result;
+                    }
+                }
+            }
+            if(outcome>=0){r=r0+event*(r-r0);th=t0+event*(th-t0);ph=f0+event*(ph-f0);result.outcome=uint8_t(outcome);break;}
         }
     }
-
-    for(int iter=0; iter<200000; ++iter) {
-        // Step-doubling
-        double rh=r,thh=theta,prh=pr,pthh=pth;
-        d_rk4(rh,thh,prh,pthh,pt,pphi,M,a,Q,L,dlam);
-        double rf=r,thf=theta,prf=pr,pthf=pth;
-        d_rk4(rf,thf,prf,pthf,pt,pphi,M,a,Q,L,dlam*0.5);
-        d_rk4(rf,thf,prf,pthf,pt,pphi,M,a,Q,L,dlam*0.5);
-        double dr_=rh-rf,dth_=thh-thf,dpr_=prh-prf,dpth_=pthh-pthf;
-        double err=sqrt(dr_*dr_+dth_*dth_+dpr_*dpr_+dpth_*dpth_)/15.0;
-        const double tol=1e-7;
-        if(err<tol||dlam<1e-10){
-            r=rf;theta=thf;pr=prf;pth=pthf;
-            double sc=(err>1e-12)?0.9*pow(tol/err,0.2):2.0;
-            dlam=fmin(fmax(dlam*sc,1e-10),100.0);
-        } else {
-            dlam=fmax(dlam*0.9*pow(tol/err,0.25),1e-10);
-            continue;
-        }
-
-        if(r < kp.r_horizon*1.03) break;
-        if(r > cp.r_obs*1.05)     break;
-
-        double cos_th=cos(theta);
-        if(prev_cos*cos_th<=0.0){
-            double denom = prev_cos - cos_th;
-            double w = (fabs(denom) > 1e-12) ? (prev_cos / denom) : 0.5;
-            w = fmax(0.0, fmin(1.0, w));
-            double r_hit = prev_r + w*(r - prev_r);
-            if(!(r_hit>=kp.r_isco && r_hit<=kp.r_disk_out)){
-                prev_cos=cos_th;
-                prev_r=r;
-                continue;
-            }
-
-            double red=d_robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
-
-            double T0=2e6*pow(r_hit/(6.0*M),-0.75);
-            double T =T0*fmax(0.1,fmin(10.0,red));
-            const double red_c = fmax(0.01, fmin(10.0, red));
-            const double receding_lift = 1.0 + 0.85 * fmax(0.0, fmin(1.0, 1.0 - red_c));
-            double I =fmax(0.0,fmin(2.5,pow(red_c,4.0)*receding_lift*pow(6.0*M/r_hit,3.0)));
-
-            uchar4 c=d_blackbody(T);
-            double R=fmin(c.x*I/255.0,1.0)*255;
-            double G=fmin(c.y*I/255.0,1.0)*255;
-            double B2=fmin(c.z*I/255.0,1.0)*255;
-            colour=(0xFFu<<24)|((uint32_t)B2<<16)|((uint32_t)G<<8)|(uint32_t)R;
-            break;
-        }
-        prev_cos=cos_th;
-        prev_r=r;
-    }
-    output[py*cp.width+px]=colour;
+    result.r=float(r);result.theta_esc=float(th);result.phi_esc=float(ph);
+    if(result.outcome==2)result.redshift=0.0f;
+    return result;
 }
 
-// ── Host-side launcher ────────────────────────────────────────
-static bool cuda_device_supports_fp64(const cudaDeviceProp& prop) {
-    return (prop.major > 1) || (prop.major == 1 && prop.minor >= 3);
+#ifndef KERRTRACE_CUDA_HOST_TEST
+__global__ void trace_kernel(GeoPixel* output,KNdSParams_CUDA kp,CameraParams_CUDA cp) {
+    int px=blockIdx.x*blockDim.x+threadIdx.x,py=blockIdx.y*blockDim.y+threadIdx.y;
+    if(px<cp.width && py<cp.height)output[py*cp.width+px]=d_trace_one(px,py,kp,cp);
 }
 
-std::vector<uint32_t> cuda_render(
-    const KNdSParams_CUDA&  kp,
-    const CameraParams_CUDA& cp,
-    bool require_fp64)
-{
-    int device_id = 0;
-    CUDA_CHECK(cudaGetDevice(&device_id));
-    cudaDeviceProp prop{};
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
-
-    const bool supports_fp64 = cuda_device_supports_fp64(prop);
-    if (require_fp64 && !supports_fp64) {
-        throw std::runtime_error(
-            "CUDA FP64 strict mode requested, but current device does not expose native FP64 support.");
-    }
-
-    static bool printed_cuda_info = false;
-    if (!printed_cuda_info) {
-        std::cerr << "Info: CUDA device " << device_id << " = " << prop.name
-                  << " (cc " << prop.major << "." << prop.minor << ")";
-        if (supports_fp64) {
-            std::cerr << ", FP64 native=yes";
-            if (prop.singleToDoublePrecisionPerfRatio > 0) {
-                std::cerr << ", SP:DP ratio ~" << prop.singleToDoublePrecisionPerfRatio << ":1";
-            }
-        } else {
-            std::cerr << ", FP64 native=no";
-        }
-        if (require_fp64) {
-            std::cerr << " [strict]";
-        }
-        std::cerr << "\n";
-        printed_cuda_info = true;
-    }
-
-    const size_t npix = (size_t)cp.width * cp.height;
-
-    uint32_t* d_out = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_out, npix * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_out, 0, npix * sizeof(uint32_t)));
-
-    dim3 block(16, 16);
-    dim3 grid(((unsigned)cp.width+15)/16, ((unsigned)cp.height+15)/16);
-    trace_kernel<<<grid, block>>>(d_out, kp, cp);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    std::vector<uint32_t> pixels(npix);
-    CUDA_CHECK(cudaMemcpy(pixels.data(), d_out, npix*sizeof(uint32_t),
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_out));
-    return pixels;
+std::vector<GeoPixel> cuda_trace(const KNdSParams_CUDA& kp,const CameraParams_CUDA& cp,bool require_fp64) {
+    int id=0;CUDA_CHECK(cudaGetDevice(&id));
+    cudaDeviceProp prop{};CUDA_CHECK(cudaGetDeviceProperties(&prop,id));
+    if(require_fp64 && !(prop.major>1 || (prop.major==1 && prop.minor>=3)))
+        throw std::runtime_error("CUDA device does not support native FP64");
+    const size_t count=checked_pixel_count(uint32_t(cp.width),uint32_t(cp.height));
+    std::vector<GeoPixel> pixels(count);
+    GeoPixel* output=nullptr;
+    CUDA_CHECK(cudaMalloc(&output,count*sizeof(GeoPixel)));
+    try {
+        dim3 block(16,16),grid((cp.width+15)/16,(cp.height+15)/16);
+        trace_kernel<<<grid,block>>>(output,kp,cp);
+        CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(pixels.data(),output,count*sizeof(GeoPixel),cudaMemcpyDeviceToHost));
+    } catch (...) { cudaFree(output);throw; }
+    CUDA_CHECK(cudaFree(output));return pixels;
 }
+#endif

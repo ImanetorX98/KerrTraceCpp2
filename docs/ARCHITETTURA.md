@@ -3,7 +3,7 @@
 Scopo: capire dov'è cosa senza rileggere 12 000 righe. Se una riga qui contraddice
 il codice, ha ragione il codice — e va corretta questa.
 
-Ultimo allineamento: v0.2.32.
+Ultimo allineamento: v0.2.34. Numeri di riga e conteggi storici sono indicativi; cercare i simboli nel sorgente.
 
 ---
 
@@ -77,7 +77,7 @@ sotto-campioni, ma noi mediamo la *geometria* e ombreggiamo una volta.
 
 ---
 
-## `GeoPixel`: il contratto fra le fasi (main.cpp:162)
+## `GeoPixel`: il contratto fra le fasi (`render_data.hpp`)
 
 64 byte, `KGEO_VERSION` = 4. **Il formato non è auto-descrittivo**: chi legge deve
 conoscere il layout. Cambiarlo senza incrementare la versione è già successo
@@ -87,7 +87,7 @@ conoscere il layout. Cambiarlo senza incrementare la versione è già successo
 |---|---|
 | `outcome` | 0 = fuga, 1 = disco, 2 = orizzonte, 3 = universo B |
 | `r`, `phi_disk` | punto d'impatto sul disco |
-| `redshift` | fattore `g` di Bardeen |
+| `redshift` | rapporto di frequenza fra camera statica finita ed emettitore |
 | `magnif` | `\|det J\|` del fascio (1 in single-ray) |
 | `theta_esc`, `phi_esc` | direzione di fuga, per lo sfondo |
 | `fp_dr_*`, `fp_dphi_*` | impronta del pixel **sul disco** |
@@ -176,7 +176,12 @@ NASA. La stratified ha un `cell_hash` proprio **non ancora piastrellato**.
 - Le due struct dei parametri (`metal_renderer.hpp` e `tracer.metal`) sono
   **gemelle**: campi nuovi vanno aggiunti **in coda a entrambe**, nello stesso
   ordine.
-- La palette NASA **non esiste** sullo shader: è solo CPU.
+- NASA e stratified, esportazione KGEO e bundle con impronte sono instradati
+  esplicitamente alla CPU. `Backend used:` dichiara il backend effettivo.
+- CUDA restituisce `GeoPixel[]` e condivide la fase colore CPU; la funzione
+  realmente chiamata dal kernel è confrontata con la CPU anche nei test host.
+- I test Metal compilano lo shader e confrontano frame BL/KS sulla GPU reale;
+  senza dispositivo accessibile vengono saltati esplicitamente.
 - Ogni correzione di fisica va portata di là a mano. Il bug del covettore BL→KS
   c'era identico e l'ho scoperto solo perché mi è stato chiesto se fosse a posto.
 

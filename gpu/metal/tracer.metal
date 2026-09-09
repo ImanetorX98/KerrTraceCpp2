@@ -119,6 +119,12 @@ struct CameraParams {
     int   interstellar_physical_profile; // 1 = Novikov-Thorne flux, 0 = artistic power law
     int   bundle_magnif_luma;   // 0 = off (physical), 1 = modulate luminance by 1/magnification
     float bundle_magnif_max;    // soft ceiling of that factor
+    float temp_scale;
+    float doppler_exp;
+    int   temp_redshift_clamp;
+    float temp_redshift_floor;
+    float observer_ut;
+    float interstellar_inner_taper_scale;
 };
 
 struct RenderParams {
@@ -1634,8 +1640,8 @@ static float physical_nt_flux_proxy_raw_f(float r, float r_isco, float a, Camera
     const float r32 = max(r_safe * sqrt(max(r_safe, 1.0e-8f)), 1.0e-8f);
     const float a2 = a * a;
     const float A = 1.0f - 2.0f / max(r_safe, 1.0e-8f) + a2 / max(r2, 1.0e-8f);
-    const float B = 1.0f - 3.0f / max(r_safe, 1.0e-8f) + 2.0f * a / r32;
-    const float C = 1.0f - 4.0f * a / r32 + 3.0f * a2 / max(r2, 1.0e-8f);
+    const float B = 1.0f - 3.0f / max(r_safe, 1.0e-8f) + 2.0f * abs(a) / r32;
+    const float C = 1.0f - 4.0f * abs(a) / r32 + 3.0f * a2 / max(r2, 1.0e-8f);
     const float zero_torque = (cp.radial_term_zero_torque != 0)
         ? clamp(1.0f - sqrt(clamp(r_isco / max(r_safe, 1.0e-8f), 0.0f, 1.0f)), 0.0f, 1.0f)
         : 1.0f;
@@ -1682,16 +1688,16 @@ static float tonemap_ch(float x, float exposure, float gamma) {
     return pow(clamp(x, 0.0f, 1.0f), 1.0f / gamma);
 }
 
-static inline float doppler_intensity_scale(float redshift, int enable_doppler) {
+static inline float doppler_intensity_scale(float redshift, int enable_doppler, float exponent) {
     if (enable_doppler == 0) return 1.0f;
     // Physical g: >1 approaching side → use g^4 directly.
-    return pow(clamp(redshift, 0.01f, 10.0f), 4.0f);
+    return pow(clamp(redshift, 0.01f, 10.0f), exponent);
 }
 
 // Mirrors magnif_luma_scale() in main.cpp: off by default, because Liouville's
 // theorem makes the observed surface brightness g^4 times the emitted one,
 // independent of the bundle footprint.
-static inline float magnif_luma_scale_f(float magnif, constant CameraParams_C& cp) {
+static inline float magnif_luma_scale_f(float magnif, CameraParams cp) {
     if (cp.bundle_magnif_luma == 0) return 1.0f;
     const float cap = max(0.05f, cp.bundle_magnif_max);
     return clamp(1.0f / max(magnif, 1e-12f), 0.05f, cap);
@@ -1700,7 +1706,7 @@ static inline float magnif_luma_scale_f(float magnif, constant CameraParams_C& c
 static inline float robust_disk_redshift(float r_hit,
                                          float pt_cov,
                                          float pphi_cov,
-                                         float M, float a, float Q, float L) {
+                                         float M, float a, float Q, float L, float observer_ut) {
     // Frequency-shift factor used by colour pipeline.
     constexpr float kRadicandFloor = 1e-8f;
     constexpr float kDenomFloor = 1e-8f;
@@ -1713,7 +1719,7 @@ static inline float robust_disk_redshift(float r_hit,
     // Covariant momenta form: -u^t (p_t + Omega p_phi) = u^t (E - Omega L).
     const float denom = -(pt_cov * ut + pphi_cov * Omega * ut);
     const float denom_safe = max(denom, kDenomFloor);
-    const float g_factor = (-pt_cov) / denom_safe;
+    const float g_factor = (-pt_cov) * observer_ut / denom_safe;
     if (!isfinite(g_factor)) return 1.0f;
     return clamp(g_factor, 0.0f, kRedMax);
 }
@@ -1836,6 +1842,38 @@ static float fbm2d_f(float x, float y, float seed, int octaves) {
     return (norm > 0.0f) ? (sum / norm) : 0.0f;
 }
 
+static float wrap_lattice_f(float v, int period) {
+    if (period <= 0) return v;
+    float m = fmod(v, float(period));
+    return m < 0.0f ? m + float(period) : m;
+}
+static float tiled_hash_f(float x, float y, float seed, int px, int py) {
+    return hash2d_f(wrap_lattice_f(x,px), wrap_lattice_f(y,py), seed);
+}
+static float value_noise2d_tiled_f(float x, float y, float seed, int px, int py) {
+    const float ix=floor(x), iy=floor(y), fx=x-ix, fy=y-iy;
+    const float ux=fx*fx*(3.0f-2.0f*fx), uy=fy*fy*(3.0f-2.0f*fy);
+    const float n00=tiled_hash_f(ix,iy,seed,px,py);
+    const float n10=tiled_hash_f(ix+1.0f,iy,seed,px,py);
+    const float n01=tiled_hash_f(ix,iy+1.0f,seed,px,py);
+    const float n11=tiled_hash_f(ix+1.0f,iy+1.0f,seed,px,py);
+    return mix(mix(n00,n10,ux), mix(n01,n11,ux), uy);
+}
+// Each octave doubles the frequency and the lattice period.
+static float fbm2d_tiled_f(float x, float y, float seed, int octaves,
+                          int per_x, int per_y) {
+    float sum = 0.0f, amp = 0.5f, freq = 1.0f, norm = 0.0f;
+    for (int i = 0; i < octaves; ++i) {
+        const int px = (per_x > 0) ? int(round(per_x * freq)) : 0;
+        const int py = (per_y > 0) ? int(round(per_y * freq)) : 0;
+        sum += amp * value_noise2d_tiled_f(x * freq, y * freq, seed + 17.0f * i, px, py);
+        norm += amp;
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return (norm > 0.0f) ? (sum / norm) : 0.0f;
+}
+
 static float interstellar_disk_soft_mask_f(float r, float phi,
                                            float r_in, float r_out,
                                            CameraParams cp) {
@@ -1843,8 +1881,8 @@ static float interstellar_disk_soft_mask_f(float r, float phi,
     const float phi_norm = fract01_f(phi / TWO_PI_F);
     const float t = cp.interstellar_time;
 
-    const float edgeInNoise = 2.0f * fbm2d_f(phi_norm * 3.0f, t * 0.10f, 11.0f, 4) - 1.0f;
-    const float edgeOutNoise = 2.0f * fbm2d_f(phi_norm * 2.0f, t * 0.07f, 29.0f, 4) - 1.0f;
+    const float edgeInNoise = 2.0f * fbm2d_tiled_f(phi_norm * 3.0f, t * 0.10f, 11.0f, 4, 3, 0) - 1.0f;
+    const float edgeOutNoise = 2.0f * fbm2d_tiled_f(phi_norm * 2.0f, t * 0.07f, 29.0f, 4, 2, 0) - 1.0f;
 
     const float rin_local = r_in * (1.0f + 0.03f * edgeInNoise);
     const float rout_local = r_out * (1.0f + 0.06f * edgeOutNoise);
@@ -1907,8 +1945,9 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
             : 1.0f;
         const float profile = radial * inner_glow;
 
-        const float n1 = 2.0f * fbm2d_f(r_hit * 1.2f, phit * 8.0f, 41.0f, 5) - 1.0f;
-        const float n2 = 2.0f * fbm2d_f(r_hit * 5.0f, phit * 25.0f + 2.0f * n1, 73.0f, 4) - 1.0f;
+        const float phit_w = fract01_f(phit / (2.0f * M_PI_F));
+        const float n1 = 2.0f * fbm2d_tiled_f(r_hit * 1.2f, phit_w * 50.0f, 41.0f, 5, 0, 50) - 1.0f;
+        const float n2 = 2.0f * fbm2d_tiled_f(r_hit * 5.0f, phit_w * 157.0f + 2.0f * n1, 73.0f, 4, 0, 157) - 1.0f;
         const float turbulence = 0.75f + cp.interstellar_turbulence_strength * (0.35f * n1 + 0.12f * n2);
 
         const float bands = 1.0f + cp.interstellar_band_strength *
@@ -1932,10 +1971,13 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
 
         const float lens = magnif_luma_scale_f(magnif, cp);
 
-        float intensity = mask * profile * turbulence * bands;
+        const float inner_sigma = max(1e-6f, cp.interstellar_inner_taper_scale * r_in);
+        const float inner_dr = max(0.0f, r_hit - r_in);
+        const float inner_taper = 1.0f - exp(-0.5f * (inner_dr/inner_sigma) * (inner_dr/inner_sigma));
+        float intensity = mask * profile * turbulence * bands * inner_taper;
         // Physical g: >1 approaching side → use g^4 directly.
         const float doppler_scale = (cp.enable_doppler != 0)
-            ? pow(clamp(red, 0.01f, 10.0f), 4.0f)
+            ? pow(clamp(red, 0.01f, 10.0f), cp.doppler_exp)
             : 1.0f;
         intensity *= doppler_scale;
         intensity *= lens;
@@ -1952,10 +1994,12 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
         );
     }
 
-    const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
+    const float red_temperature = cp.temp_redshift_clamp != 0
+        ? clamp(red, cp.temp_redshift_floor, 5.0f) : max(0.0f, red);
+    const float T = 6500.0f * cp.temp_scale * sqrt(6.0f*M/r_hit) * red_temperature;
     float I = disk_flux_norm_f(r_hit, r_isco, a, cp);
     I = max(I, inner_emission_floor_value_f(r_hit, r_isco, r_disk_out, cp));
-    I *= doppler_intensity_scale(red, cp.enable_doppler);
+    I *= doppler_intensity_scale(red, cp.enable_doppler, cp.doppler_exp);
     I *= magnif_luma_scale_f(magnif, cp);
     I *= max(0.0f, cp.disk_brightness);
     const float4 bb = blackbody_rgb(T);
@@ -2092,7 +2136,7 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
                     if (disk_tile_pass_through(r_hit, phi_hit, r_isco, r_disk_out, cp_cfg)) {
                         // Keep tracing: this Interstellar tile is intentionally transparent.
                     } else {
-                    const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
+                    const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L, cp_cfg.observer_ut);
 
                     res.r_hit = r_hit;
                     res.redshift = red;
@@ -2319,7 +2363,7 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                     float pr_hit, pth_hit, pphi_hit;
                     KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                       pr_hit, pth_hit, pphi_hit);
-                    const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
+                    const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L, cp_cfg.observer_ut);
 
                     res.r_hit = r_hit;
                     res.redshift = red;
@@ -2667,7 +2711,7 @@ static inline void trace_pixel_impl(
                 return;
             }
 
-            const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L);
+            const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L, cp.observer_ut);
             const float phi_hit_ell = (verify.outcome == 1) ? verify.phi_hit : cp.phi_obs;
             colour = disk_color_abgr(r_hit_ell, phi_hit_ell, red, 1.0f,
                                      M, a, kp.r_isco, kp.r_disk_out, cp);
@@ -2794,7 +2838,7 @@ static inline void trace_pixel_impl(
                             if (disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
                                 continue;
                             }
-                            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
+                            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L, cp.observer_ut);
                             colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
                                                      M, a, kp.r_isco, kp.r_disk_out, cp);
                             done = true;
@@ -2911,7 +2955,7 @@ static inline void trace_pixel_impl(
                             float pr_hit, pth_hit, pphi_hit;
                             KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                               pr_hit, pth_hit, pphi_hit);
-                            const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
+                            const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L, cp.observer_ut);
                             colour = disk_color_abgr(r_hit, ph_hit_bl, red, 1.0f,
                                                      M, a, kp.r_isco, kp.r_disk_out, cp);
                             best_alpha = alpha;
@@ -3020,7 +3064,7 @@ static inline void trace_pixel_impl(
             }
 
             // Disk hit
-            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
+            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L, cp.observer_ut);
             colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
                                      M, a, kp.r_isco, kp.r_disk_out, cp);
             break;

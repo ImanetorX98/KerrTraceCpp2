@@ -16,6 +16,7 @@
 #include "knds_metric.hpp"
 #include "ray_bundle.hpp"
 #include "wormhole_metric.hpp"
+#include "render_data.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -35,10 +36,21 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
+#include <filesystem>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <cerrno>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
+#endif
 
 #if defined(USE_METAL)
 #  include "gpu/metal/metal_renderer.hpp"
@@ -56,6 +68,25 @@ static double get_time() {
     using C = std::chrono::steady_clock;
     static auto t0 = C::now();
     return std::chrono::duration<double>(C::now()-t0).count();
+#endif
+}
+
+// Pass paths as argv entries: spaces and shell metacharacters are literal.
+static int run_process(const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+#ifdef _WIN32
+    return int(_spawnvp(_P_WAIT, argv[0], argv.data()));
+#else
+    pid_t child;
+    if (posix_spawnp(&child, argv[0], nullptr, nullptr, argv.data(), environ) != 0)
+        return -1;
+    int status=0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
 }
 
@@ -164,82 +195,17 @@ struct ColorParams {
     double radial_ring_taper_sigma    = 2.0;   // falloff width [M]
 };
 
-// ── Per-pixel geodesic result (Phase 1 output) ───────────────
-struct GeoPixel {
-    uint8_t outcome;    // 0 = escaped, 1 = disk_hit, 2 = horizon
-    uint8_t _pad[3];    // _pad[0]: debug solver tag (EllipticFallbackReason) when --debug-elliptic
-    float   r;          // BL radius at disk crossing (or final r)
-    float   redshift;   // g = ν_obs/ν_em
-    float   magnif;     // flux magnification (bundle mode; 1 in single-ray)
-    float   phi_disk;   // BL azimuthal angle at disk crossing (0 if not disk hit)
-    float   theta_esc;  // direction at escape (background lookup)
-    float   phi_esc;
-    // Footprint of the pixel on the disk, from the ray bundle: the two edge
-    // vectors of the parallelogram the pixel maps onto, in (r, phi). Already
-    // scaled by the pixel's angular size, so they are per-pixel, not per-radian.
-    // Zero in single-ray mode, where the pixel has no measured extent.
-    float   fp_dr_a, fp_dphi_a;
-    float   fp_dr_b, fp_dphi_b;
-    // Fraction of the pixel covered by the disk. 1 everywhere except where the
-    // footprint straddles the disk's radial bounds; this is what turns the
-    // binary hit/miss decision at the rim into a gradient.
-    float   coverage;
-    // Footprint on the celestial sphere, for filtering the background. A rim
-    // pixel needs this as well as the disk footprint above: it shades the disk
-    // over one and composites the sky over the other.
-    float   sky_dth_a, sky_dph_a;
-    float   sky_dth_b, sky_dph_b;
-};
-static_assert(sizeof(GeoPixel) == 64, "GeoPixel size mismatch");
-
-// ── .kgeo file format ─────────────────────────────────────────
-static const char   KGEO_MAGIC[4]  = {'K','G','E','O'};
-// 4: split the sky footprint out of the disk footprint, so a partly covered rim
-//    pixel can carry both.
-// 3: added the coverage fraction.
-// 2: added the disk footprint vectors to GeoPixel. Version 1 files are 28 bytes
-// per record against 44 and cannot be read; the layout is not self-describing, so
-// the version is the only guard. It was left at 1 through the v0.2.3 layout change,
-// which is what made that drift silent.
-static const uint32_t KGEO_VERSION = 4;
-
-struct KGeoMeta {
-    uint32_t W, H;
-    double   M_bh, a_bh, Q_bh, Lam;
-    double   r_isco, r_disk_in, r_disk_out;
-    double   theta_obs, phi_obs, r_obs;
-};
-
-static void save_kgeo(const char* path,
-                      const std::vector<GeoPixel>& geo,
-                      const KGeoMeta& meta) {
-    std::ofstream f(path, std::ios::binary);
-    f.write(KGEO_MAGIC, 4);
-    uint32_t ver = KGEO_VERSION;
-    f.write(reinterpret_cast<const char*>(&ver), 4);
-    f.write(reinterpret_cast<const char*>(&meta), sizeof(meta));
-    f.write(reinterpret_cast<const char*>(geo.data()),
-            (std::streamsize)(geo.size() * sizeof(GeoPixel)));
-}
-
-static bool load_kgeo(const char* path,
-                      std::vector<GeoPixel>& geo,
-                      KGeoMeta& meta) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    char magic[4]; f.read(magic, 4);
-    if (std::memcmp(magic, KGEO_MAGIC, 4) != 0) {
-        std::cerr << "load_kgeo: bad magic in " << path << "\n"; return false;
-    }
-    uint32_t ver; f.read(reinterpret_cast<char*>(&ver), 4);
-    if (ver != KGEO_VERSION) {
-        std::cerr << "load_kgeo: unsupported version " << ver << "\n"; return false;
-    }
-    f.read(reinterpret_cast<char*>(&meta), sizeof(meta));
-    geo.resize(meta.W * meta.H);
-    f.read(reinterpret_cast<char*>(geo.data()),
-           (std::streamsize)(geo.size() * sizeof(GeoPixel)));
-    return f.good();
+// Every unsupported setting must select the reference pipeline explicitly.
+// Keep the decision independent of the Metal build so it is covered by CPU CI.
+static const char* metal_cpu_reason(const ColorParams& cp, bool bundles, bool export_geo) {
+    if (bundles) return "ray-bundle footprint filtering requires the CPU Jacobi pipeline";
+    if (export_geo) return "KGEO export requires the CPU geometry pipeline";
+    if (cp.palette == DiskPalette::INTERSTELLAR_NASA || cp.palette == DiskPalette::STRATIFIED)
+        return "the selected disk palette requires CPU shading";
+    if (cp.disk_opacity < 1.0 - 1e-9) return "disk transparency requires CPU compositing";
+    if (cp.nt_gaussian_taper || cp.planck_emission || cp.radial_ring_taper || cp.zero_torque_taper)
+        return "the selected emission/taper controls require CPU shading";
+    return nullptr;
 }
 
 // One sample of the pixel's footprint, in footprint coordinates (s, t) inside
@@ -514,22 +480,9 @@ static const char* metal_kernel_mode_name(MetalKernelMode mode) {
 }
 #endif
 
-static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& g) {
-    // Frequency-shift factor used by colour pipeline.
-    constexpr double kRadicandFloor = 1.0e-8;
-    constexpr double kDenomFloor = 1.0e-8;
-    constexpr double kGMax = 6.0;
-    double Omega = -g.keplerian_omega(r);  // physical prograde Ω > 0 (keplerian_omega uses sign trick for r_isco)
-    double gLL[4][4]; g.covariant_BL(r, M_PI/2.0, gLL);
-    const double d2 = -(gLL[0][0]+2.0*gLL[0][3]*Omega+gLL[3][3]*Omega*Omega);
-    const double ut = 1.0 / std::sqrt(std::max(d2, kRadicandFloor));
-    // For covariant momenta (p_t, p_phi), disk-frame denominator is
-    // -u^t (p_t + Omega p_phi) = u^t (E - Omega L), with E = -p_t.
-    const double denom = -(pt * ut + pphi * Omega * ut);
-    const double denom_safe = std::max(denom, kDenomFloor);
-    const double g_factor = (-pt) / denom_safe;
-    if (!std::isfinite(g_factor)) return 1.0;
-    return clamp(g_factor, 0.0, kGMax);
+static double disk_redshift(double r, double pt, double pphi, const KNdSMetric& g,
+                             double observer_frequency) {
+    return g.disk_frequency_shift(r, pt, pphi, observer_frequency);
 }
 
 static double doppler_luma_scale_inverted(double redshift, double exp) {
@@ -567,7 +520,7 @@ static TraceResult trace_terminal_no_disk(GeodesicState s, const KNdSMetric& g,
                                           IntegratorControls ctl) {
     double dlam = std::max(ctl.step_init, 1e-10);
     const double rh_cut = g.r_horizon() * 1.03;
-    Vec4d fsal = Vec4d::nan_init();
+    Vec4d fsal = Vec4d::invalid();
     const int max_steps = std::max(1, ctl.max_steps);
     for (int it = 0; it < max_steps; ++it) {
         const GeodesicState s_prev = s;
@@ -623,9 +576,10 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                                 Integrator intg=Integrator::RK4_DOUBLING,
                                 const IntegratorControls& ctl = IntegratorControls{},
                                 const ColorParams* cp_ptr = nullptr) {
+    const double observer_frequency = -s.pt * g.static_observer_ut(s.r, s.theta);
     double rh=g.r_horizon(), dlam=std::max(ctl.step_init, 1e-10);
     const double rh_cut = rh * 1.03;
-    Vec4d fsal=Vec4d::nan_init();
+    Vec4d fsal=Vec4d::invalid();
     const int max_steps = std::max(1, ctl.max_steps);
     for (int it=0; it<max_steps; ++it) {
         const GeodesicState s_prev = s;
@@ -676,7 +630,7 @@ static TraceResult trace_single(GeodesicState s, const KNdSMetric& g,
                     }
                     if (!pass_through) {
                         disk_r_hit = r_hit;
-                        disk_redshift_hit = clamp(disk_redshift(r_hit, s.pt, s.pphi, g), 0.0, 20.0);
+                        disk_redshift_hit = clamp(disk_redshift(r_hit, s.pt, s.pphi, g, observer_frequency), 0.0, 20.0);
                         disk_phi_hit = phi_hit;
                         best_alpha = alpha;
                         best_event = StepEvent::DISK;
@@ -895,6 +849,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
                                                double r_escape,
                                                const IntegratorControls& ctl = IntegratorControls{},
                                                const ColorParams* cp_ptr = nullptr) {
+    const double observer_frequency = -s_bl.pt * g.static_observer_ut(s_bl.r, s_bl.theta);
     if (cp_ptr && clamp(cp_ptr->disk_opacity, 0.0, 1.0) < (1.0 - 1e-9)) {
         // Semi-analytic path currently does not carry post-disk continuation metadata
         // required for alpha compositing; defer to standard BL tracer.
@@ -988,7 +943,7 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
                     }
                     if (!pass_through) {
                         disk_r_hit = r_hit;
-                        disk_red_hit = clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g), 0.0, 20.0);
+                        disk_red_hit = clamp(disk_redshift(r_hit, s_bl.pt, s_bl.pphi, g, observer_frequency), 0.0, 20.0);
                         disk_phi_hit = phi_hit;
                         best_alpha = alpha;
                         best_event = StepEvent::DISK;
@@ -1569,6 +1524,7 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
                                                 Integrator intg = Integrator::RK4_DOUBLING,
                                                 const IntegratorControls& ctl = IntegratorControls{},
                                                 const ColorParams* cp_ptr = nullptr) {
+    const double observer_frequency = -s_bl.pt * g.static_observer_ut(s_bl.r, s_bl.theta);
     if (fallback_reason) *fallback_reason = EllipticFallbackReason::NONE;
     auto fallback_trace = [&](EllipticFallbackReason reason) -> TraceResult {
         if (fallback_reason) *fallback_reason = reason;
@@ -1637,7 +1593,7 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
             return fallback_trace(EllipticFallbackReason::DIRECT_OUTSIDE_DISK);
 
         return {Outcome::DISK_HIT, r_now,
-                clamp(disk_redshift(r_now, s_bl.pt, s_bl.pphi, g), 0.0, 20.0)};
+                clamp(disk_redshift(r_now, s_bl.pt, s_bl.pphi, g, observer_frequency), 0.0, 20.0)};
     }
     return fallback_trace(EllipticFallbackReason::DIRECT_OUTSIDE_DISK);
 }
@@ -1935,6 +1891,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                                    Integrator intg,
                                    const IntegratorControls& ctl,
                                    const ColorParams* cp_ptr) {
+    const double observer_frequency = -s_bl.pt * g.static_observer_ut(s_bl.r, s_bl.theta);
     KSState s{};
     if (!init_ks_state(s_bl, g, s))
         return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
@@ -2022,7 +1979,7 @@ static TraceResult trace_single_ks(GeodesicState s_bl, const KNdSMetric& g,
                     }
                     if (!pass_through) {
                         disk_r_hit  = r_hit;
-                        disk_red_hit = clamp(disk_redshift(r_hit, pTh, pbl[2], g), 0.0, 20.0);
+                        disk_red_hit = clamp(disk_redshift(r_hit, pTh, pbl[2], g, observer_frequency), 0.0, 20.0);
                         disk_phi_hit = ph_hit_bl;
                         best_alpha  = alpha;
                         best_event  = StepEvent::DISK;
@@ -2154,10 +2111,11 @@ static double physical_nt_flux_proxy_raw(double r, double r_isco, double a,
     const double r3 = r2 * r_safe;
     const double r32 = std::max(r_safe * std::sqrt(std::max(r_safe, 1.0e-12)), 1.0e-12);
     const double a2 = a * a;
+    const double orbit_spin = std::abs(a); // disk corotates for either spin sign
 
     const double A = 1.0 - 2.0 / std::max(r_safe, 1.0e-12) + a2 / std::max(r2, 1.0e-12);
-    const double B = 1.0 - 3.0 / std::max(r_safe, 1.0e-12) + 2.0 * a / r32;
-    const double C = 1.0 - 4.0 * a / r32 + 3.0 * a2 / std::max(r2, 1.0e-12);
+    const double B = 1.0 - 3.0 / std::max(r_safe, 1.0e-12) + 2.0 * orbit_spin / r32;
+    const double C = 1.0 - 4.0 * orbit_spin / r32 + 3.0 * a2 / std::max(r2, 1.0e-12);
 
     const double zero_torque = cp.radial_term_zero_torque
         ? clamp(1.0 - std::sqrt(clamp(r_isco / std::max(r_safe, 1.0e-12), 0.0, 1.0)), 0.0, 1.0)
@@ -3159,6 +3117,8 @@ static std::vector<GeoPixel> trace_geodesics(
     std::atomic<uint64_t> elliptic_fallback_rays{0};
 
     const double r_isco   = g.r_isco();
+    if (!std::isfinite(r_isco) || !(r_isco > 0.0))
+        throw std::runtime_error("No stable corotating ISCO for these metric parameters");
     Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
     const double r_disk_in  = r_isco;
     const double r_disk_out = fp.disk_out;
@@ -3466,6 +3426,20 @@ static std::vector<GeoPixel> trace_geodesics(
 }
 
 // ── Full render (trace + colorize, for animation / single frame) ──
+static const char* cuda_cpu_reason(const ColorParams& cp, bool bundles,
+                                    RaySolverMode solver, Integrator integrator) {
+    if (bundles) return "ray bundles require the CPU Jacobi pipeline";
+    if (solver != RaySolverMode::STANDARD) return "the selected solver requires CPU integration";
+    if (integrator != Integrator::RK4_DOUBLING) return "DOPRI5 requires CPU integration";
+    if (cp.disk_opacity < 1.0 - 1e-9) return "disk transparency requires CPU compositing";
+    if (cp.palette != DiskPalette::BLACKBODY)
+        return "procedural disk visibility requires CPU integration";
+    return nullptr;
+}
+
+// Actual completion backend, including runtime fallbacks and supersampling.
+static thread_local const char* last_render_backend = "cpu";
+
 static std::vector<RGB> render_image(
     int W, int H,
     const FrameParams& fp,
@@ -3489,6 +3463,7 @@ static std::vector<RGB> render_image(
     double pixel_offset_y = 0.0,
     const BackgroundImage* bg_b = nullptr)  // Universe B background (wormhole)
 {
+    last_render_backend = "cpu";
     if (camera_spp > 1) {
         static bool warned_geo_with_multisample = false;
         if (geo_out && !warned_geo_with_multisample) {
@@ -3552,6 +3527,8 @@ static std::vector<RGB> render_image(
         const auto offsets = build_offsets(camera_spp);
         const double gamma_eff = std::max(cp.gamma, 1e-6);
         std::vector<double> accum((size_t)W * (size_t)H * 3ull, 0.0);
+        const char* first_backend = nullptr;
+        bool mixed_backends = false;
         for (size_t sidx = 0; sidx < offsets.size(); ++sidx) {
             const auto& off = offsets[sidx];
             auto pass = render_image(
@@ -3563,6 +3540,8 @@ static std::vector<RGB> render_image(
                 pixel_offset_x + off.first,
                 pixel_offset_y + off.second,
                 bg_b);
+            if (!first_backend) first_backend = last_render_backend;
+            else mixed_backends = mixed_backends || std::strcmp(first_backend, last_render_backend) != 0;
             for (int i = 0; i < W * H; ++i) {
                 const size_t j = (size_t)i * 3ull;
                 accum[j + 0] += to_linear((double)pass[i].r / 255.0, gamma_eff);
@@ -3578,6 +3557,7 @@ static std::vector<RGB> render_image(
             out[i].g = (uint8_t)std::lround(255.0 * to_display(accum[j + 1] * inv_n, gamma_eff));
             out[i].b = (uint8_t)std::lround(255.0 * to_display(accum[j + 2] * inv_n, gamma_eff));
         }
+        last_render_backend = mixed_backends ? "mixed" : first_backend;
         return out;
     }
 
@@ -3606,8 +3586,9 @@ static std::vector<RGB> render_image(
     const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
     const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
     const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
-    const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported) && !fp.wormhole
-                          && !alpha_composite_cpu_only;
+    const char* cpu_reason = metal_cpu_reason(cp, use_bundles, geo_out != nullptr);
+    const bool can_use_gpu = base_can_use_gpu && !gpu_fp64 && !fp.wormhole && !cpu_reason;
+    if (cpu_reason) std::cerr << "Info: Metal using CPU: " << cpu_reason << ".\n";
 
     if (alpha_composite_cpu_only) {
         static bool warned_alpha_composite_cpu = false;
@@ -3672,32 +3653,25 @@ static std::vector<RGB> render_image(
                            cp.interstellar_inner_glow ? 1 : 0,
                            cp.interstellar_physical_profile ? 1 : 0,
                            cp.bundle_magnif_luma ? 1 : 0,
-                           (float)cp.bundle_magnif_max};
+                           (float)cp.bundle_magnif_max,
+                           (float)cp.temp_scale, (float)cp.doppler_exp,
+                           cp.temp_redshift_clamp ? 1 : 0, (float)cp.temp_redshift_floor,
+                           (float)g.static_observer_ut(cam.r_obs, cam.theta_obs),
+                           (float)cp.interstellar_inner_taper_scale};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;
-        auto px32 = metal_render(kpc, cpc, bg_ptr, bg_w, bg_h);
-        bool has_non_black = false;
-        for (uint32_t px : px32) {
-            if ((px & 0x00FFFFFFu) != 0u) {
-                has_non_black = true;
-                break;
-            }
-        }
-        if (!has_non_black) {
-            static bool warned_metal_black_frame = false;
-            if (!warned_metal_black_frame) {
-                std::cerr << "Info: Metal produced an all-black frame; using CPU fallback.\n";
-                warned_metal_black_frame = true;
-            }
-        } else {
-        std::vector<RGB> image(W*H);
-        for (int i=0;i<W*H;++i) {
-            image[i].r=(px32[i])    &0xFF;
-            image[i].g=(px32[i]>>8) &0xFF;
-            image[i].b=(px32[i]>>16)&0xFF;
-        }
-        return image;
+        try {
+            auto px32 = metal_render(kpc, cpc, bg_ptr, bg_w, bg_h);
+            if (px32.size() != size_t(W)*size_t(H))
+                throw std::runtime_error("Metal returned an incomplete pixel buffer");
+            std::vector<RGB> image(px32.size());
+            for (size_t i=0; i<image.size(); ++i)
+                image[i] = {uint8_t(px32[i]), uint8_t(px32[i] >> 8), uint8_t(px32[i] >> 16)};
+            last_render_backend = "gpu-metal";
+            return image;
+        } catch (const std::exception& error) {
+            std::cerr << "Info: Metal failed (" << error.what() << "); using CPU.\n";
         }
     }
 
@@ -3755,21 +3729,27 @@ static std::vector<RGB> render_image(
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
     const bool gpu_chart_ok = (chart_gpu == CoordinateChart::BL) ||
                               (chart_gpu == CoordinateChart::KS && ks_chart_supported);
-    if (!use_bundles && solver_mode == RaySolverMode::STANDARD && gpu_chart_ok && gpu_metric_ok && !fp.wormhole) {
+    const char* cpu_reason = cuda_cpu_reason(cp, use_bundles, solver_mode, intg);
+    if (cpu_reason) std::cerr << "Info: CUDA using CPU: " << cpu_reason << ".\n";
+    if (!cpu_reason && gpu_chart_ok && gpu_metric_ok && !fp.wormhole) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);
-        KNdSParams_CUDA kpcuda{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,fp.disk_out};
-        CameraParams_CUDA cpcuda{cam.r_obs,cam.theta_obs,cam.phi_obs,cam.fov_h,
-                                 W,H,(chart_gpu==CoordinateChart::KS)?1:0};
-        auto px32 = cuda_render(kpcuda, cpcuda, gpu_fp64);
-        std::vector<RGB> image(W*H);
-        for (int i=0;i<W*H;++i) {
-            image[i].r=(px32[i])    &0xFF;
-            image[i].g=(px32[i]>>8) &0xFF;
-            image[i].b=(px32[i]>>16)&0xFF;
+        KNdSParams_CUDA metric{M_bh,fp.a,Q_bh,Lam,g.r_horizon(),r_isco,fp.disk_out};
+        CameraParams_CUDA camera{cam.r_obs,cam.theta_obs,cam.phi_obs,cam.fov_h,
+            W,H,chart_gpu==CoordinateChart::KS?1:0,ctl.max_steps,
+            intersection_mode_code(intersection_mode),ctl.step_init,ctl.tol,
+            pixel_offset_x,pixel_offset_y};
+        try {
+            auto geo = cuda_trace(metric, camera, gpu_fp64);
+            auto image = colorize_buffer(geo,W,H,cp,bg,M_bh,fp.a,r_isco,r_isco,fp.disk_out,
+                                         debug_elliptic,bg_b);
+            if (geo_out) *geo_out = std::move(geo);
+            last_render_backend = "gpu-cuda";
+            return image;
+        } catch (const std::exception& error) {
+            std::cerr << "Info: CUDA failed (" << error.what() << "); using CPU.\n";
         }
-        return image;
     }
 
     static bool warned_cuda_fallback = false;
@@ -3809,8 +3789,11 @@ static std::vector<RGB> render_image(
 
 // ── File I/O ──────────────────────────────────────────────────
 static void write_png(const char* path, const std::vector<RGB>& img, int W, int H) {
-    stbi_write_png(path, W, H, 3,
-                   reinterpret_cast<const unsigned char*>(img.data()), W*3);
+    if (W <= 0 || H <= 0 || checked_pixel_count(uint32_t(W), uint32_t(H)) != img.size())
+        throw std::runtime_error("PNG dimensions do not match the pixel buffer");
+    if (!stbi_write_png(path, W, H, 3,
+                        reinterpret_cast<const unsigned char*>(img.data()), W*3))
+        throw std::runtime_error(std::string("Cannot write PNG file: ") + path);
 }
 
 // ── Interpolation helpers (animation) ────────────────────────
@@ -3823,7 +3806,7 @@ static double lerp_angle(double a, double b, double t) {
 }
 
 // ── main ──────────────────────────────────────────────────────
-int main(int argc, char** argv) {
+static int run_cli(int argc, char** argv) {
 
     // ── Resolution ───────────────────────────────────────────
     bool use_bundles=false, preview=false, hd_preview=false;
@@ -3910,12 +3893,11 @@ int main(int argc, char** argv) {
     double anim_orbits=0.0;
     std::string anim_output, anim_frames_dir;
 
-    double NaN = std::numeric_limits<double>::quiet_NaN();
-    double anim_theta_start=NaN, anim_theta_end=NaN;
-    double anim_phi_start=NaN,   anim_phi_end=NaN;
-    double anim_r_start=NaN,     anim_r_end=NaN;
-    double anim_a_start=NaN,     anim_a_end=NaN;
-    double anim_disk_out_start=NaN, anim_disk_out_end=NaN;
+    std::optional<double> anim_theta_start, anim_theta_end;
+    std::optional<double> anim_phi_start, anim_phi_end;
+    std::optional<double> anim_r_start, anim_r_end;
+    std::optional<double> anim_a_start, anim_a_end;
+    std::optional<double> anim_disk_out_start, anim_disk_out_end;
 
     for (int i=1;i<argc;++i) {
         std::string arg(argv[i]);
@@ -4249,6 +4231,7 @@ int main(int argc, char** argv) {
                 : res_720p ? 1280 : hd_preview ? 854 : preview ? 480 : 1920;
     const int H = custom_h ? custom_h : res_4k ? 2160 : res_2k ? 1440
                 : res_720p ? 720  : hd_preview ? 480 : preview ? 270 : 1080;
+    checked_pixel_count(uint32_t(W), uint32_t(H));
 
     const double default_r_obs = 60.0;
     // Wormhole mode allows negative l_obs (observer in Universe B); non-wormhole needs positive r_obs.
@@ -4302,6 +4285,9 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // A fresh checkout has no out/ directory (render outputs are gitignored).
+    std::filesystem::create_directories(OUT_DIR);
+
     // ── Helper: build timestamp ───────────────────────────────
     auto make_ts = []()->std::string {
         std::time_t now=std::time(nullptr); char ts[32];
@@ -4350,7 +4336,8 @@ int main(int argc, char** argv) {
             gpu_chart_ok &&
             solver_gpu_supported;
         const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
-        const bool can_use_gpu = (bundle_gpu_supported || single_ray_gpu_supported) && !alpha_composite_cpu_only;
+        const bool can_use_gpu = (bundle_gpu_supported || single_ray_gpu_supported) && !gpu_fp64 && !arg_wormhole
+            && !metal_cpu_reason(cp, use_bundles, geo_only || !geo_file.empty());
         if (can_use_gpu) ks_uses_rk4 = false;
 #endif
         const char* intg_tag = (ks_uses_rk4 || intg == Integrator::RK4_DOUBLING)
@@ -4379,17 +4366,17 @@ int main(int argc, char** argv) {
         const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
         const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
         const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
-        const bool can_use_gpu = base_can_use_gpu && (!gpu_fp64 || metal_fp64_supported) && !alpha_composite_cpu_only;
+        const bool can_use_gpu = base_can_use_gpu && !gpu_fp64 && !arg_wormhole
+            && !metal_cpu_reason(cp, use_bundles, geo_only || !geo_file.empty());
         return can_use_gpu ? "gpu-metal" : "cpu";
 #elif defined(USE_CUDA)
         const CoordinateChart eff_chart = effective_chart_for_naming(chart);
         const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
         const bool gpu_chart_ok = (eff_chart == CoordinateChart::BL) ||
                                   (eff_chart == CoordinateChart::KS && ks_chart_supported);
-        const bool cuda_gpu_supported =
-            !use_bundles &&
-            solver_mode == RaySolverMode::STANDARD &&
-            gpu_chart_ok;
+        const bool cuda_gpu_supported = !arg_wormhole && !geo_only &&
+            !cuda_cpu_reason(cp, use_bundles, solver_mode, intg) && gpu_chart_ok &&
+            std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15;
         return cuda_gpu_supported ? "gpu-cuda" : "cpu";
 #else
         return "cpu";
@@ -4434,10 +4421,12 @@ int main(int argc, char** argv) {
                                           nullptr, debug_elliptic,
                                           0.0, 0.0, bg_b);
 
+                std::cout << "Backend used: " << last_render_backend << "\n";
+                const std::string actual_mode_backend = mode_tag + "_" + last_render_backend + fp64_tag + spp_tag;
                 std::string ts_str = make_ts();
                 std::string outfile = std::string(OUT_DIR)+"/"+res_tag
                                     +"_"+std::to_string(W)+"x"+std::to_string(H)
-                                    +"_"+mode_backend_tag
+                                    +"_"+actual_mode_backend
                                     +"_"+ts_str+".png";
                 write_png(outfile.c_str(), image, W, H);
                 std::cout << "Saved: " << outfile << "\n";
@@ -4527,10 +4516,12 @@ int main(int argc, char** argv) {
                       << std::fixed << std::setprecision(1)
                       << W*H/elapsed/1e3 << " kpix/s)\n";
 
+            std::cout << "Backend used: " << last_render_backend << "\n";
+            const std::string actual_mode_backend = mode_tag + "_" + last_render_backend + fp64_tag + spp_tag;
             std::string ts_str = make_ts();
             std::string outfile = std::string(OUT_DIR)+"/"+res_tag
                                 +"_"+std::to_string(W)+"x"+std::to_string(H)
-                                +"_"+mode_backend_tag
+                                +"_"+actual_mode_backend
                                 +"_"+ts_str+".png";
             write_png(outfile.c_str(), image, W, H);
             std::cout << "Saved: " << outfile << "\n";
@@ -4550,7 +4541,7 @@ int main(int argc, char** argv) {
     }
 
     // ── ANIMATION mode ───────────────────────────────────────
-    auto resolve=[](double v, double fb){ return std::isnan(v)?fb:v; };
+    auto resolve=[](const std::optional<double>& v, double fb){ return v.value_or(fb); };
 
     double theta_start    = resolve(anim_theta_start,    arg_theta);
     double theta_end      = resolve(anim_theta_end,      arg_theta);
@@ -4576,7 +4567,7 @@ int main(int argc, char** argv) {
 
     std::string frames_dir = anim_frames_dir.empty()
         ? std::string(OUT_DIR)+"/anim_"+anim_tag : anim_frames_dir;
-    std::system(("mkdir -p \""+frames_dir+"\"").c_str());
+    std::filesystem::create_directories(frames_dir);
 
     std::string output_file = anim_output.empty()
         ? std::string(OUT_DIR)+"/"+anim_tag+".mp4" : anim_output;
@@ -4612,6 +4603,7 @@ int main(int argc, char** argv) {
         fp.theta    = theta_start   +(theta_end   -theta_start)   *t;
         fp.r_obs    = (r_start      +(r_end       -r_start)       *t)*M_bh;
         fp.disk_out = (disk_out_start+(disk_out_end-disk_out_start)*t)*M_bh;
+        fp.fov      = arg_fov;
         fp.phi      = (anim_orbits!=0.0)
                     ? phi_start+360.0*anim_orbits*phase
                     : lerp_angle(phi_start,phi_end,t);
@@ -4634,6 +4626,7 @@ int main(int argc, char** argv) {
                                 intersection_mode,metal_kernel_mode,gpu_fp64,
                                 elliptic_fallback_black,anti_fireflies,cp,nullptr,debug_elliptic,
                                 0.0, 0.0, bg_b);
+        std::cout << "Backend used: " << last_render_backend << "\n";
         write_png(fname,image,W,H);
 
         double dt=get_time()-t_frame;
@@ -4648,19 +4641,35 @@ int main(int argc, char** argv) {
     std::cout<<"  ("<<(get_time()-t_total)<<"s)\n";
 
     if (!anim_no_encode) {
-        char ffcmd[2048];
-        std::snprintf(ffcmd,sizeof(ffcmd),
-            "ffmpeg -y -framerate %d -i \"%s/frame_%%05d.png\""
-            " -c:v libx264 -pix_fmt yuv420p -crf %d -movflags +faststart"
-            " \"%s\" 2>&1",
-            anim_fps,frames_dir.c_str(),anim_crf,output_file.c_str());
         std::cout<<"Encoding...\n";
-        int ret=std::system(ffcmd);
+        const int ret=run_process({"ffmpeg", "-y", "-framerate", std::to_string(anim_fps),
+            "-i", frames_dir+"/frame_%05d.png", "-frames:v", std::to_string(anim_frames),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", std::to_string(anim_crf),
+            "-movflags", "+faststart", output_file});
         if (ret==0) std::cout<<"Video saved: "<<output_file<<"\n";
-        else        std::cerr<<"ffmpeg failed. Frames in: "<<frames_dir<<"\n";
+        else {
+            std::cerr << "ffmpeg failed. Frames preserved in: " << frames_dir << "\n";
+            return 1;
+        }
     }
-    if (!anim_keep_frames && !anim_no_encode)
-        std::system(("rm -rf \""+frames_dir+"\"").c_str());
+    if (!anim_keep_frames && !anim_no_encode) {
+        for (int frame=0; frame<anim_frames; ++frame) {
+            char name[32];
+            std::snprintf(name,sizeof(name),"frame_%05d.png",frame);
+            std::filesystem::remove(std::filesystem::path(frames_dir)/name);
+        }
+        if (std::filesystem::is_empty(frames_dir)) std::filesystem::remove(frames_dir);
+    }
 
     return 0;
 }
+
+#ifndef KERRTRACE_NO_MAIN
+int main(int argc, char** argv) {
+    try { return run_cli(argc, argv); }
+    catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << "\n";
+        return 1;
+    }
+}
+#endif

@@ -78,10 +78,10 @@ Two adaptive integrators (`enum class Integrator` in `geodesic.hpp`):
 | Flag | Enum | Method | RHS evals/step | Notes |
 |------|------|--------|----------------|-------|
 | *(default)* | `RK4_DOUBLING` | RK4 + Richardson step-doubling | 12 | Simple, robust |
-| `--dopri5`  | `DOPRI5` | Dormand-Prince RK45 | 6 (FSAL→5 net) | `ode45` standard |
+| `--dopri5`  | `DOPRI5` | Dormand-Prince RK45 | 7 first, 6 with FSAL | `ode45` standard |
 
-DOPRI5 Butcher tableau: 6 stages, embedded 4th/5th order pair, error = `‖y5−y4‖`.
-FSAL: `k7 = f(y5)` reused as `k1` of the next step → 5 net evaluations per accepted step.
+DOPRI5 Butcher tableau: 7 stages, embedded 4th/5th order pair, error = `‖y5−y4‖`.
+FSAL: `k7 = f(y5)` reused as `k1` of the next step → 6 new evaluations per subsequent accepted step; rejected trials add evaluations.
 RK4-doubling: 1 full step + 2 half steps, Richardson factor = 2⁴−1 = 15.
 
 ### Ray bundles
@@ -93,8 +93,11 @@ Reference: James et al. (2015) CQG 32 065001.
 
 ### Disk redshift
 Full formula (Bardeen 1972):
-`g = ν_obs/ν_emit = √(−g_tt−2g_tφΩ−g_φφΩ²) / (1−Ω·b)`
-where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
+`g = ν_obs/ν_emit = u_obs^t · √(−g_tt−2g_tφΩ−g_φφΩ²) / (1−Ω·b)`
+where `b = p_φ/(−p_t)`, `u_obs^t = 1/√(−g_tt_obs)` for the static camera,
+and corotating Kerr `Ω_K = s√M/(r^{3/2}+|a|√M)`, with `s = −1` for `a<0`, otherwise `+1`.
+The KNdS implementation uses metric derivatives for the general circular orbit.
+The observer-at-infinity approximation is recovered when `u_obs^t → 1`.
 
 ---
 

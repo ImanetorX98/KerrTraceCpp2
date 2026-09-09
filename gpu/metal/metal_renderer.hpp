@@ -68,6 +68,12 @@ struct CameraParams_C {
     int   interstellar_physical_profile; // 1 = Novikov-Thorne flux, 0 = artistic power law
     int   bundle_magnif_luma;   // 0 = off (physical), 1 = modulate luminance by 1/magnification
     float bundle_magnif_max;    // soft ceiling of that factor
+    float temp_scale;
+    float doppler_exp;
+    int   temp_redshift_clamp;
+    float temp_redshift_floor;
+    float observer_ut;
+    float interstellar_inner_taper_scale;
 };
 
 /// Renders the image on the default Metal GPU device.
