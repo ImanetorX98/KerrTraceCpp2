@@ -42,7 +42,7 @@ def main():
         ax.set_ylabel("y [pixel del frame]")
         ax.invert_yaxis()
         ax.grid(alpha=.15)
-    axes[0].set_title("Contorni misurati nell'arco superiore")
+    axes[0].set_title("Contorni nella regione misurata")
     axes[0].legend(loc="lower center", fontsize=9)
     axes[0].scatter([wx], [wy], s=150, facecolors="none", edgecolors="#b22222")
     axes[1].set_xlim(min(wx, nx)-8, max(wx, nx)+8)

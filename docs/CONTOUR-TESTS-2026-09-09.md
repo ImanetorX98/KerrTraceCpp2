@@ -1,5 +1,11 @@
 # Verifica del contorno Metal — 9 settembre 2026
 
+**Precisazione successiva alla foto cerchiata:** il gradino sul bordo esterno
+sinistro era fuori dalla regione misurata qui. Il [test aggiornato sul punto
+indicato](CONTOUR-BUMP-2026-09-09.md) aggiunge quella regione: BL raggiunge
+5 pixel a 640×360 e 9 a 1280×720; KS resta entro un pixel su quel tratto.
+I risultati sotto restano riferiti alla prima regione e alla prima esecuzione.
+
 Le correzioni precedenti sono nel commit `16677fd2ed25f35b53cdbfa25905a9449609abe4`,
 pubblicato su `origin/codex/audit-physics-backend-fixes`. `main` è rimasto a
 `ce1dd33b34f9bfc9710550239d9f714e01a9662f` alla verifica del remoto.

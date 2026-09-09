@@ -14,6 +14,11 @@ struct Scene {
     bool custom=true;
     double offset_x=0, offset_y=0;
 };
+struct RegionSpec {
+    const char* name;
+    contour::Region bounds;
+    size_t minimum_points;
+};
 struct Reference {
     KGeoMeta meta;
     std::vector<GeoPixel> normal, tight;
@@ -63,7 +68,7 @@ int main(int argc,char** argv) {
             }
             std::filesystem::create_directories(output);
             std::ofstream summary(output/"summary.csv");
-            summary<<"scene,width,height,comparison,threshold,reference_edges,candidate_edges,max_px,p95_px,p99_px,mean_px,beyond_one,total,pass\n";
+            summary<<"scene,width,height,comparison,threshold,reference_edges,candidate_edges,max_px,p95_px,p99_px,mean_px,beyond_one,total,pass,region\n";
             std::map<std::string,Reference> references;
             FrameParams frame;frame.a=.5;frame.theta=80;frame.phi=0;
             frame.r_obs=40;frame.fov=45;frame.disk_out=12;
@@ -104,21 +109,28 @@ int main(int argc,char** argv) {
                 write_png((output/(scene.name+"-metal.png")).string().c_str(),gpu,scene.width,scene.height);
                 // Same angular ROI at both resolutions: upper arc and inner rim,
                 // including the thin higher-order image. No edge erosion.
-                const contour::Region region{int(.30*scene.width),1,int(.70*scene.width),int(.45*scene.height)};
-                for(int threshold : {1,3,8}) {
+                const RegionSpec regions[] = {
+                    {"upper", {int(.30*scene.width),1,int(.70*scene.width),int(.45*scene.height)},500},
+                    // The user-circled vertical step is near (178,95) at 640x360,
+                    // OUTSIDE the original upper ROI. Track this outer edge alone.
+                    {"left-bump", {int(.22*scene.width),int(.24*scene.height),
+                                   int(.30*scene.width),int(.32*scene.height)},20}
+                };
+                for(const auto& region : regions) for(int threshold : {1,3,8}) {
                     const auto reference_mask=mask(tight,scene.width,scene.height,threshold);
                     for(bool metal : {false,true}) {
                         const std::string name=metal?"metal-vs-cpu":"cpu-convergence";
                         const auto result=contour::compare(reference_mask,
-                            mask(metal?gpu:cpu,scene.width,scene.height,threshold),region);
-                        const bool passed=result.within_one_pixel() && result.reference_points>=500;
+                            mask(metal?gpu:cpu,scene.width,scene.height,threshold),region.bounds);
+                        const bool passed=result.within_one_pixel() && result.reference_points>=region.minimum_points;
                         ++checked;failed+=!passed;
                         summary<<scene.name<<','<<scene.width<<','<<scene.height<<','<<name<<','<<threshold<<','
                             <<result.reference_points<<','<<result.candidate_points<<','<<result.maximum<<','
                             <<result.p95<<','<<result.p99<<','<<result.mean<<','<<result.beyond_one<<','
-                            <<result.matches.size()<<','<<int(passed)<<'\n';
-                        save_matches(output/(scene.name+"-"+name+"-t"+std::to_string(threshold)+".csv"),result);
-                        std::cout<<(passed?"[PASS] ":"[FAIL] ")<<scene.name<<' '<<name<<" threshold="<<threshold
+                            <<result.matches.size()<<','<<int(passed)<<','<<region.name<<'\n';
+                        const std::string suffix=std::string(region.name)=="upper" ? "" : "-"+std::string(region.name);
+                        save_matches(output/(scene.name+suffix+"-"+name+"-t"+std::to_string(threshold)+".csv"),result);
+                        std::cout<<(passed?"[PASS] ":"[FAIL] ")<<scene.name<<' '<<region.name<<' '<<name<<" threshold="<<threshold
                             <<" max="<<result.maximum<<"px p99="<<result.p99<<"px beyond 1px="
                             <<result.beyond_one<<'/'<<result.matches.size()<<'\n'<<std::flush;
                     }

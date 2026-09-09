@@ -49,6 +49,8 @@ inline Comparison compare(const Mask& reference, const Mask& candidate, Region r
     if (reference.width!=candidate.width || reference.height!=candidate.height)
         throw std::invalid_argument("Contour images have different dimensions");
     const auto ref=boundary(reference,region), test=boundary(candidate,region);
+    const Region full{1,1,reference.width-2,reference.height-2};
+    const auto ref_full=boundary(reference,full), test_full=boundary(candidate,full);
     Comparison result;
     result.reference_points=ref.size(); result.candidate_points=test.size();
     // Empty contours are a failed/missing observation, never perfect agreement.
@@ -71,7 +73,9 @@ inline Comparison compare(const Mask& reference, const Mask& candidate, Region r
             result.mean += distance;
         }
     };
-    directed(ref,test,false); directed(test,ref,true);
+    // Only source points are restricted to the ROI. A nearest neighbour may
+    // lie just outside it: clipping targets would inflate endpoint distances.
+    directed(ref,test_full,false); directed(test,ref_full,true);
     result.mean/=result.matches.size();
     std::vector<int> distances;
     for (const auto& match : result.matches) distances.push_back(match.distance);

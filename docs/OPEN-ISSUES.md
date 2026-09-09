@@ -2,21 +2,24 @@
 
 Aggiornamento sul contorno Metal; le diagnosi storiche restano sotto con il loro stato.
 
-## 0. Contorno Metal diverso dal riferimento CPU — APERTO
+## 0. Gradino sul bordo esterno sinistro in Metal BL — APERTO
 
-Il nuovo test `kerrtrace.metal_contour` esegue davvero la GPU e rileva scarti
-locali di 2–3 pixel a 640×360 e 5 pixel a 1280×720, oltre la soglia di un pixel.
-Il riferimento CPU rimane entro un pixel stringendo la tolleranza da 1e-7 a
-1e-10. Il vecchio test sul colore interno passa perché esclude il bordo.
+La foto cerchiata dell'utente indica circa (178,95) nel frame 640×360.
+Questo tratto era fuori dalla prima regione di `kerrtrace.metal_contour`:
+è ora coperto dalla regione dedicata `left-bump`.
 
-Il difetto rimane con temperatura/Doppler standard o personalizzati, BL/KS,
-RK4/DOPRI5 e jitter subpixel. Il massimo include anche l'anello sottile; non
-misura soltanto la gobba al vertice. Causa numerica puntuale ancora da isolare,
-nessuna modifica dello shader in questa verifica. Il test resta fallito sul
-renderer corrente: non è un fallimento atteso convertito in PASS.
+Sul tratto indicato Metal BL raggiunge **5 pixel** di scarto dal riferimento
+CPU a 640×360, **9 pixel** a 1280×720; KS rimane entro un pixel. Il riferimento
+CPU rimane entro un pixel stringendo la tolleranza. Il gradino BL persiste
+con temperatura/Doppler standard, DOPRI5 e jitter. Il termine numerico
+responsabile resta da isolare; lo shader non è stato modificato.
+
+Altri residui di 2–3 pixel (5 a 1280×720) restano nella regione `upper`,
+compreso l'anello sottile. Il test sui colori interni continua a passare.
+Il test di contorno fallisce realmente, senza convertire il fallimento in PASS.
 
 Metodo, risultati e frame riproducibili in
-[CONTOUR-TESTS-2026-09-09.md](CONTOUR-TESTS-2026-09-09.md).
+[CONTOUR-BUMP-2026-09-09.md](CONTOUR-BUMP-2026-09-09.md).
 
 ---
 

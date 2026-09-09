@@ -214,6 +214,9 @@ The contour regression measures the maximum local boundary displacement against
 converged CPU frames. It currently **fails on actual Metal hardware** (2–3 pixels
 at 640×360, 5 at 1280×720; acceptance limit: 1 pixel). The earlier interior-color
 test still passes. See [contour results and reproduction](docs/CONTOUR-TESTS-2026-09-09.md).
+A follow-up [test on the user-circled outer-left step](docs/CONTOUR-BUMP-2026-09-09.md)
+covers the region missed by the original test: BL reaches 5 pixels at 640×360
+and 9 at 1280×720; KS stays within 1 pixel on that specific segment.
 A skipped GPU test is not validation of the contour.
 
 CUDA math and the actual tracing function also run as host C++ tests, but this

@@ -30,5 +30,13 @@ int main() {
     check(!compare(reference,empty,region).within_one_pixel(),"all-black candidate cannot pass");
     check(!compare(empty,empty,region).valid,"two empty masks are not evidence of agreement");
     check(boundary(reference,{40,35,80,55}).empty(),"ROI clipping creates no artificial boundary");
+    Mask diagonal{128,96,std::vector<uint8_t>(128*96,0)};
+    auto parallel=diagonal;
+    for(int y=0;y<96;++y) for(int x=0;x<128;++x) {
+        diagonal.pixels[y*128+x]=x>=y;
+        parallel.pixels[y*128+x]=x>=y+2;
+    }
+    check(compare(diagonal,parallel,{40,40,80,80}).within_one_pixel(),
+          "nearest neighbours outside the ROI prevent inflated endpoint errors");
     return failures?1:0;
 }
