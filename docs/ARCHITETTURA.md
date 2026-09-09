@@ -5,6 +5,13 @@ il codice, ha ragione il codice — e va corretta questa.
 
 Ultimo allineamento: v0.2.34. Numeri di riga e conteggi storici sono indicativi; cercare i simboli nel sorgente.
 
+Aggiornamento Metal BL (9 settembre 2026): `geodesic_rhs` nello shader usa
+derivate analitiche della Hamiltoniana, mentre il riferimento CPU conserva
+le differenze finite in double. Il tracciamento BL limita il passo vicino
+all’asse e il single-ray riusa gli eventi del tracciatore condiviso. Vedere
+[il resoconto del bump](METAL-BUMP-FIX-2026-09-09.md) e il test nativo
+`metal_rhs_regression.mm`; non reintrodurre differenze finite FP32 nelle forze BL.
+
 ---
 
 ## Albero

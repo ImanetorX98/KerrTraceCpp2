@@ -2,24 +2,21 @@
 
 Aggiornamento sul contorno Metal; le diagnosi storiche restano sotto con il loro stato.
 
-## 0. Gradino sul bordo esterno sinistro in Metal BL — APERTO
+## 0. Gradino Metal BL risolto; residui sull'anello sottile — APERTO
 
-La foto cerchiata dell'utente indica circa (178,95) nel frame 640×360.
-Questo tratto era fuori dalla prima regione di `kerrtrace.metal_contour`:
-è ora coperto dalla regione dedicata `left-bump`.
+Il punto cerchiato a circa (178,95) nel frame 640×360 è corretto:
+le derivate BL sono ora analitiche e il passo risolve l'avvicinamento all'asse.
+Lo scarto locale passa da 5 a 1 pixel, e da 9 a 0 pixel a 1280×720.
+Il renderer single-ray usa inoltre l'intersezione Hermite richiesta.
 
-Sul tratto indicato Metal BL raggiunge **5 pixel** di scarto dal riferimento
-CPU a 640×360, **9 pixel** a 1280×720; KS rimane entro un pixel. Il riferimento
-CPU rimane entro un pixel stringendo la tolleranza. Il gradino BL persiste
-con temperatura/Doppler standard, DOPRI5 e jitter. Il termine numerico
-responsabile resta da isolare; lo shader non è stato modificato.
+Resta un residuo di **2 pixel** nella regione `upper`: in BL a 1280×720
+un punto candidato presso (590,173), e in KS a 640×360 undici confronti
+diretti fuori soglia. Il punto cerchiato passa in tutte le scene provate.
+La matrice estesa passa 102/108 controlli, gli altri 11 test passano.
+Il test globale del contorno rimane fallito; nessuna soglia è stata allargata.
 
-Altri residui di 2–3 pixel (5 a 1280×720) restano nella regione `upper`,
-compreso l'anello sottile. Il test sui colori interni continua a passare.
-Il test di contorno fallisce realmente, senza convertire il fallimento in PASS.
-
-Metodo, risultati e frame riproducibili in
-[CONTOUR-BUMP-2026-09-09.md](CONTOUR-BUMP-2026-09-09.md).
+Diagnosi, prove intermedie e frame prima/dopo in
+[METAL-BUMP-FIX-2026-09-09.md](METAL-BUMP-FIX-2026-09-09.md).
 
 ---
 

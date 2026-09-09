@@ -13,6 +13,7 @@ struct Scene {
     Integrator integrator=Integrator::RK4_DOUBLING;
     bool custom=true;
     double offset_x=0, offset_y=0;
+    double spin=.5;
 };
 struct RegionSpec {
     const char* name;
@@ -65,6 +66,9 @@ int main(int argc,char** argv) {
             if(extended) {
                 scenes.push_back({"bl-jitter",640,360,CoordinateChart::BL,Integrator::RK4_DOUBLING,true,.25,-.25});
                 scenes.push_back({"bl-1280",1280,720});
+                Scene zero{"bl-spin-zero"};zero.spin=0;scenes.push_back(zero);
+                Scene negative{"bl-spin-negative"};negative.spin=-.5;scenes.push_back(negative);
+                Scene high{"bl-spin-high"};high.spin=.9;scenes.push_back(high);
             }
             std::filesystem::create_directories(output);
             std::ofstream summary(output/"summary.csv");
@@ -78,10 +82,12 @@ int main(int argc,char** argv) {
             for(const auto& scene : scenes) {
                 if(!only_case.empty() && scene.name!=only_case) continue;
                 ++selected;
+                frame.a=scene.spin;
                 ColorParams colors;
                 if(scene.custom) {colors.temp_scale=.65;colors.doppler_exp=2;}
                 IntegratorControls controls;controls.max_steps=500000;controls.tol=1e-7;
-                const std::string key=std::to_string(scene.width)+":"+std::to_string(int(scene.chart))+":"+
+                const std::string key=std::to_string(scene.width)+":"+std::to_string(scene.height)+":"+
+                    std::to_string(scene.spin)+":"+std::to_string(int(scene.chart))+":"+
                     std::to_string(int(scene.integrator))+":"+std::to_string(scene.offset_x)+":"+std::to_string(scene.offset_y);
                 std::cout<<"Scene "<<scene.name<<": actual Metal, CPU tol=1e-7 and 1e-10\n"<<std::flush;
                 if(!references.count(key)) {

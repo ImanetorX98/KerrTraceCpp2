@@ -281,6 +281,12 @@ if(BUILD_TESTING)
             "-framework Metal" "-framework Foundation" "-framework CoreGraphics")
         add_test(NAME kerrtrace.metal_render COMMAND kerrtrace_metal_render_test)
         set_tests_properties(kerrtrace.metal_render PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        add_executable(kerrtrace_metal_rhs_test tests/metal_rhs_regression.mm)
+        target_compile_options(kerrtrace_metal_rhs_test PRIVATE -O2)
+        target_link_libraries(kerrtrace_metal_rhs_test PRIVATE "-framework Metal" "-framework Foundation")
+        add_test(NAME kerrtrace.metal_rhs COMMAND kerrtrace_metal_rhs_test
+            ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
+        set_tests_properties(kerrtrace.metal_rhs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         add_executable(kerrtrace_metal_shader_test tests/metal_shader_test.mm)
         target_link_libraries(kerrtrace_metal_shader_test PRIVATE
             "-framework Metal" "-framework Foundation")

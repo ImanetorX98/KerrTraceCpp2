@@ -1,5 +1,9 @@
 # Verifica del contorno Metal — 9 settembre 2026
 
+**Stato aggiornato:** il gradino BL è ora corretto. Vedere
+[correzione e verifica prima/dopo](METAL-BUMP-FIX-2026-09-09.md).
+Questo documento conserva la diagnosi e le misure precedenti alla correzione.
+
 **Precisazione successiva alla foto cerchiata:** il gradino sul bordo esterno
 sinistro era fuori dalla regione misurata qui. Il [test aggiornato sul punto
 indicato](CONTOUR-BUMP-2026-09-09.md) aggiunge quella regione: BL raggiunge

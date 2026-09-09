@@ -1,5 +1,9 @@
 # Punto cerchiato: gradino sul bordo esterno sinistro
 
+**Stato aggiornato:** il gradino BL è ora corretto. Vedere
+[correzione e verifica prima/dopo](METAL-BUMP-FIX-2026-09-09.md).
+Questo documento conserva la diagnosi e le misure precedenti alla correzione.
+
 La seconda foto dell'utente localizza il difetto: un breve tratto quasi
 verticale interrompe il bordo obliquo esterno sinistro del disco. Nei frame
 di riferimento a 640×360 si trova circa in **(178,95)**, coordinate da zero.

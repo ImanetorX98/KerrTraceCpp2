@@ -16,13 +16,10 @@ constant float ADAPT_H_MIN = 1e-6f;
 constant float ADAPT_H_MAX = 50.0f;
 constant float ADAPT_ERR_TINY_DOPRI = 1e-12f;
 constant float ADAPT_ERR_TINY_RK4 = 1e-10f;
-// This shader is float32 throughout. Asking for a tolerance tighter than the
-// precision can express buys no accuracy at all -- measured against the float64
-// CPU renderer, tol=1e-7 and tol=1e-5 both land ~17/255 mean pixel difference,
-// because the residual is float32 itself, not truncation. It only shrinks the
-// step: ~99,500 accepted steps per ray instead of a few hundred, i.e. 103s
-// instead of 1.2s for an 854x480 frame. Floor the requested tolerance so the
-// CPU-side default of 1e-7 cannot drive the GPU integrator into that regime.
+// Error estimates subtract FP32 RK stage values. Retain a relative tolerance
+// floor so the CPU default (1e-7) does not demand differences at the scale of
+// state-rounding noise. Analytic BL forces remove finite-difference noise;
+// state advancement and event localization still use single precision.
 constant float ADAPT_TOL_MIN_F32 = 1e-5f;
 
 // ── Adaptive step-size helpers (shared by every integrator here) ──────────
@@ -208,14 +205,41 @@ static void geodesic_rhs(float r, float theta,
     dth_out = gu[2][2]*pth;
     dphi_out = gu[3][0]*pt + gu[3][3]*pphi;
 
-    const float er  = 1e-5f*(abs(r)+0.1f);
-    const float eth = 1e-6f;
+    // Differentiate H = N/(2 Sigma) analytically. Subtracting two FP32
+    // Hamiltonians at theta +/- 1e-6 loses the force in cancellation noise.
+    // Keep the N*dSigma term: RK stages need the off-null Hamiltonian too.
+    const float st = sin(theta), ct = cos(theta);
+    const float st2 = st*st, a2 = a*a;
+    const float sig = r*r + a2*ct*ct;
+    const float delta = Delta_r(r,M,a,Q,L);
+    const float polar = Delta_th(theta,a,L);
+    const float xi = Xi(a,L), xi2 = xi*xi;
+    const float A = r*r + a2;
+    const float B = A*pt + a*pphi;
+    const float delta_r = 2.0f*r*(1.0f-L*r*r/3.0f)
+                        - 2.0f*L*r*A/3.0f - 2.0f*M;
+    const float polar_th = -2.0f*L*a2*ct*st/3.0f;
+    float radial_num = B*B;
+    float polar_num, polar_num_th;
+    if (st2 > 1e-10f) {
+        const float C = a*st*pt + pphi/st;
+        polar_num = C*C;
+        polar_num_th = 2.0f*C*ct*(a*pt-pphi/st2);
+    } else {
+        // Match gUU's existing g^{phi phi}=0 guard at the singular BL axis.
+        radial_num -= a2*pphi*pphi;
+        polar_num = a2*st2*pt*pt + 2.0f*a*pt*pphi;
+        polar_num_th = 2.0f*a2*st*ct*pt*pt;
+    }
+    const float N = delta*pr*pr + polar*pth*pth
+                  + xi2*(polar_num/polar-radial_num/delta);
+    const float Nr = delta_r*pr*pr + xi2*(radial_num*delta_r/(delta*delta)
+                                                   -4.0f*r*pt*B/delta);
+    const float Nth = polar_th*pth*pth + xi2*(polar_num_th/polar
+                                           -polar_num*polar_th/(polar*polar));
+    dpr_out = -(Nr - N*(2.0f*r/sig))/(2.0f*sig);
+    dpth_out = -(Nth + N*(2.0f*a2*ct*st/sig))/(2.0f*sig);
 
-    dpr_out  = -(hamiltonian(r+er, theta, pr, pth, pt, pphi, M, a, Q, L)
-               - hamiltonian(r-er, theta, pr, pth, pt, pphi, M, a, Q, L)) / (2.0f*er);
-
-    dpth_out = -(hamiltonian(r, theta+eth, pr, pth, pt, pphi, M, a, Q, L)
-               - hamiltonian(r, theta-eth, pr, pth, pt, pphi, M, a, Q, L)) / (2.0f*eth);
 }
 
 // RK4 step
@@ -2099,6 +2123,14 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
 
     const int iter_cap = max(max_steps, 1);
     for (int iter = 0; iter < iter_cap; ++iter) {
+        // An adaptive RK estimate can miss the narrow centrifugal turning
+        // region if all its stages jump across the BL axis. Resolve approach
+        // to a pole before the trial, keeping the actual step for Hermite.
+        if (abs(pphi) > 1e-8f*max(abs(pt),1e-8f)) {
+            const float theta_rate = Delta_th(theta,a,L)*pth/Sigma(r,theta,a);
+            const float polar_step = 0.25f*abs(sin(theta))/max(abs(theta_rate),1e-20f);
+            dlam = min(dlam,max(ADAPT_H_MIN,polar_step));
+        }
         const float step_used = dlam;
         if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L,
                               integrator_mode, integrator_tol)) {
@@ -2660,11 +2692,6 @@ static inline void trace_pixel_impl(
 
     // ── Trace ─────────────────────────────────────────────────
     float r = r0, theta = th0, phi = cp.phi_obs;
-    float dlam = max(cp.step_init, ADAPT_H_MIN);
-    float prev_r = r0;
-    float prev_theta = th0;
-    float prev_phi = phi;
-    float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
     const bool can_separable_kerr = (abs(Q) <= 1e-8f) && (abs(L) <= 1e-8f);
@@ -3013,66 +3040,22 @@ static inline void trace_pixel_impl(
         }
     }
 
-    const int std_iter_cap = max(cp.max_steps, 1);
-    for (int iter = 0; iter < std_iter_cap; ++iter) {
-        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L,
-                              cp.integrator_mode, cp.integrator_tol)) {
-            continue;
-        }
-
-        if (!(isfinite(r) && isfinite(theta) && isfinite(phi) &&
-              isfinite(pr) && isfinite(pth))) {
-            break;
-        }
-
-        if (r < kp.r_horizon * 1.03f) break;
-        if (r > cp.r_obs * 1.05f) {
-            const float r_escape = cp.r_obs * 1.05f;
-            const float denom = r - prev_r;
-            float w = (abs(denom) > 1e-8f) ? ((r_escape - prev_r) / denom) : 1.0f;
-            w = clamp(w, 0.0f, 1.0f);
-            const float th_esc = prev_theta + w*(theta - prev_theta);
-            const float ph_esc = prev_phi   + w*(phi   - prev_phi);
-            float4 bgc = clamp(sample_background(bg_tex, bg_samp, th_esc, ph_esc), 0.0f, 1.0f);
-            colour = (0xFFu << 24)
-                   | (uint32_t(bgc.b*255.0f) << 16)
-                   | (uint32_t(bgc.g*255.0f) << 8)
-                   |  uint32_t(bgc.r*255.0f);
-            break;
-        }
-
-        const float cos_th = cos(theta);
-        if (prev_cos*cos_th <= 0.0f) {
-            const float denom = prev_cos - cos_th;
-            float w = (abs(denom) > 1e-8f) ? (prev_cos / denom) : 0.5f;
-            w = clamp(w, 0.0f, 1.0f);
-            const float r_hit = prev_r + w*(r - prev_r);
-            const float phi_hit = prev_phi + w*(phi - prev_phi);
-            if (!(r_hit >= kp.r_isco && r_hit <= kp.r_disk_out)) {
-                prev_cos = cos_th;
-                prev_r = r;
-                prev_theta = theta;
-                prev_phi = phi;
-                continue;
-            }
-            if (disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
-                prev_cos = cos_th;
-                prev_r = r;
-                prev_theta = theta;
-                prev_phi = phi;
-                continue;
-            }
-
-            // Disk hit
-            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L, cp.observer_ut);
-            colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
-                                     M, a, kp.r_isco, kp.r_disk_out, cp);
-            break;
-        }
-        prev_cos = cos_th;
-        prev_r = r;
-        prev_theta = theta;
-        prev_phi = phi;
+    // Use the shared BL event tracer for single rays and numerical fallbacks.
+    // The former duplicate loop always interpolated linearly in cos(theta),
+    // ignoring cp.intersection_mode and bending the disk edge at coarse steps.
+    const RayTraceResultBL result = trace_standard_bl_from_angles(
+        alpha, beta, M, a, Q, L,
+        cp.r_obs, cp.theta_obs, cp.phi_obs,
+        kp.r_horizon, kp.r_isco, kp.r_disk_out,
+        cp.intersection_mode, cp.integrator_mode,
+        cp.max_steps, cp.step_init, cp.integrator_tol, cp);
+    if (result.outcome == 1) {
+        colour = disk_color_abgr(result.r_hit, result.phi_hit, result.redshift, 1.0f,
+                                 M, a, kp.r_isco, kp.r_disk_out, cp);
+    } else if (result.outcome == 0) {
+        const float4 bgc = clamp(sample_background(bg_tex, bg_samp,
+                                                   result.theta_esc, result.phi_esc),0.0f,1.0f);
+        colour = pack_abgr(bgc.r,bgc.g,bgc.b);
     }
 
     output[py * width + px] = colour;

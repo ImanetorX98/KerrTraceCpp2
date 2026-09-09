@@ -210,13 +210,13 @@ ctest --test-dir build --output-on-failure
 
 On macOS the suite includes shader compilation and actual Metal/CPU render
 comparisons. These tests report **Skipped** if no Metal device is accessible.
-The contour regression measures the maximum local boundary displacement against
-converged CPU frames. It currently **fails on actual Metal hardware** (2–3 pixels
-at 640×360, 5 at 1280×720; acceptance limit: 1 pixel). The earlier interior-color
-test still passes. See [contour results and reproduction](docs/CONTOUR-TESTS-2026-09-09.md).
-A follow-up [test on the user-circled outer-left step](docs/CONTOUR-BUMP-2026-09-09.md)
-covers the region missed by the original test: BL reaches 5 pixels at 640×360
-and 9 at 1280×720; KS stays within 1 pixel on that specific segment.
+The user-circled Metal BL outer-edge step is corrected with analytic Hamiltonian
+forces and a polar step limit. Its local discrepancy falls from 5 to 1 pixel at
+640×360 and from 9 to 0 at 1280×720. The expanded contour matrix passes 102/108
+checks; 2-pixel residuals on the thin inner ring remain in KS and high-resolution
+BL, so the full contour test still fails. The other 11 tests pass, including a
+native GPU force comparison against independent double-precision derivatives.
+See [the correction and before/after validation](docs/METAL-BUMP-FIX-2026-09-09.md).
 A skipped GPU test is not validation of the contour.
 
 CUDA math and the actual tracing function also run as host C++ tests, but this
