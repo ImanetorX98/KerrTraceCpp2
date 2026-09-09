@@ -1,6 +1,22 @@
-# Aperto al 2026-09-05
+# Aperto al 2026-09-09
 
-Ordinato per urgenza. Il primo punto è una regressione visiva già su `main`.
+Aggiornamento sul contorno Metal; le diagnosi storiche restano sotto con il loro stato.
+
+## 0. Contorno Metal diverso dal riferimento CPU — APERTO
+
+Il nuovo test `kerrtrace.metal_contour` esegue davvero la GPU e rileva scarti
+locali di 2–3 pixel a 640×360 e 5 pixel a 1280×720, oltre la soglia di un pixel.
+Il riferimento CPU rimane entro un pixel stringendo la tolleranza da 1e-7 a
+1e-10. Il vecchio test sul colore interno passa perché esclude il bordo.
+
+Il difetto rimane con temperatura/Doppler standard o personalizzati, BL/KS,
+RK4/DOPRI5 e jitter subpixel. Il massimo include anche l'anello sottile; non
+misura soltanto la gobba al vertice. Causa numerica puntuale ancora da isolare,
+nessuna modifica dello shader in questa verifica. Il test resta fallito sul
+renderer corrente: non è un fallimento atteso convertito in PASS.
+
+Metodo, risultati e frame riproducibili in
+[CONTOUR-TESTS-2026-09-09.md](CONTOUR-TESTS-2026-09-09.md).
 
 ---
 

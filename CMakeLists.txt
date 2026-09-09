@@ -203,6 +203,10 @@ endif()
 
 # ── Tests ───────────────────────────────────────────────────────
 if(BUILD_TESTING)
+    add_executable(kerrtrace_contour_metrics_tests tests/contour_metrics_tests.cpp)
+    target_compile_options(kerrtrace_contour_metrics_tests PRIVATE -O2 -Wall -Wextra)
+    add_test(NAME kerrtrace.contour_metrics COMMAND kerrtrace_contour_metrics_tests)
+
     add_executable(kerrtrace_core_tests tests/core_tests.cpp)
     target_include_directories(kerrtrace_core_tests PRIVATE ${CMAKE_SOURCE_DIR})
     target_compile_options(kerrtrace_core_tests PRIVATE
@@ -258,6 +262,17 @@ if(BUILD_TESTING)
         set_tests_properties(kerrtrace.cli PROPERTIES TIMEOUT 180)
     endif()
     if(APPLE)
+        add_executable(kerrtrace_metal_contour_test tests/metal_contour_regression.mm
+            gpu/metal/metal_renderer.mm)
+        target_compile_definitions(kerrtrace_metal_contour_test PRIVATE USE_METAL)
+        target_compile_options(kerrtrace_metal_contour_test PRIVATE -O2 -Wno-unused-function)
+        target_link_libraries(kerrtrace_metal_contour_test PRIVATE
+            "-framework Metal" "-framework Foundation" "-framework CoreGraphics")
+        add_test(NAME kerrtrace.metal_contour COMMAND kerrtrace_metal_contour_test
+            --output-dir ${CMAKE_BINARY_DIR}/contour-output)
+        set_tests_properties(kerrtrace.metal_contour PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS "metal;contour")
+
         add_executable(kerrtrace_metal_render_test tests/metal_render_regression.mm
             gpu/metal/metal_renderer.mm)
         target_compile_definitions(kerrtrace_metal_render_test PRIVATE USE_METAL)
