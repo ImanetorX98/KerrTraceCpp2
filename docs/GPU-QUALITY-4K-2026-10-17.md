@@ -18,7 +18,19 @@ CPU 1e-7 contro CPU 1e-9: 0,002 % di pixel con errore > 16. Il riferimento
 | Metal, `KERR_METAL_TILE_ROWS=64 KERR_METAL_TILE_COLS=4096` | **40 s** |
 
 Le tessere grandi danno un'immagine identica bit per bit e nessuna tessera
-fallita. Le tessere di default a 4K tengono la GPU quasi ferma (invio
+fallita. Da allora sono il default (tessera ≈ 256 000 pixel, righe multiple di 16):
+
+| risoluzione | CPU | Metal, default nuovo |
+|---|---:|---:|
+| 640×360 | 1,9 s | 3,4 s |
+| 1600×900 | 12,1 s | 9,9 s |
+| 3840×2160 | 69 s | **38 s** |
+
+Provati e scartati perché senza guadagno misurabile: tre command buffer in volo
+sulla stessa coda (Metal li esegue in ordine) e tre code separate (nessuna
+sovrapposizione: una tessera così grande occupa già tutta la GPU). A 640×360
+la CPU resta più veloce: il frame è troppo piccolo per riempire la GPU, e pochi
+raggi lunghi vicini all'orbita fotonica pesano molto su un singolo thread GPU. Le tessere di default a 4K tengono la GPU quasi ferma (invio
 sincrono, griglia arrotondata a 16 righe su tessere da 2).
 
 ## Dove sbaglia la GPU

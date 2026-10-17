@@ -215,38 +215,38 @@ std::vector<uint32_t> metal_render(
     // ── Dispatch ──────────────────────────────────────────────
     // (queue is the cached g_cache.queue)
 
-    // Tile in adaptive row/column slices to stay under GPU interactivity watchdog.
-    // On failure we retry the same tile with smaller extents until it succeeds.
+    // Tiles. Each tile is one command buffer, so it must finish well inside the
+    // macOS GPU watchdog; within that limit it should be large enough to fill the
+    // GPU. Rows are a multiple of the 16-row threadgroup: the grid is rounded up to
+    // 16, and the former 2-row tiles at 4K left 7 of every 8 threads idle (398 s
+    // against 39 s for the same frame). Heavier modes get proportionally fewer
+    // pixels per tile. A tile that still fails is split and retried below, so
+    // coverage never depends on these numbers being right.
+    //
+    // Tiles are submitted one at a time. Keeping several command buffers in flight,
+    // on one queue or on several, was measured and gained nothing: a tile of this
+    // size already occupies the whole GPU.
     //
     // Optional env overrides:
-    //   KERR_METAL_TILE_ROWS=<1..64>
+    //   KERR_METAL_TILE_ROWS=<1..256>
     //   KERR_METAL_TILE_COLS=<16..4096>
     // The shader uses x_offset/y_offset so each tile writes to the correct area.
-    constexpr int TILE_ROWS_MAX = 64;
+    constexpr int TILE_ROWS_MAX = 256;
     constexpr int TILE_COLS_MAX = 4096;
     auto clamp_i = [](int v, int lo, int hi) {
         return std::max(lo, std::min(v, hi));
     };
-    auto default_tile_rows = [&]() -> int {
-        int rows = 16;
-        if (cp.solver_mode != 0) rows = 8; // semi/elliptic are typically heavier
-        if (cp.use_bundles != 0) rows = std::min(rows, 2);
-        if (cp.width >= 2560 || cp.height >= 1440) rows = std::min(rows, 4);
-        if (cp.width >= 3840 || cp.height >= 2160) rows = std::min(rows, 2);
-        if (cp.use_bundles != 0 && (cp.width >= 2560 || cp.height >= 1440))
-            rows = 1;
-        return rows;
-    };
-    auto default_tile_cols = [&]() -> int {
-        int cols = 1024;
-        if (cp.use_bundles != 0) cols = 256;
-        if (cp.width >= 3840) cols = std::min(cols, 512);
-        if (cp.use_bundles != 0 && cp.width >= 2560) cols = std::min(cols, 128);
-        return cols;
-    };
+    const int target_pixels = (cp.use_bundles != 0) ? 16384
+                            : (cp.solver_mode != 0) ? 65536
+                            : 262144;
+    const int default_cols = clamp_i((cp.width + 15) / 16 * 16, 16, TILE_COLS_MAX);
+    const int rows_for_target = target_pixels / default_cols;
+    const int default_rows = (rows_for_target >= 16)
+        ? clamp_i(rows_for_target / 16 * 16, 16, 64)
+        : clamp_i(rows_for_target, 1, 16);
 
-    int tile_rows = default_tile_rows();
-    int tile_cols = default_tile_cols();
+    int tile_rows = default_rows;
+    int tile_cols = default_cols;
     if (const char* env = std::getenv("KERR_METAL_TILE_ROWS")) {
         char* end = nullptr;
         const long parsed = std::strtol(env, &end, 10);
