@@ -4,13 +4,8 @@
 // Part of the single-translation-unit renderer included by main.cpp;
 // see docs/ARCHITETTURA.md for how the modules fit together.
 
-#include "tracer_bl.hpp"
-#include "tracer_separable.hpp"
-#include "tracer_elliptic.hpp"
-#include "tracer_ks.hpp"
-#include "tracer_wormhole.hpp"
+#include "pixel_tracers.hpp"
 #include "palettes.hpp"
-#include "frame.hpp"
 
 // ── Phase 1: trace all geodesics → GeoPixel buffer ───────────
 static std::vector<GeoPixel> trace_geodesics(
@@ -28,9 +23,10 @@ static std::vector<GeoPixel> trace_geodesics(
     KGeoMeta* meta_out = nullptr,
     bool debug_elliptic = false)
 {
-    // Wormhole: delegate entirely to the DNEG integrator
+    // Wormhole: a different spacetime, with its own camera and integrator.
     if (fp.wormhole)
-        return trace_geodesics_wormhole(W, H, fp, ctl, pixel_offset_x, pixel_offset_y, meta_out);
+        return trace_frame(W, H, make_wormhole_tracer(W, H, fp, ctl,
+                                                      pixel_offset_x, pixel_offset_y, meta_out));
 
     bool eff_use_bundles = use_bundles;
     if (chart == CoordinateChart::GKS && eff_use_bundles && std::abs(Lam) > 1e-15) {
@@ -94,12 +90,7 @@ static std::vector<GeoPixel> trace_geodesics(
     }
     const bool track_elliptic_fallbacks =
         (!eff_use_bundles && solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED);
-    constexpr size_t elliptic_reason_count =
-        static_cast<size_t>(EllipticFallbackReason::COUNT);
-    std::array<std::atomic<uint64_t>, elliptic_reason_count> elliptic_fallback_by_reason{};
-    for (auto& c : elliptic_fallback_by_reason) c.store(0, std::memory_order_relaxed);
-    std::atomic<uint64_t> elliptic_total_rays{0};
-    std::atomic<uint64_t> elliptic_fallback_rays{0};
+    EllipticFallbackStats elliptic_stats;
 
     const double r_isco   = g.r_isco();
     if (!std::isfinite(r_isco) || !(r_isco > 0.0))
@@ -139,124 +130,20 @@ static std::vector<GeoPixel> trace_geodesics(
         };
     }
 
-    std::vector<GeoPixel> geo(W*H);
-    std::atomic<int> rows_done{0};
-    const double t0_geo = get_time();
-    std::mutex progress_mu;
-
-    auto trace_row = [&](int py) {
-        for (int px_=0; px_<W; ++px_) {
-            GeoPixel& pix = geo[py*W+px_];
-            if (eff_use_bundles) {
-                auto res = trace_bundle(px_, py, cam, g, r_disk_in, r_disk_out, r_escape,
-                                        ctl.max_steps, ctl.step_init, ctl.tol,
-                                        pixel_offset_x, pixel_offset_y, disk_transp);
-                pix.outcome   = res.disk_hit ? 1 : 0;
-                pix.r         = res.disk_hit ? (float)res.r_hit : 0.0f;
-                pix.redshift  = (float)res.redshift;
-                pix.magnif    = (float)res.magnif;
-                pix.phi_disk  = (float)res.phi_disk;
-                pix.fp_dr_a   = (float)res.fp_dr_a;
-                pix.fp_dphi_a = (float)res.fp_dphi_a;
-                pix.fp_dr_b   = (float)res.fp_dr_b;
-                pix.fp_dphi_b = (float)res.fp_dphi_b;
-                pix.coverage  = (float)res.coverage;
-                pix.sky_dth_a = (float)res.sky_dth_a;
-                pix.sky_dph_a = (float)res.sky_dph_a;
-                pix.sky_dth_b = (float)res.sky_dth_b;
-                pix.sky_dph_b = (float)res.sky_dph_b;
-                pix.theta_esc = (float)res.theta_esc;
-                pix.phi_esc   = (float)res.phi_esc;
-                // The uncovered fraction of a rim pixel sees the background, so
-                // it must be told to sample it rather than composite on black.
-                pix._pad[1] = res.disk_hit ? (res.behind_escaped ? 0 : 2) : 0;
-                if (res.disk_hit && res.behind_escaped) {
-                    pix.theta_esc = (float)res.behind_theta;
-                    pix.phi_esc   = (float)res.behind_phi;
-                }
-            } else {
-                auto s   = cam.pixel_ray(px_, py, g, pixel_offset_x, pixel_offset_y);
-                TraceResult res{};
-                if (solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED) {
-                    EllipticFallbackReason fb_reason = EllipticFallbackReason::NONE;
-                    res = trace_single_elliptic_closed(
-                        s, g, r_disk_in, r_disk_out, r_escape,
-                        &fb_reason, eff_chart, intg, ctl, cp_ptr);
-                    if (debug_elliptic)
-                        pix._pad[0] = static_cast<uint8_t>(fb_reason);
-                    if (track_elliptic_fallbacks) {
-                        elliptic_total_rays.fetch_add(1, std::memory_order_relaxed);
-                        if (fb_reason != EllipticFallbackReason::NONE) {
-                            elliptic_fallback_rays.fetch_add(1, std::memory_order_relaxed);
-                            const size_t idx = static_cast<size_t>(fb_reason);
-                            if (idx < elliptic_reason_count)
-                                elliptic_fallback_by_reason[idx].fetch_add(1, std::memory_order_relaxed);
-                        }
-                    }
-                } else if (eff_chart == CoordinateChart::KS) {
-                    res = trace_single_ks(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
-                } else if (solver_sel.effective == RaySolverMode::SEMI_ANALYTIC) {
-                    res = trace_single_separable_kerr(s, g, r_disk_in, r_disk_out, r_escape, ctl, cp_ptr);
-                } else {
-                    res = trace_single(s, g, r_disk_in, r_disk_out, r_escape, intg, ctl, cp_ptr);
-                }
-                pix.outcome   = (res.out==Outcome::DISK_HIT)  ? 1
-                              : (res.out==Outcome::HORIZON)    ? 2
-                              : (res.out==Outcome::ESCAPED_B)  ? 3 : 0;
-                pix.r         = (float)res.r;
-                pix.redshift  = (float)res.redshift;
-                pix.magnif    = 1.0f;
-                pix.phi_disk  = (float)res.phi_disk;
-                pix.fp_dr_a = pix.fp_dphi_a = pix.fp_dr_b = pix.fp_dphi_b = 0.0f;
-                pix.sky_dth_a = pix.sky_dph_a = pix.sky_dth_b = pix.sky_dph_b = 0.0f;
-                pix.coverage = 1.0f;
-                pix.theta_esc = (float)res.theta_esc;
-                pix.phi_esc   = (float)res.phi_esc;
-                if (res.out == Outcome::DISK_HIT) {
-                    pix._pad[1] = (res.behind_out == Outcome::ESCAPED_B) ? 3
-                                : (res.behind_out == Outcome::HORIZON)   ? 2 : 0;
-                } else {
-                    pix._pad[1] = 0;
-                }
-            }
-            if (!debug_elliptic) pix._pad[0]=0;
-            pix._pad[2]=0;
-        }
-        int done = ++rows_done;
-        if (done%4==0 || done==H) {
-            std::lock_guard<std::mutex> lk(progress_mu);
-            print_progress(done, H, get_time()-t0_geo);
-        }
-    };
-
-#if defined(_OPENMP)
-    #pragma omp parallel for schedule(dynamic, 4)
-    for (int py=0; py<H; ++py) {
-        trace_row(py);
-    }
-#else
-    const unsigned hw = std::thread::hardware_concurrency();
-    const unsigned workers = std::max(1u, hw);
-    if (workers == 1 || H < 4) {
-        for (int py = 0; py < H; ++py) trace_row(py);
-    } else {
-        std::atomic<int> next_row{0};
-        std::vector<std::thread> pool;
-        pool.reserve(workers);
-        for (unsigned t = 0; t < workers; ++t) {
-            pool.emplace_back([&]() {
-                while (true) {
-                    const int py = next_row.fetch_add(1);
-                    if (py >= H) break;
-                    trace_row(py);
-                }
-            });
-        }
-        for (auto& th : pool) th.join();
-    }
-#endif
-
-    std::cerr << "\n";
+    // Pick the tracer once for the frame; trace_frame runs a loop specialised for it.
+    const KndsFrameSetup setup{cam, g, r_disk_in, r_disk_out, r_escape, ctl,
+                               pixel_offset_x, pixel_offset_y, cp_ptr, debug_elliptic};
+    const PixelTracer tracer =
+          eff_use_bundles
+            ? PixelTracer{BundlePixelTracer{setup, disk_transp}}
+        : solver_sel.effective == RaySolverMode::ELLIPTIC_CLOSED
+            ? PixelTracer{EllipticPixelTracer{setup, eff_chart, intg, elliptic_stats}}
+        : eff_chart == CoordinateChart::KS
+            ? PixelTracer{KsPixelTracer{setup, intg}}
+        : solver_sel.effective == RaySolverMode::SEMI_ANALYTIC
+            ? PixelTracer{SeparablePixelTracer{setup}}
+            : PixelTracer{BlPixelTracer{setup, intg}};
+    std::vector<GeoPixel> geo = trace_frame(W, H, tracer);
 
     // ── Edge resampling: A.3.1's own remedy ──────────────────────────────
     //
@@ -388,24 +275,6 @@ static std::vector<GeoPixel> trace_geodesics(
         for (size_t idx = 0; idx < edge.size(); ++idx) geo[edge[idx]] = resolved[idx];
     }
 
-    if (track_elliptic_fallbacks) {
-        const uint64_t total = elliptic_total_rays.load(std::memory_order_relaxed);
-        const uint64_t fb = elliptic_fallback_rays.load(std::memory_order_relaxed);
-        if (total > 0) {
-            const double pct = 100.0 * double(fb) / double(total);
-            std::cerr << "Info: elliptic-closed fallback summary: "
-                      << fb << "/" << total << " rays ("
-                      << std::fixed << std::setprecision(2) << pct << "%)\n";
-            if (fb > 0) {
-                for (size_t i = 1; i < elliptic_reason_count; ++i) {
-                    const uint64_t cnt = elliptic_fallback_by_reason[i].load(std::memory_order_relaxed);
-                    if (cnt == 0) continue;
-                    const auto reason = static_cast<EllipticFallbackReason>(i);
-                    std::cerr << "  - " << elliptic_fallback_reason_name(reason)
-                              << ": " << cnt << "\n";
-                }
-            }
-        }
-    }
+    if (track_elliptic_fallbacks) elliptic_stats.report();
     return geo;
 }
