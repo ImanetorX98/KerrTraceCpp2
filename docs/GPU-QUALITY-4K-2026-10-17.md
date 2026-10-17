@@ -30,8 +30,10 @@ Provati e scartati perché senza guadagno misurabile: tre command buffer in volo
 sulla stessa coda (Metal li esegue in ordine) e tre code separate (nessuna
 sovrapposizione: una tessera così grande occupa già tutta la GPU). A 640×360
 la CPU resta più veloce: il frame è troppo piccolo per riempire la GPU, e pochi
-raggi lunghi vicini all'orbita fotonica pesano molto su un singolo thread GPU. Le tessere di default a 4K tengono la GPU quasi ferma (invio
-sincrono, griglia arrotondata a 16 righe su tessere da 2).
+raggi lunghi vicini all'orbita fotonica pesano molto su un singolo thread GPU.
+
+Perché le vecchie tessere erano così lente: invio sincrono di 8 640 tessere da
+512×2 pixel, con la griglia arrotondata a 16 righe, quindi 7 thread su 8 inattivi.
 
 ## Dove sbaglia la GPU
 
