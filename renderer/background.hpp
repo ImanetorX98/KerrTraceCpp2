@@ -1,0 +1,70 @@
+#pragma once
+// Celestial-sphere background image and footprint resampling.
+//
+// Part of the single-translation-unit renderer included by main.cpp;
+// see docs/ARCHITETTURA.md for how the modules fit together.
+
+#include "color_params.hpp"
+#include "util.hpp"
+
+struct FootprintSample { double s, t, w; };
+
+// ── Background HDRI ───────────────────────────────────────────
+struct BackgroundImage {
+    int w = 0, h = 0;
+    std::vector<uint8_t> px;
+
+    bool load(const char* path) {
+        int c;
+        uint8_t* data = stbi_load(path, &w, &h, &c, 3);
+        if (!data) return false;
+        px.assign(data, data + (size_t)w*h*3);
+        stbi_image_free(data);
+        return true;
+    }
+
+    // Averages the lookup over the beam's footprint on the celestial sphere.
+    // The background is a resolved texture, so what the bundle gives it is a
+    // resampling kernel: A.3.1 minimises moire on extended structures "by
+    // adapting the resampling filter according to the shape of the beam". With
+    // a single bilinear tap the star field aliases badly wherever the lensing
+    // stretches or compresses the sky -- measured at twice the reference's
+    // high-frequency energy, and 3181 of the 3546 pixels still off the 16-spp
+    // reference after the disk work of P1.
+    RGB sample_footprint(double theta, double phi,
+                         double dth_a, double dph_a,
+                         double dth_b, double dph_b,
+                         const std::vector<FootprintSample>& pat) const {
+        if (px.empty()) return {0,0,0};
+        const double ha_t = 0.5*dth_a, ha_p = 0.5*dph_a;
+        const double hb_t = 0.5*dth_b, hb_p = 0.5*dph_b;
+        double ar = 0.0, ag = 0.0, ab = 0.0;
+        for (const FootprintSample& fs : pat) {
+            const RGB c = sample(theta + fs.s*ha_t + fs.t*hb_t,
+                                 phi   + fs.s*ha_p + fs.t*hb_p);
+            ar += fs.w * c.r; ag += fs.w * c.g; ab += fs.w * c.b;
+        }
+        return { (uint8_t)clamp(ar + 0.5, 0.0, 255.0),
+                 (uint8_t)clamp(ag + 0.5, 0.0, 255.0),
+                 (uint8_t)clamp(ab + 0.5, 0.0, 255.0) };
+    }
+
+    RGB sample(double theta, double phi) const {
+        if (px.empty()) return {0,0,0};
+        double pw = std::fmod(phi, 2.0*M_PI);
+        if (pw < 0) pw += 2.0*M_PI;
+        double uf = pw  / (2.0*M_PI) * (w-1);
+        double vf = theta / M_PI     * (h-1);
+        int u0=(int)uf, u1=(w > 1) ? ((u0 + 1) % w) : 0;
+        int v0=(int)vf, v1=std::min(v0+1,h-1);
+        double fu=uf-u0, fv=vf-v0;
+        auto at=[&](int u,int v)->const uint8_t*{
+            return px.data()+3*(clamp(v,0,h-1)*w+clamp(u,0,w-1));
+        };
+        auto lp=[](double a,double b,double t){return a+t*(b-a);};
+        double R=lp(lp(at(u0,v0)[0],at(u1,v0)[0],fu),lp(at(u0,v1)[0],at(u1,v1)[0],fu),fv);
+        double G=lp(lp(at(u0,v0)[1],at(u1,v0)[1],fu),lp(at(u0,v1)[1],at(u1,v1)[1],fu),fv);
+        double B=lp(lp(at(u0,v0)[2],at(u1,v0)[2],fu),lp(at(u0,v1)[2],at(u1,v1)[2],fu),fv);
+        return {(uint8_t)R,(uint8_t)G,(uint8_t)B};
+    }
+};
