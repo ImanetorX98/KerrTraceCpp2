@@ -20,7 +20,7 @@ It includes CPU and GPU backends, plus a basic web UI.
 
 ## Repository Layout
 
-- `main.cpp`: CLI, render pipeline, backend dispatch
+- `main.cpp`: entry point; the renderer lives in `renderer/` (CLI, render pipeline, tracers, backend planning)
 - `knds_metric.hpp`: metric and chart transforms
 - `geodesic.hpp`: Hamiltonian RHS and integrators
 - `camera.hpp`: camera model and initial ray setup

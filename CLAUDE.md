@@ -21,7 +21,8 @@ Leggilo prima di esplorare il sorgente: evita di rileggere 12 000 righe.
 | `geodesic.hpp` | Hamiltonian RHS, adaptive RK4 (step-doubling) |
 | `camera.hpp` | BL camera, pixel→(α,β)→initial state, `angle_ray()` |
 | `ray_bundle.hpp` | Jacobi-field bundle: Hessian(H), variational equations, magnification |
-| `main.cpp` | Render loop, backend dispatch, PPM output |
+| `main.cpp` | Entry point only: stb implementations + `main()` |
+| `renderer/*.hpp` | The CPU renderer: CLI, phase 1/2, tracers, palettes, backend planner (see `docs/ARCHITETTURA.md`) |
 | `gpu/metal/tracer.metal` | MSL compute shader (one thread = one pixel) |
 | `gpu/metal/metal_renderer.hpp/.mm` | Objective-C++ Metal bridge |
 | `gpu/cuda/tracer.cu/.cuh` | CUDA kernel + host launcher |
@@ -235,7 +236,7 @@ parameter dispatch and image delivery, which simplifies integration.
 | `interactive/render_scheduler.hpp` | New: async multi-pass dispatch |
 | `interactive/ui.hpp` | New: Dear ImGui sidebar layout |
 | `gpu/metal/tracer.metal` | Add `phi_bg_offset` uniform to `CameraParams_C` |
-| `main.cpp` | Add `--interactive` flag dispatching to `InteractiveWindow::run()` |
+| `renderer/cli.hpp` | Add `--interactive` flag dispatching to `InteractiveWindow::run()` |
 
 ---
 

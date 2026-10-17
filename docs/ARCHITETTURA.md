@@ -3,7 +3,8 @@
 Scopo: capire dov'è cosa senza rileggere 12 000 righe. Se una riga qui contraddice
 il codice, ha ragione il codice — e va corretta questa.
 
-Ultimo allineamento: v0.2.34. Numeri di riga e conteggi storici sono indicativi; cercare i simboli nel sorgente.
+Ultimo allineamento: v0.2.34 + refactor modulare (17 ottobre 2026). Numeri di riga
+e conteggi storici sono indicativi; cercare i simboli nel sorgente.
 
 Aggiornamento Metal BL (9 settembre 2026): `geodesic_rhs` nello shader usa
 derivate analitiche della Hamiltoniana, mentre il riferimento CPU conserva
@@ -18,8 +19,24 @@ all’asse e il single-ray riusa gli eventi del tracciatore condiviso. Vedere
 
 ```
 KerrTraceCpp2/
-├── main.cpp                    4661  tutto il renderer CPU: parametri, tracciatori,
-│                                     palette, fase 1 e fase 2, CLI, animazione
+├── main.cpp                      29  solo stb + main(): include renderer/cli.hpp
+├── renderer/                         il renderer CPU, un header per argomento
+│   ├── cli.hpp                  836  parsing dei flag, frame singolo, animazione
+│   ├── render.hpp               350  fase 1 + fase 2 sul backend scelto
+│   ├── backend_select.hpp       168  pianificatore unico CPU/Metal/CUDA
+│   ├── phase1.hpp               280  trace_geodesics: setup del frame, resampling di bordo
+│   ├── pixel_tracers.hpp        276  un tipo per tracciatore + std::variant + ciclo
+│   ├── parallel.hpp              37  ciclo parallelo per righe (OpenMP o thread)
+│   ├── tracer_bl.hpp            197  BL numerico, il riferimento
+│   ├── tracer_ks.hpp            478  Kerr-Schild Cartesiano
+│   ├── tracer_separable.hpp     296  Kerr separabile (Q=0, Λ=0)
+│   ├── tracer_elliptic.hpp      613  forma chiusa, Carlson + Jacobi
+│   ├── tracer_wormhole.hpp       47  integrazione DNEG di un raggio
+│   ├── colorize.hpp             172  fase 2: GeoPixel → RGB
+│   ├── palettes.hpp             649  palette del disco, profili radiali
+│   ├── frame.hpp                 54  FrameParams, Spacetime, spacetime_traits
+│   └── …                             trace_types, color_params, background,
+│                                     disk_physics, util, common
 ├── knds_metric.hpp              444  metrica Kerr-Newman-de Sitter, carte BL e KS
 ├── geodesic.hpp                 444  RHS hamiltoniana, RK4 a passo doppio, DOPRI5
 ├── camera.hpp                   146  tetrad dell'osservatore statico, pixel → raggio
@@ -27,7 +44,7 @@ KerrTraceCpp2/
 ├── wormhole_metric.hpp          270  metrica DNEG del wormhole
 │
 ├── gpu/metal/
-│   ├── tracer.metal            3079  shader MSL: rispecchia main.cpp, float32
+│   ├── tracer.metal            3079  shader MSL: rispecchia renderer/, float32
 │   ├── metal_renderer.mm        374  ponte Objective-C++
 │   └── metal_renderer.hpp        81  struct dei parametri, gemella di quella MSL
 ├── gpu/cuda/
@@ -67,11 +84,11 @@ KerrTraceCpp2/
    e registra DOVE finiscono         redshift, filtri
 ```
 
-**Fase 1** (`trace_geodesics`, main.cpp:3067) non conosce i colori. Per ogni pixel
+**Fase 1** (`trace_geodesics`, `renderer/phase1.hpp`) non conosce i colori. Per ogni pixel
 traccia un raggio e scrive un `GeoPixel`: esito, raggio d'impatto, redshift,
 azimut, direzione di fuga, impronta.
 
-**Fase 2** (`colorize_buffer`, main.cpp:2110 in poi) non traccia niente: legge il
+**Fase 2** (`colorize_buffer`, `renderer/colorize.hpp`) non traccia niente: legge il
 buffer e produce colori.
 
 Si possono eseguire separatamente: `--geo-only` scrive il `.kgeo`, `--color-only
@@ -109,16 +126,41 @@ sulla dimensione: se cambi `GeoPixel` e non i test, il build fallisce subito.
 
 ## I tracciatori: quale corre quando
 
-Tutti in main.cpp, selezionati da `--solver-mode` e dalla carta.
+Selezionati da spaziotempo, `--solver-mode` e carta.
 
-| funzione | riga | quando |
-|---|---|---|
-| `trace_single` | ~305 | BL, numerico, il riferimento |
-| `trace_single_ks` | ~1640 | KS Cartesiana, default quando `Q=0, Λ=0` |
-| `trace_single_separable_kerr` | ~747 | Kerr puro, potenziali separati |
-| `trace_single_elliptic_closed` | ~1035 | forma chiusa con integrali ellittici |
-| `trace_bundle` | ray_bundle.hpp | modalità `--bundles` |
-| `trace_wormhole` | ~2943 | metrica DNEG |
+| tipo in `pixel_tracers.hpp` | chiama | file | quando |
+|---|---|---|---|
+| `BlPixelTracer` | `trace_single` | tracer_bl.hpp | BL, numerico, il riferimento |
+| `KsPixelTracer` | `trace_single_ks` | tracer_ks.hpp | KS Cartesiana, default quando `Q=0, Λ=0` |
+| `SeparablePixelTracer` | `trace_single_separable_kerr` | tracer_separable.hpp | Kerr puro, potenziali separati |
+| `EllipticPixelTracer` | `trace_single_elliptic_closed` | tracer_elliptic.hpp | forma chiusa con integrali ellittici |
+| `BundlePixelTracer` | `trace_bundle` | ray_bundle.hpp | modalità `--bundles` |
+| `WormholePixelTracer` | `trace_single_wormhole` | tracer_wormhole.hpp | metrica DNEG |
+
+### Come si sceglie, e perché non con `virtual`
+
+Ogni tracciatore è un piccolo oggetto funzione con
+`void operator()(int px, int py, GeoPixel&) const`. `trace_geodesics` ne
+costruisce **uno per frame** e lo mette in `PixelTracer`, uno `std::variant`.
+`trace_frame` fa un solo `std::visit`, che istanzia `trace_rows<T>` per quel
+tipo: il ciclo sui pixel è monomorfo, senza if-chain né chiamata virtuale per
+pixel. Costo misurato: nessuno (stessi tempi a 720p di prima del refactor).
+
+Per aggiungere un tracciatore: un tipo nuovo in `pixel_tracers.hpp`, una voce nel
+variant, un ramo nella scelta in `phase1.hpp`. Ciclo, thread e barra di
+avanzamento restano condivisi.
+
+### Spaziotempo e backend
+
+`FrameParams::spacetime` (`KNDS` o `DNEG_WORMHOLE`) sostituisce il vecchio
+`bool wormhole`. Quel che cambia fra i due fuori dal tracciatore (kernel GPU
+disponibili? `r_obs` può essere negativo?) si chiede a `spacetime_traits`, non
+controllando "è il wormhole?" in ogni punto.
+
+"Questo frame può girare su Metal/CUDA?" ha **una sola** risposta:
+`plan_metal` / `plan_cuda` in `backend_select.hpp`. `render_image` la esegue, la
+CLI la usa (`planned_backend`) per la riga `Mode:` e i nomi dei file. Prima la
+stessa logica stava in tre copie sincronizzate a mano.
 
 **BL e KS devono dare la stessa immagine.** Non era così fino a v0.2.18: KS
 sbagliava il raggio d'ombra del 5%. Ora `kerrtrace.chart_consistency` lo verifica
@@ -175,7 +217,7 @@ NASA. La stratified ha un `cell_hash` proprio **non ancora piastrellato**.
 
 ## GPU
 
-`tracer.metal` rispecchia `main.cpp` in float32. Regole:
+`tracer.metal` rispecchia i tracciatori di `renderer/` in float32. Regole:
 
 - **Si carica dal sorgente**, `exeDir/../gpu/metal/tracer.metal`
   (`metal_renderer.mm:49`), non dalla copia in build. Modificarlo ha effetto al
@@ -198,7 +240,7 @@ NASA. La stratified ha un `cell_hash` proprio **non ancora piastrellato**.
 
 `server/index.js` traduce il JSON del frontend in flag CLI e lancia il binario.
 Non parsa i `.kgeo`. Quindi **una nuova opzione va aggiunta in tre punti**:
-`main.cpp` (parsing), `server/index.js` (inoltro), `frontend/src/app/` (controllo
+`renderer/cli.hpp` (parsing), `server/index.js` (inoltro), `frontend/src/app/` (controllo
 e tipo in `render.service.ts`).
 
 ---
@@ -210,6 +252,12 @@ cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu -j8
 cmake -B build -DUSE_METAL=ON     && cmake --build build -j8
 ctest --test-dir build_cpu
 ```
+
+**Refactor senza cambi di comportamento**: `tests/render_fingerprint.py` rende
+una ventina di configurazioni piccole (carte, solutori, bundle, palette, Q, Λ,
+wormhole, round trip `.kgeo`) e ne salva gli hash. Baseline col binario prima
+della modifica, poi `--compare`: ogni hash deve restare uguale. Gli hash valgono
+solo sulla stessa macchina e con gli stessi flag (`-march=native`, driver Metal).
 
 Su Apple Silicon il build è vincolato ad arm64: `CMakeLists.txt` interroga
 `sysctl hw.optional.arm64` **prima** di `project()` e fallisce se il toolchain
