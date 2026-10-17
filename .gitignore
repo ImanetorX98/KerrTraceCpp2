@@ -34,3 +34,4 @@ frontend/.angular/
 # Handoff locale per analisi esterna: non versionato di proposito, contiene
 # valutazioni di processo che non appartengono alla storia del repo.
 HANDOFF-ASTRA.md
+HANDOFF-OPUS55.md
