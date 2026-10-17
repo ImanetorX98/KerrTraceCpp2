@@ -137,28 +137,21 @@ static std::vector<RGB> render_image(
     (void)gpu_fp64;
     (void)elliptic_fallback_black;
     (void)anti_fireflies;
+    const BackendRequest backend_rq{fp.spacetime, chart, solver_mode, intg, use_bundles,
+                                    Q_bh, Lam, gpu_fp64, geo_out != nullptr};
+    (void)backend_rq;
 #if defined(USE_METAL)
-    const CoordinateChart chart_gpu = resolve_runtime_chart_gpu(chart, Lam);
-    const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-    const bool gpu_chart_ok = (chart_gpu == CoordinateChart::BL) ||
-                              (chart_gpu == CoordinateChart::KS && ks_chart_supported);
-    const SolverSelection gpu_solver_sel = select_solver_mode(
-        solver_mode, use_bundles, chart_gpu, Q_bh, Lam);
-    const RaySolverMode gpu_solver_mode = gpu_solver_sel.effective;
-    const bool solver_gpu_supported = metal_solver_supported(gpu_solver_mode, chart_gpu, Q_bh, Lam);
-    const bool bundle_gpu_supported =
-        use_bundles &&
-        gpu_chart_ok &&
-        gpu_solver_mode == RaySolverMode::STANDARD;
-    const bool single_ray_gpu_supported =
-        !use_bundles &&
-        gpu_chart_ok &&
-        solver_gpu_supported;
-    const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
+    const MetalPlan plan = plan_metal(backend_rq, cp);
+    const CoordinateChart chart_gpu = plan.chart;
+    const bool ks_chart_supported = plan.ks_chart_supported;
+    const bool gpu_chart_ok = plan.chart_ok;
+    const RaySolverMode gpu_solver_mode = plan.solver;
+    const bool solver_gpu_supported = plan.solver_supported;
+    const bool base_can_use_gpu = plan.base_can_use_gpu;
     const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
     const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
-    const char* cpu_reason = metal_cpu_reason(cp, use_bundles, geo_out != nullptr);
-    const bool can_use_gpu = base_can_use_gpu && !gpu_fp64 && !fp.wormhole && !cpu_reason;
+    const char* cpu_reason = plan.cpu_reason;
+    const bool can_use_gpu = plan.can_use_gpu;
     if (cpu_reason) std::cerr << "Info: Metal using CPU: " << cpu_reason << ".\n";
 
     if (alpha_composite_cpu_only) {
@@ -295,14 +288,12 @@ static std::vector<RGB> render_image(
                      "Use --gpu-fp64 for strict capability checking/reporting.\n";
         warned_cuda_fp64_default = true;
     }
-    const CoordinateChart chart_gpu = resolve_runtime_chart_gpu(chart, Lam);
-    const bool gpu_metric_ok = (std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15);
+    const CudaPlan plan = plan_cuda(backend_rq, cp);
+    const CoordinateChart chart_gpu = plan.chart;
+    const bool gpu_metric_ok = plan.metric_ok;
     const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-    const bool gpu_chart_ok = (chart_gpu == CoordinateChart::BL) ||
-                              (chart_gpu == CoordinateChart::KS && ks_chart_supported);
-    const char* cpu_reason = cuda_cpu_reason(cp, use_bundles, solver_mode, intg);
-    if (cpu_reason) std::cerr << "Info: CUDA using CPU: " << cpu_reason << ".\n";
-    if (!cpu_reason && gpu_chart_ok && gpu_metric_ok && !fp.wormhole) {
+    if (plan.cpu_reason) std::cerr << "Info: CUDA using CPU: " << plan.cpu_reason << ".\n";
+    if (plan.can_use_gpu) {
         KNdSMetric g(M_bh, fp.a, Q_bh, Lam);
         const double r_isco = g.r_isco();
         Camera cam(fp.r_obs, fp.theta, fp.phi, fp.fov, W, H);

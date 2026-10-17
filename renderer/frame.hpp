@@ -23,11 +23,29 @@ static void print_progress(int done, int total, double elapsed) {
     std::cerr<<"   "<<std::flush;
 }
 
+// ── Spacetimes ───────────────────────────────────────────────
+// Which geometry a frame lives in. What differs between them beyond the tracer
+// itself is answered by spacetime_traits, so callers ask "does it have GPU
+// kernels?" rather than "is it the wormhole?".
+enum class Spacetime : uint8_t { KNDS, DNEG_WORMHOLE };
+
+struct SpacetimeTraits {
+    const char* name;      ///< label in logs
+    bool gpu_kernels;      ///< Metal/CUDA kernels exist for this geometry
+    bool signed_radius;    ///< r_obs may be negative (observer on the far side)
+};
+
+static constexpr SpacetimeTraits spacetime_traits(Spacetime s) {
+    return s == Spacetime::DNEG_WORMHOLE
+        ? SpacetimeTraits{"wormhole", false, true}
+        : SpacetimeTraits{"knds",     true,  false};
+}
+
 // ── Per-frame camera/physics parameters ───────────────────────
 struct FrameParams {
     double a=0.7, theta=80.0, phi=0.0, r_obs=60.0, disk_out=12.0, fov=30.0;
-    // Wormhole mode (DNEG metric)
-    bool   wormhole      = false;
+    Spacetime spacetime = Spacetime::KNDS;
+    // DNEG wormhole parameters (used when spacetime == DNEG_WORMHOLE)
     double wh_rho        = 1.0;   ///< throat areal radius ρ  [geometric units]
     double wh_a_tunnel   = 0.01;  ///< half-length of cylindrical tunnel a  (Interstellar default)
     double wh_M_lens     = 1.0;   ///< lensing parameter M

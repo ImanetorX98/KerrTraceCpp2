@@ -50,7 +50,7 @@ static int run_cli(int argc, char** argv) {
     double arg_Q=0.0, arg_Lam=0.0, arg_fov=30.0;
 
     // ── Wormhole params ───────────────────────────────────────
-    bool   arg_wormhole  = false;
+    Spacetime arg_spacetime = Spacetime::KNDS;
     double arg_wh_rho    = 1.0;   // throat areal radius ρ
     double arg_wh_a      = 0.01;  // half tunnel length a
     double arg_wh_M      = 1.0;   // lensing parameter M
@@ -323,7 +323,7 @@ static int run_cli(int argc, char** argv) {
         if (arg=="--ring-taper-sigma" && i+1<argc) cp.radial_ring_taper_sigma = std::max(1e-6, std::stod(argv[++i]));
 
         // Wormhole
-        if (arg=="--wormhole")                   arg_wormhole = true;
+        if (arg=="--wormhole")                   arg_spacetime = Spacetime::DNEG_WORMHOLE;
         if (arg=="--wh-throat" && i+1<argc)      arg_wh_rho   = std::stod(argv[++i]);
         if (arg=="--wh-lensing"&& i+1<argc)      arg_wh_M     = std::stod(argv[++i]);
         if (arg=="--wh-tunnel" && i+1<argc)      arg_wh_a     = std::stod(argv[++i]);
@@ -453,9 +453,10 @@ static int run_cli(int argc, char** argv) {
     checked_pixel_count(uint32_t(W), uint32_t(H));
 
     const double default_r_obs = 60.0;
-    // Wormhole mode allows negative l_obs (observer in Universe B); non-wormhole needs positive r_obs.
+    // A signed radial coordinate (wormhole l) allows an observer on the far side;
+    // Boyer-Lindquist r_obs must stay positive.
     const double base_r_obs = arg_r_obs_set
-        ? (arg_wormhole ? arg_r_obs : std::max(arg_r_obs, 1.0))
+        ? (spacetime_traits(arg_spacetime).signed_radius ? arg_r_obs : std::max(arg_r_obs, 1.0))
         : default_r_obs;
 
     const char* res_tag = res_4k ? "4k" : res_2k ? "2k" : custom_w ? "custom"
@@ -520,6 +521,8 @@ static int run_cli(int argc, char** argv) {
             eff = CoordinateChart::BL;
         return eff;
     };
+    const BackendRequest backend_request{arg_spacetime, chart, solver_mode, intg, use_bundles,
+                                         Q_bh, Lam, gpu_fp64, geo_only || !geo_file.empty()};
     auto integration_mode_tag = [&]()->std::string {
         const CoordinateChart eff_chart = effective_chart_for_naming(chart);
         const char* out_chart_tag = (chart == CoordinateChart::GKS)
@@ -542,67 +545,15 @@ static int run_cli(int argc, char** argv) {
         // Standard solver: CPU KS is RK4-only; GPU KS can expose DOPRI5.
         bool ks_uses_rk4 = (eff_chart == CoordinateChart::KS);
 #if defined(USE_METAL)
-        const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-        const bool gpu_chart_ok = (eff_chart == CoordinateChart::BL) ||
-                                  (eff_chart == CoordinateChart::KS && ks_chart_supported);
-        const bool solver_gpu_supported = metal_solver_supported(sel.effective, eff_chart, Q_bh, Lam);
-        const bool bundle_gpu_supported =
-            use_bundles &&
-            gpu_chart_ok &&
-            sel.effective == RaySolverMode::STANDARD;
-        const bool single_ray_gpu_supported =
-            !use_bundles &&
-            gpu_chart_ok &&
-            solver_gpu_supported;
-        const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
-        const bool can_use_gpu = (bundle_gpu_supported || single_ray_gpu_supported) && !gpu_fp64 && !arg_wormhole
-            && !metal_cpu_reason(cp, use_bundles, geo_only || !geo_file.empty());
-        if (can_use_gpu) ks_uses_rk4 = false;
+        if (plan_metal(backend_request, cp).can_use_gpu) ks_uses_rk4 = false;
 #endif
         const char* intg_tag = (ks_uses_rk4 || intg == Integrator::RK4_DOUBLING)
             ? "rk4"
             : "dopri5";
         return std::string(out_chart_tag) + "-standard-" + intg_tag;
     };
-    auto backend_mode_tag = [&]()->const char* {
-#if defined(USE_METAL)
-        const CoordinateChart eff_chart = effective_chart_for_naming(chart);
-        const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-        const bool gpu_chart_ok = (eff_chart == CoordinateChart::BL) ||
-                                  (eff_chart == CoordinateChart::KS && ks_chart_supported);
-        const SolverSelection gpu_solver_sel = select_solver_mode(
-            solver_mode, use_bundles, eff_chart, Q_bh, Lam);
-        const RaySolverMode gpu_solver_mode = gpu_solver_sel.effective;
-        const bool solver_gpu_supported = metal_solver_supported(gpu_solver_mode, eff_chart, Q_bh, Lam);
-        const bool bundle_gpu_supported =
-            use_bundles &&
-            gpu_chart_ok &&
-            gpu_solver_mode == RaySolverMode::STANDARD;
-        const bool single_ray_gpu_supported =
-            !use_bundles &&
-            gpu_chart_ok &&
-            solver_gpu_supported;
-        const bool base_can_use_gpu = bundle_gpu_supported || single_ray_gpu_supported;
-        const bool metal_fp64_supported = false; // Current Metal kernel path is FP32 only.
-        const bool alpha_composite_cpu_only = cp.disk_opacity < (1.0 - 1e-9);
-        const bool can_use_gpu = base_can_use_gpu && !gpu_fp64 && !arg_wormhole
-            && !metal_cpu_reason(cp, use_bundles, geo_only || !geo_file.empty());
-        return can_use_gpu ? "gpu-metal" : "cpu";
-#elif defined(USE_CUDA)
-        const CoordinateChart eff_chart = effective_chart_for_naming(chart);
-        const bool ks_chart_supported = (std::abs(Lam) <= 1e-15);
-        const bool gpu_chart_ok = (eff_chart == CoordinateChart::BL) ||
-                                  (eff_chart == CoordinateChart::KS && ks_chart_supported);
-        const bool cuda_gpu_supported = !arg_wormhole && !geo_only &&
-            !cuda_cpu_reason(cp, use_bundles, solver_mode, intg) && gpu_chart_ok &&
-            std::abs(Q_bh) <= 1e-15 && std::abs(Lam) <= 1e-15;
-        return cuda_gpu_supported ? "gpu-cuda" : "cpu";
-#else
-        return "cpu";
-#endif
-    };
     const std::string mode_tag = integration_mode_tag();
-    const std::string backend_tag = backend_mode_tag();
+    const std::string backend_tag = planned_backend(backend_request, cp, geo_only);
     const std::string fp64_tag = gpu_fp64 ? "_gpufp64req" : "";
     const std::string spp_tag = (camera_spp > 1) ? ("_spp" + std::to_string(camera_spp)) : "";
     const std::string mode_backend_tag = mode_tag + "_" + backend_tag + fp64_tag + spp_tag;
@@ -613,7 +564,7 @@ static int run_cli(int argc, char** argv) {
         fp.a=arg_a; fp.theta=arg_theta; fp.phi=arg_phi;
         fp.r_obs=base_r_obs*M_bh; fp.disk_out=arg_disk_out*M_bh;
         fp.fov=arg_fov;
-        fp.wormhole    = arg_wormhole;
+        fp.spacetime   = arg_spacetime;
         fp.wh_rho      = arg_wh_rho;
         fp.wh_a_tunnel = arg_wh_a;
         fp.wh_M_lens   = arg_wh_M;
@@ -654,7 +605,8 @@ static int run_cli(int argc, char** argv) {
             return 0;
         }
 
-        if (fp.wormhole) {
+        const bool is_wormhole = (fp.spacetime == Spacetime::DNEG_WORMHOLE);
+        if (is_wormhole) {
             std::cout << "DNEG Wormhole  ρ=" << fp.wh_rho
                       << " a=" << fp.wh_a_tunnel
                       << " M_lens=" << fp.wh_M_lens << "\n"
@@ -667,11 +619,11 @@ static int run_cli(int argc, char** argv) {
                       << "  r₊=" << g_info.r_horizon()
                       << "  r_ISCO=" << g_info.r_isco() << "\n";
         }
-        std::cout << "Mode: " << (fp.wormhole?"wormhole":use_bundles?"ray bundles":"single ray")
-                  << "  chart=" << (fp.wormhole ? "wormhole" : chart_label(chart))
+        std::cout << "Mode: " << (is_wormhole?"wormhole":use_bundles?"ray bundles":"single ray")
+                  << "  chart=" << (is_wormhole ? "wormhole" : chart_label(chart))
                   << "  " << (intg==Integrator::DOPRI5?"DOPRI5":"RK4-doubling")
-                  << "  " << (fp.wormhole?"rk4-adaptive":solver_mode_name(solver_mode))
-                  << "  backend=" << (fp.wormhole?"cpu":backend_tag.c_str())
+                  << "  " << (is_wormhole?"rk4-adaptive":solver_mode_name(solver_mode))
+                  << "  backend=" << backend_tag
                   << "  intersection=" << intersection_mode_name(intersection_mode)
                   << "  elliptic-fallback-black=" << (elliptic_fallback_black ? "on" : "off")
                   << "  anti-fireflies=" << (anti_fireflies ? "on" : "off")
@@ -826,7 +778,7 @@ static int run_cli(int argc, char** argv) {
         fp.phi      = (anim_orbits!=0.0)
                     ? phi_start+360.0*anim_orbits*phase
                     : lerp_angle(phi_start,phi_end,t);
-        fp.wormhole    = arg_wormhole;
+        fp.spacetime   = arg_spacetime;
         fp.wh_rho      = arg_wh_rho;
         fp.wh_a_tunnel = arg_wh_a;
         fp.wh_M_lens   = arg_wh_M;

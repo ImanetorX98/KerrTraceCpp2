@@ -24,7 +24,7 @@ static std::vector<GeoPixel> trace_geodesics(
     bool debug_elliptic = false)
 {
     // Wormhole: a different spacetime, with its own camera and integrator.
-    if (fp.wormhole)
+    if (fp.spacetime == Spacetime::DNEG_WORMHOLE)
         return trace_frame(W, H, make_wormhole_tracer(W, H, fp, ctl,
                                                       pixel_offset_x, pixel_offset_y, meta_out));
 

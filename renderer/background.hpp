@@ -7,6 +7,9 @@
 #include "color_params.hpp"
 #include "util.hpp"
 
+// One sample of the pixel's footprint, in footprint coordinates (s, t) inside
+// [-1,1]^2 with a truncated-Gaussian weight. Declared here because both the
+// background sampler and the disk shading use the same pattern.
 struct FootprintSample { double s, t, w; };
 
 // ── Background HDRI ───────────────────────────────────────────
