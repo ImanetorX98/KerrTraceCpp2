@@ -56,11 +56,17 @@ struct BackgroundImage {
         if (px.empty()) return {0,0,0};
         double pw = std::fmod(phi, 2.0*M_PI);
         if (pw < 0) pw += 2.0*M_PI;
-        double uf = pw  / (2.0*M_PI) * (w-1);
-        double vf = theta / M_PI     * (h-1);
-        int u0=(int)uf, u1=(w > 1) ? ((u0 + 1) % w) : 0;
-        int v0=(int)vf, v1=std::min(v0+1,h-1);
-        double fu=uf-u0, fv=vf-v0;
+        // Texel i covers [i, i+1)/w with its centre at (i + 0.5)/w: the convention
+        // of the Metal sampler (repeat in u, clamp in v). Scaling by (w-1) instead
+        // put CPU and GPU up to half a texel apart across the sky and left a
+        // one-texel jump at phi = 2pi.
+        const double uf = pw / (2.0*M_PI) * w - 0.5;
+        const double vf = clamp(theta / M_PI, 0.0, 1.0) * h - 0.5;
+        const double uf0 = std::floor(uf), vf0 = std::floor(vf);
+        int u0 = int(uf0) % w; if (u0 < 0) u0 += w;
+        const int u1 = (w > 1) ? ((u0 + 1) % w) : 0;
+        const int v0 = int(vf0), v1 = v0 + 1;   // at() clamps v to the edge rows
+        const double fu = uf - uf0, fv = vf - vf0;
         auto at=[&](int u,int v)->const uint8_t*{
             return px.data()+3*(clamp(v,0,h-1)*w+clamp(u,0,w-1));
         };
