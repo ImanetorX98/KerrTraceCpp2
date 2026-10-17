@@ -136,6 +136,11 @@ endfunction()
 # ── Executable ────────────────────────────────────────────────
 add_executable(kerr_tracer ${CPU_SOURCES})
 
+# .kgeo -> NumPy .npy + JSON metadata; the dtype comes from the Reflection
+# description in tools/kgeo_reflection.hpp (vendored Sane C++ Reflection).
+add_executable(kgeo_to_npy tools/kgeo_to_npy.cpp)
+target_compile_features(kgeo_to_npy PRIVATE cxx_std_17)
+
 target_include_directories(kerr_tracer PRIVATE ${CMAKE_SOURCE_DIR})
 
 # Inject absolute output path so the binary finds it regardless of CWD
@@ -260,6 +265,10 @@ if(BUILD_TESTING)
         add_test(NAME kerrtrace.cli COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_SOURCE_DIR}/tests/cli_regression.py $<TARGET_FILE:kerr_tracer>)
         set_tests_properties(kerrtrace.cli PROPERTIES TIMEOUT 180)
+        add_test(NAME kerrtrace.kgeo_npy COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/kgeo_npy_regression.py
+            $<TARGET_FILE:kerr_tracer> $<TARGET_FILE:kgeo_to_npy>)
+        set_tests_properties(kerrtrace.kgeo_npy PROPERTIES TIMEOUT 300)
     endif()
     if(APPLE)
         add_executable(kerrtrace_metal_contour_test tests/metal_contour_regression.mm

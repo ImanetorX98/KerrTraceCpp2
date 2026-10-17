@@ -122,6 +122,14 @@ I tre test di regressione replicano questo layout e hanno uno `static_assert`
 sulla dimensione: se cambi `GeoPixel` e non i test, il build fallisce subito.
 È voluto.
 
+**Lettura da Python.** `kgeo_to_npy file.kgeo out` scrive `out.npy` (array NumPy
+strutturato H×W, `numpy.load("out.npy")["redshift"]`) e `out.json` con
+`KGeoMeta`. Il dtype non è scritto a mano: viene da `tools/kgeo_reflection.hpp`,
+che descrive ogni campo con Sane C++ Reflection (`third_party/sane_cpp/`). I suoi
+`static_assert` fermano il build se un campo aggiunto a `GeoPixel` non è descritto
+lì o se compare padding. Se cambi `GeoPixel`, aggiorna anche quel file
+(tag nuovi in coda, mai riusati).
+
 ---
 
 ## I tracciatori: quale corre quando
