@@ -293,5 +293,11 @@ if(BUILD_TESTING)
         add_test(NAME kerrtrace.metal_shader COMMAND kerrtrace_metal_shader_test
             ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
         set_tests_properties(kerrtrace.metal_shader PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        if(TARGET kerr_tracer_metal AND Python3_Interpreter_FOUND)
+            add_test(NAME kerrtrace.metal_passthrough COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/tests/metal_passthrough_regression.py
+                $<TARGET_FILE:kerr_tracer_metal>)
+            set_tests_properties(kerrtrace.metal_passthrough PROPERTIES TIMEOUT 300 LABELS "metal")
+        endif()
     endif()
 endif()

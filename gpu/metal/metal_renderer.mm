@@ -285,6 +285,12 @@ std::vector<uint32_t> metal_render(
     size_t done_tiles = 0;
     const long long total_pixels = (long long)cp.width * cp.height;
     const auto t0 = std::chrono::steady_clock::now();
+    // KERR_METAL_STATS=1 prints tile counts, failed tiles and GPU time vs wall time:
+    // the quickest way to tell slow kernels from idle GPU between tiles.
+    const bool diag_stats = std::getenv("KERR_METAL_STATS") != nullptr;
+    size_t diag_ok = 0, diag_failed = 0;
+    double diag_gpu_ok = 0.0, diag_gpu_failed = 0.0;
+    std::string diag_first_error;
 
     for (size_t i = 0; i < tiles.size();) {
         const Tile t = tiles[i];
@@ -317,6 +323,15 @@ std::vector<uint32_t> metal_render(
         [cmd commit];
         [cmd waitUntilCompleted];
 
+        if (diag_stats) {
+            const double gpu_s = cmd.GPUEndTime - cmd.GPUStartTime;
+            if (cmd.status == MTLCommandBufferStatusCompleted) { ++diag_ok; diag_gpu_ok += gpu_s; }
+            else {
+                ++diag_failed; diag_gpu_failed += gpu_s;
+                if (diag_first_error.empty() && cmd.error)
+                    diag_first_error = [cmd.error.localizedDescription UTF8String];
+            }
+        }
         if (cmd.status == MTLCommandBufferStatusCompleted) {
             ++i;
             ++done_tiles;
@@ -367,6 +382,12 @@ std::vector<uint32_t> metal_render(
         throw std::runtime_error("Metal command failed: " + last_error);
     }
 
+    if (diag_stats) {
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "METAL_STATS tiles_initial=%zu tile=%dx%d ok=%zu failed=%zu gpu_ok=%.3fs gpu_failed=%.3fs wall=%.3fs first_error=%s\n",
+                total_tiles, tile_cols, tile_rows, diag_ok, diag_failed, diag_gpu_ok, diag_gpu_failed, wall,
+                diag_first_error.empty() ? "-" : diag_first_error.c_str());
+    }
     // ── Copy result ───────────────────────────────────────────
     std::vector<uint32_t> pixels(npix);
     std::memcpy(pixels.data(), [outBuf contents], npix * sizeof(uint32_t));

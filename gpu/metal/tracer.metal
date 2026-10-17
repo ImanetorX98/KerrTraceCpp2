@@ -2974,11 +2974,12 @@ static inline void trace_pixel_impl(
                         // ph_hit is the KS azimuth: KS_covector_to_BL wants it as
                         // such, everything downstream wants the BL one.
                         const float ph_hit_bl = ph_hit - ks_azimuth_twist(r_hit, a, M, Q);
-                        if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
-                            if (disk_tile_pass_through(r_hit, ph_hit_bl, kp.r_isco, kp.r_disk_out, cp)) {
-                                // Keep tracing: this Interstellar tile is intentionally transparent.
-                                continue;
-                            }
+                        // A transparent Interstellar edge lets the ray through: it must still
+                        // reach the horizon/escape checks and the prev-state update at the end
+                        // of this iteration. A `continue` here skipped both, so the stale prevZ
+                        // re-detected the same crossing every step and the ray ran to max_steps.
+                        if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out &&
+                            !disk_tile_pass_through(r_hit, ph_hit_bl, kp.r_isco, kp.r_disk_out, cp)) {
                             float pr_hit, pth_hit, pphi_hit;
                             KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                               pr_hit, pth_hit, pphi_hit);
