@@ -778,15 +778,44 @@ static void geodesic_rhs_KS(float X, float Y, float Z,
     dY = guu[2][0]*pT + guu[2][1]*pX + guu[2][2]*pY + guu[2][3]*pZ;
     dZ = guu[3][0]*pT + guu[3][1]*pX + guu[3][2]*pY + guu[3][3]*pZ;
 
-    const float eX = 1e-5f*(abs(X)+0.1f);
-    const float eY = 1e-5f*(abs(Y)+0.1f);
-    const float eZ = 1e-5f*(abs(Z)+0.1f);
-    dpX = -(hamiltonian_KS(X+eX, Y, Z, pT, pX, pY, pZ, M, a, Q)
-          - hamiltonian_KS(X-eX, Y, Z, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eX);
-    dpY = -(hamiltonian_KS(X, Y+eY, Z, pT, pX, pY, pZ, M, a, Q)
-          - hamiltonian_KS(X, Y-eY, Z, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eY);
-    dpZ = -(hamiltonian_KS(X, Y, Z+eZ, pT, pX, pY, pZ, M, a, Q)
-          - hamiltonian_KS(X, Y, Z-eZ, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eZ);
+    // Force -dH/dx, analytic. H = (eta p p - F S^2)/2 with F = (2Mr - Q^2)/rho^2 and
+    // S = l^a p_a, so dp_i = F_i S^2/2 + F S S_i. Central differences of two FP32
+    // Hamiltonians lost most of their digits to cancellation (up to 9% force error,
+    // grainy lensed sky); the BL forces had the same fix on 2026-09-09. Guards match
+    // gUU_KS so the force and the velocity above describe the same Hamiltonian.
+    const float r    = r_KS(X, Y, Z, a);
+    const float rr   = max(r*r, 1e-12f);
+    const float rg   = max(r, 1e-6f);
+    const float a2   = a*a;
+    const float Z2   = Z*Z;
+    const float rho2 = rr + a2*Z2/rr;
+    const float A    = rr + a2;
+    const float F    = (2.0f*M*r - Q*Q) / rho2;
+    const float l1   = (r*X + a*Y) / A;
+    const float l2   = (r*Y - a*X) / A;
+    const float l3   = Z / rg;
+    const float S    = -pT + l1*pX + l2*pY + l3*pZ;
+
+    // r(X,Y,Z) is implicit in r^4 - (R^2 - a^2) r^2 - a^2 Z^2 = 0, which gives
+    // dr/dX = rX/rho^2, dr/dY = rY/rho^2, dr/dZ = Z (r^2 + a^2)/(r rho^2).
+    const float dr[3] = {r*X/rho2, r*Y/rho2, Z*A/(rg*rho2)};
+    const float rho2_r = 2.0f*r - 2.0f*a2*Z2/(rr*rg);   // d rho^2 / dr at fixed Z
+    float force[3];
+    for (int i = 0; i < 3; ++i) {
+        const float dri    = dr[i];
+        const float drho2  = rho2_r*dri + ((i == 2) ? 2.0f*a2*Z/rr : 0.0f);
+        const float dF     = (2.0f*M*dri - F*drho2) / rho2;
+        const float dN1    = dri*X + ((i == 0) ? r : 0.0f) + ((i == 1) ? a : 0.0f);
+        const float dN2    = dri*Y + ((i == 1) ? r : 0.0f) - ((i == 0) ? a : 0.0f);
+        const float dl1    = (dN1 - l1*2.0f*r*dri) / A;
+        const float dl2    = (dN2 - l2*2.0f*r*dri) / A;
+        const float dl3    = (((i == 2) ? 1.0f : 0.0f) - l3*dri) / rg;
+        const float dS     = pX*dl1 + pY*dl2 + pZ*dl3;
+        force[i] = 0.5f*dF*S*S + F*S*dS;
+    }
+    dpX = force[0];
+    dpY = force[1];
+    dpZ = force[2];
 }
 
 static void rk4_KS(thread float& X, thread float& Y, thread float& Z,

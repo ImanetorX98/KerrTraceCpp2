@@ -73,3 +73,25 @@ Selezione: pixel con salto di colore > T verso un vicino, dilatati di R.
 - Le leve sono: derivate analitiche anche per le forze KS sulla GPU (come per
   BL), tessere più grandi nel dispatch Metal, e allineare l'ombreggiatura
   Interstellar della GPU a quella CPU.
+
+## Aggiornamento 19 ottobre: forze KS analitiche sulla GPU
+
+`geodesic_rhs_KS` calcola ora −∂H/∂x in forma chiusa (H = ½(η pp − F S²),
+∂r/∂x dalla definizione implicita di r) invece che con differenze centrali di
+due Hamiltoniane FP32. `kerrtrace.metal_rhs` confronta la funzione GPU con
+differenze a cinque punti in double su 720 stati KS (a da −0,9 a 0,95, r da
+1,5 a 40, fuori dal cono nullo inclusi).
+
+| | prima | dopo |
+|---|---:|---:|
+| errore forze KS (massimo, scalato) | 9,2·10⁻² | 4,1·10⁻⁷ |
+| grana del cielo 4K vs CPU | 2,52× | 1,01× |
+| pixel 4K con errore > 48 | 3,04 % | 0,32 % |
+| pixel 4K con errore > 16 | 12,4 % | 2,4 % |
+| tempo 4K Interstellar | 38 s | 16,9 s (CPU 69 s) |
+| `metal_contour` ks-custom/upper | max 2 px, 11 oltre 1 px | max 1 px, 0 oltre |
+
+`metal_contour` passa per la prima volta da settembre: tutta la suite è verde.
+L'errore residuo sul disco (chiazze uguali in KS e BL) è ombreggiatura
+Interstellar, non traiettoria. Gli hash Metal di `render_fingerprint` nei casi
+KS cambiano: vanno registrati di nuovo.

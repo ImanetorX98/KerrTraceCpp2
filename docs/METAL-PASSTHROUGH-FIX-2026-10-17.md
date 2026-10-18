@@ -53,9 +53,11 @@ che richiedono davvero più di 5 000 passi.
 - **Stesso `continue` nel percorso separabile** (`--semi-analytic`): salta
   l'aggiornamento di `prev_*_sep`. Non corretto perché non misurabile ora: il
   percorso separabile su GPU impiega 472 s a 320×180 anche col blackbody.
-- **Forze KS su GPU per differenze finite FP32** (`geodesic_rhs_KS`, passo
-  relativo 1e-5): la stessa cancellazione corretta in BL il 9 settembre.
-  Candidata principale per gli scarti residui di 2 px in `metal_contour`.
+- ~~**Forze KS su GPU per differenze finite FP32**~~ — risolto il 19 ottobre con
+  derivate analitiche; gli scarti di 2 px in `metal_contour` sono spariti
+  (vedi `GPU-QUALITY-4K-2026-10-17.md`).
+- ~~**Tessere sincrone**~~ — risolto il 17 ottobre (tessere dimensionate dalla
+  risoluzione, commit eb247a2).
 
 ## `KERR_METAL_STATS`
 

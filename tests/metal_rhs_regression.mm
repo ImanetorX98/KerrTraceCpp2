@@ -9,6 +9,9 @@
 // cannot masquerade as an error in the GPU's Hamiltonian derivatives.
 struct Sample { float r,theta,pr,pth,pt,pphi,M,a,Q,L; };
 static_assert(sizeof(Sample)==40,"MSL input layout");
+// Kerr-Schild Cartesian state (Lambda = 0 only, like the KS chart itself).
+struct KSSample { float X,Y,Z,pT,pX,pY,pZ,M,a,Q; };
+static_assert(sizeof(KSSample)==40,"MSL input layout");
 
 int main(int argc,char** argv) {
     @autoreleasepool {
@@ -31,6 +34,17 @@ kernel void test_bl_rhs(device const RHSSample* samples [[buffer(0)]],
                  dr,dth,dphi,dpr,dpth);
     out[5*i]=dr; out[5*i+1]=dth; out[5*i+2]=dphi;
     out[5*i+3]=dpr; out[5*i+4]=dpth;
+}
+struct KSRHSSample { float X,Y,Z,pT,pX,pY,pZ,M,a,Q; };
+kernel void test_ks_rhs(device const KSRHSSample* samples [[buffer(0)]],
+                        device float* out [[buffer(1)]],
+                        uint i [[thread_position_in_grid]]) {
+    const KSRHSSample s=samples[i];
+    float dX,dY,dZ,dpX,dpY,dpZ;
+    geodesic_rhs_KS(s.X,s.Y,s.Z,s.pT,s.pX,s.pY,s.pZ,s.M,s.a,s.Q,
+                    dX,dY,dZ,dpX,dpY,dpZ);
+    out[6*i]=dX; out[6*i+1]=dY; out[6*i+2]=dZ;
+    out[6*i+3]=dpX; out[6*i+4]=dpY; out[6*i+5]=dpZ;
 }
 )" ];
         MTLCompileOptions* options=[MTLCompileOptions new];
@@ -103,6 +117,69 @@ kernel void test_bl_rhs(device const RHSSample* samples [[buffer(0)]],
         }
         std::cout<<"Metal BL RHS: "<<samples.size()<<" states, "<<failures
                  <<" failed components; max scaled error="<<worst<<'\n';
-        return failures?1:0;
+
+        // ── KS chart: the force is -dH/dx in Kerr-Schild Cartesian coordinates ──
+        id<MTLFunction> ksFn=[lib newFunctionWithName:@"test_ks_rhs"];
+        id<MTLComputePipelineState> ksPipeline=ksFn?
+            [device newComputePipelineStateWithFunction:ksFn error:&error]:nil;
+        if(!ksPipeline) {std::cerr<<[[error localizedDescription] UTF8String]<<'\n';return 1;}
+        std::vector<KSSample> ks;
+        struct Spin { float a,Q,rmin; };
+        for(const Spin sp : {Spin{0.f,0.f,2.2f},Spin{.7f,0.f,1.9f},Spin{.95f,.1f,1.5f},Spin{-.9f,0.f,1.6f}})
+            for(float r : {sp.rmin,2.5f,4.f,12.f,40.f})
+                for(float theta : {.03f,.3f,1.f,float(M_PI/2)-.02f,2.6f,3.1f})
+                    for(float phi : {.4f,2.f})
+                        for(int momenta=0;momenta<3;++momenta) {
+                            double X,Y,Z;
+                            KNdSMetric::BL_to_KS_spatial(r,theta,phi,sp.a,X,Y,Z);
+                            // Off-null momenta as well: RK stages leave the null cone.
+                            ks.push_back(KSSample{float(X),float(Y),float(Z),-1.f,
+                                .3f-.4f*momenta,-.6f+.5f*momenta,.2f+.3f*momenta,1.f,sp.a,sp.Q});
+                        }
+        id<MTLBuffer> ksIn=[device newBufferWithBytes:ks.data()
+            length:ks.size()*sizeof(KSSample) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ksOut=[device newBufferWithLength:ks.size()*6*sizeof(float)
+            options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> ksCmd=[queue commandBuffer];
+        id<MTLComputeCommandEncoder> ksEnc=[ksCmd computeCommandEncoder];
+        if(!ksIn || !ksOut || !ksEnc) {std::cerr<<"Metal allocation failed\n";return 1;}
+        [ksEnc setComputePipelineState:ksPipeline];
+        [ksEnc setBuffer:ksIn offset:0 atIndex:0];
+        [ksEnc setBuffer:ksOut offset:0 atIndex:1];
+        [ksEnc dispatchThreads:MTLSizeMake(ks.size(),1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        [ksEnc endEncoding];[ksCmd commit];[ksCmd waitUntilCompleted];
+        if(ksCmd.status!=MTLCommandBufferStatusCompleted) {std::cerr<<"GPU execution failed\n";return 1;}
+        const float* ksValues=static_cast<const float*>(ksOut.contents);
+        int ksFailures=0;double ksWorst=0;
+        for(size_t i=0;i<ks.size();++i) {
+            const auto& s=ks[i];
+            KNdSMetric metric(s.M,s.a,s.Q,0.0);
+            const double p[4]={s.pT,s.pX,s.pY,s.pZ};
+            double gu[4][4];metric.contravariant_KS(0,s.X,s.Y,s.Z,true,gu);
+            auto H=[&](double X,double Y,double Z){return metric.hamiltonian_KS(0,X,Y,Z,p,true);};
+            auto derivative=[](auto f,double x,double h) {
+                return (-f(x+2*h)+8*f(x+h)-8*f(x-h)+f(x-2*h))/(12*h);
+            };
+            const double hX=1e-4*(std::abs(double(s.X))+.1), hY=1e-4*(std::abs(double(s.Y))+.1),
+                         hZ=1e-4*(std::abs(double(s.Z))+.1);
+            double expected[6];
+            for(int c=0;c<3;++c) expected[c]=gu[c+1][0]*p[0]+gu[c+1][1]*p[1]+gu[c+1][2]*p[2]+gu[c+1][3]*p[3];
+            expected[3]=-derivative([&](double x){return H(x,s.Y,s.Z);},s.X,hX);
+            expected[4]=-derivative([&](double y){return H(s.X,y,s.Z);},s.Y,hY);
+            expected[5]=-derivative([&](double z){return H(s.X,s.Y,z);},s.Z,hZ);
+            for(int c=0;c<6;++c) {
+                const double actual=ksValues[6*i+c];
+                const double scaled=std::abs(actual-expected[c])/(1+std::abs(expected[c]));
+                ksWorst=std::max(ksWorst,scaled);
+                if(!std::isfinite(actual) || scaled>3e-5) {
+                    if(ksFailures<8) std::cerr<<"KS RHS mismatch sample="<<i<<" component="<<c
+                        <<" gpu="<<actual<<" reference="<<expected[c]<<'\n';
+                    ++ksFailures;
+                }
+            }
+        }
+        std::cout<<"Metal KS RHS: "<<ks.size()<<" states, "<<ksFailures
+                 <<" failed components; max scaled error="<<ksWorst<<'\n';
+        return (failures||ksFailures)?1:0;
     }
 }
