@@ -214,6 +214,7 @@ static int run_cli(int argc, char** argv) {
         if (arg=="--disk-blackbody")    cp.palette = DiskPalette::BLACKBODY;
         if (arg=="--disk-stratified")   cp.palette = DiskPalette::STRATIFIED;
         if (arg=="--disk-interstellar") cp.palette = DiskPalette::INTERSTELLAR;
+        if (arg=="--legacy-noise")      cp.legacy_noise_hash = true;
         if (arg=="--disk-nasa") cp.palette = DiskPalette::INTERSTELLAR_NASA;
         if (arg=="--disk-nasa-symmetric") {
             cp.palette = DiskPalette::INTERSTELLAR_NASA;

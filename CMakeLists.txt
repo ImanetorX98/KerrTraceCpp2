@@ -296,6 +296,12 @@ if(BUILD_TESTING)
         add_test(NAME kerrtrace.metal_rhs COMMAND kerrtrace_metal_rhs_test
             ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
         set_tests_properties(kerrtrace.metal_rhs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        add_executable(kerrtrace_metal_noise_test tests/metal_noise_regression.mm)
+        target_compile_options(kerrtrace_metal_noise_test PRIVATE -O2)
+        target_link_libraries(kerrtrace_metal_noise_test PRIVATE "-framework Metal" "-framework Foundation")
+        add_test(NAME kerrtrace.metal_noise COMMAND kerrtrace_metal_noise_test
+            ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
+        set_tests_properties(kerrtrace.metal_noise PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         add_executable(kerrtrace_metal_shader_test tests/metal_shader_test.mm)
         target_link_libraries(kerrtrace_metal_shader_test PRIVATE
             "-framework Metal" "-framework Foundation")

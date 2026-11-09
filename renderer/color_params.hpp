@@ -39,6 +39,9 @@ struct ColorParams {
     double temp_redshift_floor = 0.2;
     double disk_brightness = 1.0; // common accretion-disk brightness multiplier
     double disk_opacity = 1.0; // common disk opacity [0,1], shared by all palettes
+    // Interstellar/NASA texture noise: false = integer lattice hash (same bits on
+    // CPU and Metal), true = the pre-v0.3 sin hash, CPU only, for older frames.
+    bool   legacy_noise_hash = false;
     DiskPalette palette    = DiskPalette::BLACKBODY;
     int    disk_rings      = 7;    // number of radial rings in stratified mode
     int    disk_sectors    = 14;   // number of azimuthal sectors in stratified mode

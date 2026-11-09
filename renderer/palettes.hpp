@@ -296,8 +296,30 @@ static double fract01(double x) {
     return x - std::floor(x);
 }
 
+// Pre-v0.3 lattice hash, kept behind --legacy-noise to reproduce older frames.
+// The result is the low digits of 43758*sin(...), so it hangs on the last bits of
+// the sine: float and double disagree on ~80% of lattice points, and the Metal
+// disk got different veins and edges from the CPU one.
 static double hash2d(double x, double y, double seed) {
     return fract01(std::sin(x * 127.1 + y * 311.7 + seed) * 43758.5453123);
+}
+
+// PCG output permutation (Jarzynski & Olano 2020). Integer arithmetic only, so
+// lattice_hash_f in tracer.metal returns the same bits as this function.
+static inline uint32_t pcg_hash(uint32_t v) {
+    const uint32_t s = v * 747796405u + 2891336453u;
+    const uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+// x, y and seed are integer-valued (lattice corners and the fbm seeds). The top
+// 24 bits become a value in [0,1) that a float holds exactly.
+static double lattice_hash(double x, double y, double seed) {
+    const uint32_t ix = (uint32_t)(int32_t)x;
+    const uint32_t iy = (uint32_t)(int32_t)y;
+    const uint32_t is = (uint32_t)(int32_t)seed;
+    const uint32_t h = pcg_hash(ix + pcg_hash(iy + pcg_hash(is)));
+    return (double)(h >> 8) * (1.0 / 16777216.0);
 }
 
 static double value_noise2d(double x, double y, double seed) {
@@ -326,7 +348,7 @@ static double value_noise2d(double x, double y, double seed) {
 // and untiled lattice noise reads a completely unrelated value across it. That
 // was the vertical seam through the disk.
 static double value_noise2d_tiled(double x, double y, double seed,
-                                  int per_x, int per_y) {
+                                  int per_x, int per_y, bool legacy) {
     const double ix = std::floor(x), iy = std::floor(y);
     const double fx = x - ix,        fy = y - iy;
     const double ux = fx * fx * (3.0 - 2.0 * fx);
@@ -340,7 +362,8 @@ static double value_noise2d_tiled(double x, double y, double seed,
         return m;
     };
     auto H = [&](double gx, double gy) {
-        return hash2d(wrap(gx, per_x), wrap(gy, per_y), seed);
+        const double wx = wrap(gx, per_x), wy = wrap(gy, per_y);
+        return legacy ? hash2d(wx, wy, seed) : lattice_hash(wx, wy, seed);
     };
 
     const double n00 = H(ix, iy),       n10 = H(ix + 1.0, iy);
@@ -352,12 +375,12 @@ static double value_noise2d_tiled(double x, double y, double seed,
 
 // Each octave doubles the frequency, so its period in lattice cells doubles too.
 static double fbm2d_tiled(double x, double y, double seed, int octaves,
-                          int per_x, int per_y) {
+                          int per_x, int per_y, bool legacy) {
     double sum = 0.0, amp = 0.5, freq = 1.0, norm = 0.0;
     for (int i = 0; i < octaves; ++i) {
         const int px = (per_x > 0) ? int(std::lround(per_x * freq)) : 0;
         const int py = (per_y > 0) ? int(std::lround(per_y * freq)) : 0;
-        sum += amp * value_noise2d_tiled(x * freq, y * freq, seed + 17.0 * i, px, py);
+        sum += amp * value_noise2d_tiled(x * freq, y * freq, seed + 17.0 * i, px, py, legacy);
         norm += amp;
         freq *= 2.0;
         amp *= 0.5;
@@ -387,8 +410,8 @@ static double interstellar_disk_soft_mask(double r, double phi,
 
     // phi_norm already wraps into [0,1); the noise must wrap with it, or the
     // disk's inner and outer edges step at the branch cut.
-    const double edgeInNoise = 2.0 * fbm2d_tiled(phi_norm * 3.0, t * 0.10, 11.0, 4, 3, 0) - 1.0;
-    const double edgeOutNoise = 2.0 * fbm2d_tiled(phi_norm * 2.0, t * 0.07, 29.0, 4, 2, 0) - 1.0;
+    const double edgeInNoise = 2.0 * fbm2d_tiled(phi_norm * 3.0, t * 0.10, 11.0, 4, 3, 0, cp.legacy_noise_hash) - 1.0;
+    const double edgeOutNoise = 2.0 * fbm2d_tiled(phi_norm * 2.0, t * 0.07, 29.0, 4, 2, 0, cp.legacy_noise_hash) - 1.0;
 
     const double rin_local = r_in * (1.0 + 0.03 * edgeInNoise);
     const double rout_local = r_out * (1.0 + 0.06 * edgeOutNoise);
@@ -439,8 +462,8 @@ static RGB disk_colour_interstellar(double r, double phi,
     // cells per revolution: 2*pi*8 = 50.3 becomes 50 and 2*pi*25 = 157.1 becomes
     // 157, so the texture tiles with essentially the same visual scale as before.
     const double phit_w = fract01(phit / (2.0 * M_PI));
-    const double n1 = 2.0 * fbm2d_tiled(r * 1.2, phit_w * 50.0, 41.0, 5, 0, 50) - 1.0;
-    const double n2 = 2.0 * fbm2d_tiled(r * 5.0, phit_w * 157.0 + 2.0 * n1, 73.0, 4, 0, 157) - 1.0;
+    const double n1 = 2.0 * fbm2d_tiled(r * 1.2, phit_w * 50.0, 41.0, 5, 0, 50, cp.legacy_noise_hash) - 1.0;
+    const double n2 = 2.0 * fbm2d_tiled(r * 5.0, phit_w * 157.0 + 2.0 * n1, 73.0, 4, 0, 157, cp.legacy_noise_hash) - 1.0;
     const double turb_str = cp.interstellar_turbulence_strength;
     const double turbulence = 0.75 + turb_str * (0.35 * n1 + 0.12 * n2);
 
@@ -525,7 +548,7 @@ static RGB disk_colour_interstellar_nasa(double r, double phi,
     // cut. v0.2.29 tiled the shared soft mask and the Interstellar turbulence but
     // missed this one, which is why the seam survived in NASA frames.
     const double phit_w = fract01(phit / (2.0 * M_PI));
-    const double n1 = 2.0 * fbm2d_tiled(r * 0.7, phit_w * 31.0, 41.0, 3, 0, 31) - 1.0;
+    const double n1 = 2.0 * fbm2d_tiled(r * 0.7, phit_w * 31.0, 41.0, 3, 0, 31, cp.legacy_noise_hash) - 1.0;
     const double turb_str = cp.interstellar_turbulence_strength;
     const double turbulence = 0.88 + turb_str * 0.18 * n1;
 

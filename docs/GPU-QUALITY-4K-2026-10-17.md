@@ -95,3 +95,39 @@ differenze a cinque punti in double su 720 stati KS (a da −0,9 a 0,95, r da
 L'errore residuo sul disco (chiazze uguali in KS e BL) è ombreggiatura
 Interstellar, non traiettoria. Gli hash Metal di `render_fingerprint` nei casi
 KS cambiano: vanno registrati di nuovo.
+
+## Aggiornamento 9 novembre: hash del rumore su interi
+
+Le chiazze sul disco venivano dall'hash del reticolo del rumore,
+`fract(sin(x·127.1 + y·311.7 + seed)·43758.5453)`: il risultato sono le cifre
+basse di un seno moltiplicato per 43 758, cioè proprio le cifre che float e
+double non condividono. Su CPU e GPU il valore differiva nel 77–83 % dei punti
+del reticolo, quindi venature e bordo sfumato del disco Interstellar erano
+disegni diversi sui due backend.
+
+Ora entrambi usano `pcg_hash` (Jarzynski & Olano 2020) su indici interi, e i 24
+bit alti diventano il valore in [0,1): aritmetica intera, stessi bit ovunque.
+`kerrtrace.metal_noise` lo verifica su 164 864 punti del reticolo (negativi,
+avvolti, grandi, tutti i seed delle palette): 0 differenze, fbm entro 1,5·10⁻⁷.
+Con il vecchio hash sin nello shader lo stesso test fallisce su 164 845 punti.
+
+Stessa scena, cielo nero (così l'errore misurato è solo del disco), CPU a
+tolleranza 1e-9:
+
+| pixel 4K con errore > | hash sin | hash su interi |
+|---|---:|---:|
+| 2 | 977 725 | 165 |
+| 8 | 230 798 | 24 |
+| 16 | 49 547 | 22 |
+| 48 | 601 | 21 |
+| errore medio per canale | 0,674 | 0,003 |
+
+I 21 pixel residui stanno sul bordo anteriore del disco visto quasi di taglio:
+differenza di traiettoria, non di ombreggiatura. Grana senza quei pixel: 1,003.
+
+Il disegno della turbolenza cambia anche sulla CPU (stesse statistiche, venature
+in posti diversi). Per riprodurre i frame precedenti: `--legacy-noise`, solo CPU
+(il pianificatore manda la palette Interstellar alla CPU quando è attivo); il
+frame 4K di riferimento rifatto con `--legacy-noise` è identico bit per bit a
+quello del vecchio binario. L'hash `cell_hash` della palette stratificata usa
+ancora il seno, ma quella palette gira solo sulla CPU.

@@ -155,6 +155,9 @@ Useful flags:
 - `--semi-analytic` / `--elliptic` (legacy alias for `--solver-mode semi-analytic`)
 - `--elliptic-closed` (alias for `--solver-mode elliptic-closed`)
 - `--bg <path>`
+- `--legacy-noise` (CPU only: the pre-v0.3 sin hash for the Interstellar/NASA
+  disk texture, to reproduce older frames; the default integer hash gives the
+  same bits on CPU and Metal)
 - `--4k`, `--2k`, `--720p`, `--custom-res W H`
 
 Experimental note:

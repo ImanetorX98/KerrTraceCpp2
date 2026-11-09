@@ -12,6 +12,8 @@ static const char* metal_cpu_reason(const ColorParams& cp, bool bundles, bool ex
     if (export_geo) return "KGEO export requires the CPU geometry pipeline";
     if (cp.palette == DiskPalette::INTERSTELLAR_NASA || cp.palette == DiskPalette::STRATIFIED)
         return "the selected disk palette requires CPU shading";
+    if (cp.legacy_noise_hash && cp.palette == DiskPalette::INTERSTELLAR)
+        return "--legacy-noise is implemented on the CPU only";
     if (cp.disk_opacity < 1.0 - 1e-9) return "disk transparency requires CPU compositing";
     if (cp.nt_gaussian_taper || cp.planck_emission || cp.radial_ring_taper || cp.zero_torque_taper)
         return "the selected emission/taper controls require CPU shading";

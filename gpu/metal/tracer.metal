@@ -1862,6 +1862,22 @@ static inline float hash2d_f(float x, float y, float seed) {
     return fract01_f(sin(x * 127.1f + y * 311.7f + seed) * 43758.5453123f);
 }
 
+// Mirrors pcg_hash / lattice_hash in renderer/palettes.hpp bit for bit: integer
+// arithmetic only, top 24 bits -> [0,1). The sin hash above stays for the
+// value_noise2d_f / opacity paths; the tiled texture noise uses this one.
+static inline uint pcg_hash(uint v) {
+    const uint s = v * 747796405u + 2891336453u;
+    const uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+static inline float lattice_hash_f(float x, float y, float seed) {
+    const uint ix = uint(int(x));
+    const uint iy = uint(int(y));
+    const uint is = uint(int(seed));
+    const uint h = pcg_hash(ix + pcg_hash(iy + pcg_hash(is)));
+    return float(h >> 8) * (1.0f / 16777216.0f);
+}
+
 static float value_noise2d_f(float x, float y, float seed) {
     const float ix = floor(x);
     const float iy = floor(y);
@@ -1901,7 +1917,7 @@ static float wrap_lattice_f(float v, int period) {
     return m < 0.0f ? m + float(period) : m;
 }
 static float tiled_hash_f(float x, float y, float seed, int px, int py) {
-    return hash2d_f(wrap_lattice_f(x,px), wrap_lattice_f(y,py), seed);
+    return lattice_hash_f(wrap_lattice_f(x,px), wrap_lattice_f(y,py), seed);
 }
 static float value_noise2d_tiled_f(float x, float y, float seed, int px, int py) {
     const float ix=floor(x), iy=floor(y), fx=x-ix, fy=y-iy;
