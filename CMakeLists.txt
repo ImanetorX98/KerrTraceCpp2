@@ -206,6 +206,33 @@ if(APPLE AND NOT USE_METAL)
     message(STATUS "Metal GPU binary: kerr_tracer_metal")
 endif()
 
+# ── Which binary runs which backend ────────────────────────────
+# The Metal-enabled binary is kerr_tracer when USE_METAL=ON and the extra
+# kerr_tracer_metal otherwise, so a file name alone says nothing: a build dir
+# reconfigured from one layout to the other keeps the old executable on disk,
+# and a stale build/kerr_tracer_metal was once measured by mistake. Tests and
+# the render server go through these variables and the manifest below instead.
+set(KERRTRACE_CPU_BACKENDS "cpu")
+if(USE_METAL)
+    list(APPEND KERRTRACE_CPU_BACKENDS "metal")
+    set(KERRTRACE_METAL_TARGET kerr_tracer)
+elseif(APPLE)
+    set(KERRTRACE_METAL_TARGET kerr_tracer_metal)
+endif()
+if(USE_CUDA)
+    list(APPEND KERRTRACE_CPU_BACKENDS "cuda")
+endif()
+list(JOIN KERRTRACE_CPU_BACKENDS "\", \"" _kt_backends_json)
+set(_kt_manifest_entries
+    "    {\"path\": \"$<TARGET_FILE:kerr_tracer>\", \"backends\": [\"${_kt_backends_json}\"]}")
+if(KERRTRACE_METAL_TARGET AND NOT KERRTRACE_METAL_TARGET STREQUAL "kerr_tracer")
+    string(APPEND _kt_manifest_entries
+        ",\n    {\"path\": \"$<TARGET_FILE:${KERRTRACE_METAL_TARGET}>\", \"backends\": [\"cpu\", \"metal\"]}")
+endif()
+# Lists only the executables this configuration builds; read by server/index.js.
+file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/kerrtrace-binaries.json CONTENT
+"{\n  \"version\": \"${PROJECT_VERSION}\",\n  \"binaries\": [\n${_kt_manifest_entries}\n  ]\n}\n")
+
 # ── Tests ───────────────────────────────────────────────────────
 if(BUILD_TESTING)
     add_executable(kerrtrace_contour_metrics_tests tests/contour_metrics_tests.cpp)
@@ -270,6 +297,12 @@ if(BUILD_TESTING)
             $<TARGET_FILE:kerr_tracer> $<TARGET_FILE:kgeo_to_npy>)
         set_tests_properties(kerrtrace.kgeo_npy PROPERTIES TIMEOUT 300)
     endif()
+    find_program(NODE_EXECUTABLE node)
+    if(NODE_EXECUTABLE)
+        add_test(NAME kerrtrace.server_binaries COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/server_binaries_test.js)
+        set_tests_properties(kerrtrace.server_binaries PROPERTIES TIMEOUT 60)
+    endif()
     if(APPLE)
         add_executable(kerrtrace_metal_contour_test tests/metal_contour_regression.mm
             gpu/metal/metal_renderer.mm)
@@ -308,11 +341,12 @@ if(BUILD_TESTING)
         add_test(NAME kerrtrace.metal_shader COMMAND kerrtrace_metal_shader_test
             ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
         set_tests_properties(kerrtrace.metal_shader PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
-        if(TARGET kerr_tracer_metal AND Python3_Interpreter_FOUND)
+        if(KERRTRACE_METAL_TARGET AND Python3_Interpreter_FOUND)
             add_test(NAME kerrtrace.metal_passthrough COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_SOURCE_DIR}/tests/metal_passthrough_regression.py
-                $<TARGET_FILE:kerr_tracer_metal>)
-            set_tests_properties(kerrtrace.metal_passthrough PROPERTIES TIMEOUT 300 LABELS "metal")
+                $<TARGET_FILE:${KERRTRACE_METAL_TARGET}>)
+            set_tests_properties(kerrtrace.metal_passthrough PROPERTIES
+                SKIP_RETURN_CODE 77 TIMEOUT 300 LABELS "metal")
         endif()
     endif()
 endif()

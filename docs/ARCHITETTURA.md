@@ -261,6 +261,13 @@ cmake -B build -DUSE_METAL=ON     && cmake --build build -j8
 ctest --test-dir build_cpu
 ```
 
+**Quale binario ha Metal.** Con `USE_METAL=ON` è `kerr_tracer`; con `USE_METAL=OFF`
+su macOS è il `kerr_tracer_metal` costruito accanto. Una cartella riconfigurata da
+un layout all'altro conserva il vecchio eseguibile: un `build/kerr_tracer_metal`
+fermo da settimane è stato misurato per sbaglio. Ogni build scrive
+`kerrtrace-binaries.json` con i soli binari che costruisce e i loro backend; il
+server (`server/binaries.js`) e i test passano da lì, mai dal nome del file.
+
 **Refactor senza cambi di comportamento**: `tests/render_fingerprint.py` rende
 una ventina di configurazioni piccole (carte, solutori, bundle, palette, Q, Λ,
 wormhole, round trip `.kgeo`) e ne salva gli hash. Baseline col binario prima

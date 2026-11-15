@@ -95,6 +95,11 @@ cmake --build build --parallel
 ./build/kerr_tracer
 ```
 
+Each build directory also gets `kerrtrace-binaries.json`, listing the binaries
+that configuration builds and their backends. The render server picks its
+binaries from these manifests, so an executable left over from an earlier
+configuration is never used.
+
 ### CUDA
 
 ```bash

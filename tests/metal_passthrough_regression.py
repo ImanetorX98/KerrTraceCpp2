@@ -9,7 +9,7 @@ Invariant checked here: the image must barely depend on the step cap. Raising
 it from 5000 to 500000 changed 677 rim pixels before the fix and 2 after (rays
 that genuinely skim the photon orbit), so at most MAX_CHANGED may differ.
 
-usage: metal_passthrough_regression.py <kerr_tracer_metal>
+usage: metal_passthrough_regression.py <Metal-enabled kerr_tracer binary>
 """
 from pathlib import Path
 import re
@@ -20,6 +20,7 @@ import struct
 import zlib
 
 MAX_CHANGED = 10
+SKIP = 77  # CTest SKIP_RETURN_CODE
 
 ROOT = Path(__file__).resolve().parents[1]
 binary = str(Path(sys.argv[1]).resolve())
@@ -75,8 +76,14 @@ def render(max_steps, out_dir):
     if run.returncode != 0 or not saved:
         sys.exit(f'[FAIL] render failed (max_steps={max_steps}): {run.stderr[-400:]}')
     if not backend or backend[-1] != 'gpu-metal':
-        print(f'[SKIP] Metal not used (backend={backend[-1] if backend else "?"})')
-        sys.exit(0)
+        # Skip only when the machine has no Metal GPU. Any other CPU fallback
+        # (a CPU-only binary, a planner change) means the shader went untested:
+        # exiting 0 there let CTest count a frame the GPU never drew as a pass.
+        if 'No Metal-capable GPU found' in run.stderr + run.stdout:
+            print('[SKIP] no Metal-capable GPU on this machine')
+            sys.exit(SKIP)
+        sys.exit(f'[FAIL] Metal not used (backend={backend[-1] if backend else "?"}); '
+                 f'pass a Metal-enabled binary')
     target = Path(out_dir) / f'steps_{max_steps}.png'
     Path(saved[-1]).replace(target)
     return target.read_bytes()

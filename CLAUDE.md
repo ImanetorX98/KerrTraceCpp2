@@ -305,6 +305,10 @@ Option (b) is already in effect via the fallback guard.
 ### Build notes (2026-04-24)
 - CPU binary: `cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu`
 - Metal binary: `cmake -B build -DUSE_METAL=ON && cmake --build build`
+- Which binary has Metal: `kerr_tracer` when `USE_METAL=ON`, `kerr_tracer_metal`
+  when `USE_METAL=OFF` on macOS. A reconfigured dir keeps the other layout's old
+  executable on disk, so check `build*/kerrtrace-binaries.json` (written by CMake,
+  lists only what that configuration builds); the server picks binaries from it.
 - tracer.metal is loaded at runtime from `exeDir/../gpu/metal/tracer.metal`, i.e.
   **the source file**, not the copy in the build dir (`metal_renderer.mm:49`).
   The `build/tracer.metal` copy made by `configure_file` is only the fallback,
