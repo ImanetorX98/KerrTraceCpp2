@@ -10,7 +10,12 @@ Record a baseline with the binary built before the change, then compare:
 
 Hashes are only comparable between builds on the same machine and compiler
 flags (-march=native, Metal driver). Set FAST=1 to skip the slow
-semi-analytic case. Rendered PNGs are kept next to the JSON for inspection.
+semi-analytic case, in both runs: --compare wants the same set of cases.
+Rendered PNGs are kept next to the JSON for inspection.
+
+The comparison is strict (see compare()): a missing case, a failed render
+(even one that failed the same way twice) and a change of backend all count
+as mismatches. Without --compare the exit code is non-zero if any case failed.
 """
 import hashlib, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
@@ -66,6 +71,35 @@ def run_case(binary, name, args, work):
         res['err'] = (r.stderr[-400:] + r.stdout[-400:])
     return res
 
+META = '__meta__'
+
+def case_failed(res):
+    return res.get('rc') != 0 or not res.get('png')
+
+def compare(base, results):
+    """Every way the two runs differ, as human-readable strings; empty = match.
+
+    Strict on purpose: a case missing from either run, a failed render (rc != 0
+    or no PNG, even when both runs failed alike) and a frame that moved to
+    another backend are all problems, not silent matches.
+    """
+    problems = []
+    names = (set(base) | set(results)) - {META}
+    for k in sorted(names):
+        if k not in results:
+            problems.append(f'{k}: missing from this run'); continue
+        if k not in base:
+            problems.append(f'{k}: not in the baseline'); continue
+        b, r = base[k], results[k]
+        for label, res in (('baseline', b), ('this run', r)):
+            if case_failed(res):
+                problems.append(f"{k}: failed in {label} (rc={res.get('rc')}, png={res.get('png')})")
+        if b.get('png') != r.get('png'):
+            problems.append(f"{k}: hash {b.get('png')} -> {r.get('png')}")
+        if b.get('backend') != r.get('backend'):
+            problems.append(f"{k}: backend {b.get('backend')} -> {r.get('backend')}")
+    return problems
+
 def main():
     binary, out = str(Path(sys.argv[1]).resolve()), sys.argv[2]
     work = Path(out).with_suffix('')
@@ -88,11 +122,21 @@ def main():
     else:
         results['color_only'] = {'rc': r.returncode, 'png': None, 'err': r.stderr[-400:]}
     print('geo_only', results['geo_only'], 'color_only', results['color_only'].get('png'))
+    results[META] = {'fast': bool(os.environ.get('FAST')), 'binary': binary}
     json.dump(results, open(out, 'w'), indent=1)
+    failed = [k for k, v in results.items() if k != META and case_failed(v)]
+    if failed:
+        print('FAILED CASES:', failed)
     if '--compare' in sys.argv:
         base = json.load(open(sys.argv[sys.argv.index('--compare') + 1]))
-        bad = [k for k in base if k in results and base[k].get('png') != results[k].get('png')]
-        print('MISMATCH:' if bad else 'ALL MATCH', bad)
+        if base.get(META, {}).get('fast') != results[META]['fast']:
+            print('Note: FAST differs between the runs, so semi_analytic is missing on one side.')
+        bad = compare(base, results)
+        print('MISMATCH:' if bad else 'ALL MATCH')
+        for line in bad:
+            print('  ' + line)
         sys.exit(1 if bad else 0)
+    sys.exit(1 if failed else 0)
 
-main()
+if __name__ == '__main__':
+    main()

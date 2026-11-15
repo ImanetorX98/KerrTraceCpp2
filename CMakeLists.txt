@@ -296,6 +296,9 @@ if(BUILD_TESTING)
             ${CMAKE_SOURCE_DIR}/tests/kgeo_npy_regression.py
             $<TARGET_FILE:kerr_tracer> $<TARGET_FILE:kgeo_to_npy>)
         set_tests_properties(kerrtrace.kgeo_npy PROPERTIES TIMEOUT 300)
+        add_test(NAME kerrtrace.fingerprint_compare COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/render_fingerprint_compare_test.py)
+        set_tests_properties(kerrtrace.fingerprint_compare PROPERTIES TIMEOUT 30)
     endif()
     find_program(NODE_EXECUTABLE node)
     if(NODE_EXECUTABLE)
