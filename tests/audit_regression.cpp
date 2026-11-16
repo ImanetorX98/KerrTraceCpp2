@@ -74,12 +74,51 @@ void io_tests() {
     KGeoMeta meta{2,2,1,.5,0,0,4.233,4.233,12,80,0,40};
     std::vector<GeoPixel> pixels(4),loaded;KGeoMeta read{};
     pixels[0].outcome=1;pixels[0].r=8;pixels[0].redshift=.8;
-    save_kgeo(path.c_str(),pixels,meta);
-    check(load_kgeo(path.c_str(),loaded,read) && loaded.size()==4 && loaded[0].r==8,"KGEO valid round-trip");
+    KGeoProvenance made;made.complete=true;made.set("spacetime","knds");made.set("metric.a",.5);
+    made.set("camera.fov_deg",30.0);made.set("solver.chart","bl");
+    save_kgeo(path.c_str(),pixels,meta,made);
+    KGeoProvenance got;
+    check(load_kgeo(path.c_str(),loaded,read,&got) && loaded.size()==4 && loaded[0].r==8,"KGEO valid round-trip");
+    check(got.complete && got.find("metric.a") && *got.find("metric.a")=="0.5"
+          && got.find("camera.fov_deg") && *got.find("solver.chart")=="\"bl\""
+          && got.find("kgeo_version") && *got.find("kgeo_version")=="5"
+          && got.find("record_size") && *got.find("record_size")=="64",
+          "KGEO v5 keeps the provenance and declares format, record size and schema");
+    {
+        // Version 4: same records, KGeoMeta right after the version, no provenance.
+        std::ofstream f(path,std::ios::binary);const uint32_t v4=4;
+        f.write(KGEO_MAGIC,4);f.write(reinterpret_cast<const char*>(&v4),4);
+        f.write(reinterpret_cast<const char*>(&meta),sizeof(meta));
+        f.write(reinterpret_cast<const char*>(pixels.data()),std::streamsize(4*sizeof(GeoPixel)));
+    }
+    got=KGeoProvenance{};got.complete=true;
+    check(load_kgeo(path.c_str(),loaded,read,&got) && loaded[0].r==8 && !got.complete,
+          "KGEO v4 still loads, with provenance declared incomplete");
+    // Patch one header word of a valid v5 file and expect a refusal.
+    auto patched=[&](size_t offset,uint32_t value) {
+        save_kgeo(path.c_str(),pixels,meta,made);
+        std::fstream f(path,std::ios::in|std::ios::out|std::ios::binary);
+        f.seekp(std::streamoff(offset));f.write(reinterpret_cast<const char*>(&value),4);
+    };
+    patched(8,0x04030201u);check(!load_kgeo(path.c_str(),loaded,read),"KGEO v5 rejects the other byte order");
+    patched(16,60);check(!load_kgeo(path.c_str(),loaded,read),"KGEO v5 rejects another record size");
+    patched(20,80);check(!load_kgeo(path.c_str(),loaded,read),"KGEO v5 rejects another KGeoMeta size");
+    patched(12,200);check(!load_kgeo(path.c_str(),loaded,read),"KGEO v5 rejects an inconsistent header length");
+    patched(4,6);check(!load_kgeo(path.c_str(),loaded,read),"KGEO rejects unknown versions");
+    {
+        // Same size, different meaning: swap two field names in the schema.
+        save_kgeo(path.c_str(),pixels,meta,made);
+        std::fstream f(path,std::ios::in|std::ios::out|std::ios::binary);
+        std::string all((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
+        const size_t at=all.find("theta_esc:f4");
+        check(at!=std::string::npos,"KGEO v5 schema lists the GeoPixel fields");
+        f.seekp(std::streamoff(at));f.write("theta_ESC",9);
+    }
+    check(!load_kgeo(path.c_str(),loaded,read),"KGEO v5 rejects a schema that differs from GeoPixel");
     auto raw_header=[&](uint32_t w,uint32_t h) {
-        meta.W=w;meta.H=h;
+        meta.W=w;meta.H=h;const uint32_t v4=4;
         std::ofstream f(path,std::ios::binary);f.write(KGEO_MAGIC,4);
-        f.write(reinterpret_cast<const char*>(&KGEO_VERSION),4);
+        f.write(reinterpret_cast<const char*>(&v4),4);
         f.write(reinterpret_cast<const char*>(&meta),sizeof(meta));
     };
     raw_header(65536,65536);
@@ -89,10 +128,10 @@ void io_tests() {
     {std::ofstream f(path,std::ios::binary);f.write("KGEO",4);}
     check(!load_kgeo(path.c_str(),loaded,read),"KGEO rejects truncated header");
     meta.W=meta.H=2;
-    save_kgeo(path.c_str(),pixels,meta);
+    save_kgeo(path.c_str(),pixels,meta,made);
     {std::ofstream f(path,std::ios::app|std::ios::binary);f.put('x');}
     check(!load_kgeo(path.c_str(),loaded,read),"KGEO rejects unexpected trailing records");
-    bool failed=false;try{save_kgeo((dir/"missing/file.kgeo").string().c_str(),pixels,meta);}catch(const std::exception&){failed=true;}
+    bool failed=false;try{save_kgeo((dir/"missing/file.kgeo").string().c_str(),pixels,meta,made);}catch(const std::exception&){failed=true;}
     check(failed,"KGEO writing propagates filesystem errors");
     failed=false;try{std::vector<RGB> rgb(4);write_png((dir/"missing/frame.png").string().c_str(),rgb,2,2);}catch(const std::exception&){failed=true;}
     check(failed,"PNG writing propagates filesystem errors");

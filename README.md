@@ -237,6 +237,13 @@ The v0.2.34 corrections and reproducible before/after frames are documented in
 [the audit validation report](docs/FIXES-2026-09-09.md). Existing v4 KGEO files
 remain readable; retrace old geometry to obtain the corrected observer redshift.
 
+KGEO v5 files describe themselves: byte order, record size, field schema and a
+provenance block (metric or wormhole, camera, solver, tolerances, code
+revision, and the colour settings that decide which rays pass through the
+disk). `--color-only` warns when the current palette or those settings differ
+from the ones the geometry was traced with. v4 files load with provenance
+marked incomplete.
+
 ## CI
 
 GitHub Actions workflow: `.github/workflows/ci.yml`

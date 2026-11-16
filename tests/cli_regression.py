@@ -67,4 +67,25 @@ with tempfile.TemporaryDirectory(prefix='kerrtrace-cli-') as directory:
     check(run.returncode != 0 and 'Geo saved:' not in run.stdout,
           'invalid output path does not produce a success message')
 
+    # A .kgeo records the visibility settings it was traced with; --color-only
+    # warns when they differ, and stays quiet when they match.
+    geo = root / 'interstellar.kgeo'
+    run = subprocess.run([binary, '--custom-res', '32', '18', '--a', '.5', '--max-steps', '2000',
+                          '--disk-interstellar', '--geo-only', '--geo-file', str(geo)],
+                         capture_output=True, text=True, timeout=60)
+    check(run.returncode == 0 and geo.exists(), 'geometry-only trace writes a .kgeo')
+    def recolor(*extra):
+        return subprocess.run([binary, *extra, '--color-only', str(geo)],
+                              capture_output=True, text=True, timeout=60)
+    run = recolor('--disk-interstellar')
+    check(run.returncode == 0 and 'Warning' not in run.stderr,
+          'recolouring with the traced settings gives no warning')
+    run = recolor()
+    check(run.returncode == 0 and 'traced with palette "interstellar", now "blackbody"' in run.stderr,
+          'recolouring with another palette warns that the geometry is the old one')
+    run = recolor('--disk-interstellar', '--disk-interstellar-edge-transparency', '0.2')
+    check(run.returncode == 0 and 'visibility.interstellar_edge_transparency is 0.2' in run.stderr
+          and 'traced with 0.02' in run.stderr,
+          'recolouring with another rim transparency names the setting')
+
 sys.exit(bool(failures))
