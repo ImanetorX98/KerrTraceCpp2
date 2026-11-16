@@ -16,15 +16,16 @@ It includes CPU and GPU backends, plus a basic web UI.
   - Metal (`gpu/metal`) on macOS
   - CUDA (`gpu/cuda`) on NVIDIA platforms
 - CLI renderer + Node/Angular UI
-- CI + tests (`core` + bump detector)
+- Regression tests for physics, bundles, CLI/I/O, CPU/CUDA math and Metal
 
 ## Repository Layout
 
-- `main.cpp`: CLI, render pipeline, backend dispatch
+- `main.cpp`: entry point; the renderer lives in `renderer/` (CLI, render pipeline, tracers, backend planning)
 - `knds_metric.hpp`: metric and chart transforms
 - `geodesic.hpp`: Hamiltonian RHS and integrators
 - `camera.hpp`: camera model and initial ray setup
 - `ray_bundle.hpp`: Jacobi/ray-bundle machinery
+- `render_data.hpp`: shared geometry records and validated KGEO I/O
 - `gpu/metal/*`: Metal backend
 - `gpu/cuda/*`: CUDA backend
 - `frontend/`, `server/`: web UI and API layer
@@ -94,6 +95,11 @@ cmake --build build --parallel
 ./build/kerr_tracer
 ```
 
+Each build directory also gets `kerrtrace-binaries.json`, listing the binaries
+that configuration builds and their backends. The render server picks its
+binaries from these manifests, so an executable left over from an earlier
+configuration is never used.
+
 ### CUDA
 
 ```bash
@@ -154,6 +160,9 @@ Useful flags:
 - `--semi-analytic` / `--elliptic` (legacy alias for `--solver-mode semi-analytic`)
 - `--elliptic-closed` (alias for `--solver-mode elliptic-closed`)
 - `--bg <path>`
+- `--legacy-noise` (CPU only: the pre-v0.3 sin hash for the Interstellar/NASA
+  disk texture, to reproduce older frames; the default integer hash gives the
+  same bits on CPU and Metal)
 - `--4k`, `--2k`, `--720p`, `--custom-res W H`
 
 Experimental note:
@@ -169,8 +178,18 @@ Experimental note:
 - Metal dispatch is adaptive-tiled for high resolutions (2K/4K). You can
   override tile rows with `KERR_METAL_TILE_ROWS=<n>` when tuning stability
   vs throughput.
-- `--bundles` on Metal is GPU-native for BL + `standard` solver (finite-
-  difference bundle proxy). Other bundle configurations fall back to CPU.
+- `--bundles` on Metal uses the CPU Jacobi pipeline, including disk/sky
+  footprints and edge coverage. The older GPU bundle proxy lacks those filters.
+- Metal also falls back to CPU for NASA/stratified palettes, KGEO export,
+  transparency and emission controls absent from the shader. `Backend used:`
+  reports the backend that completed the frame, including runtime fallbacks.
+- CUDA traces geometry in double precision and shares CPU colorization and
+  backgrounds. Its native path supports opaque blackbody, standard RK4, BL/KS
+  and pure Kerr. Other configurations use an explicit CPU fallback.
+- CPU scientific builds preserve NaN/Inf checks; Metal defaults to safe math.
+  Redshift uses the finite static observer defined by the camera.
+- Failed encoding preserves frames and returns an error. Successful encoding
+  removes only the consumed frames, preserving other files in `--frames-dir`.
 - Kernel entrypoints are selectable:
   - `auto` (default): picks `single` or `bundle` by mode
   - `unified`: legacy all-in-one kernel (`trace_pixel`)
@@ -196,6 +215,24 @@ cmake -S . -B build -DBUILD_TESTING=ON
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
+
+On macOS the suite includes shader compilation and actual Metal/CPU render
+comparisons. These tests report **Skipped** if no Metal device is accessible.
+The user-circled Metal BL outer-edge step is corrected with analytic Hamiltonian
+forces and a polar step limit. Its local discrepancy falls from 5 to 1 pixel at
+640×360 and from 9 to 0 at 1280×720. The expanded contour matrix passes 102/108
+checks; 2-pixel residuals on the thin inner ring remain in KS and high-resolution
+BL, so the full contour test still fails. The other 11 tests pass, including a
+native GPU force comparison against independent double-precision derivatives.
+See [the correction and before/after validation](docs/METAL-BUMP-FIX-2026-09-09.md).
+A skipped GPU test is not validation of the contour.
+
+CUDA math and the actual tracing function also run as host C++ tests, but this
+does not replace compiling with NVCC and testing on NVIDIA hardware.
+
+The v0.2.34 corrections and reproducible before/after frames are documented in
+[the audit validation report](docs/FIXES-2026-09-09.md). Existing v4 KGEO files
+remain readable; retrace old geometry to obtain the corrected observer redshift.
 
 ## CI
 

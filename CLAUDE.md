@@ -21,7 +21,8 @@ Leggilo prima di esplorare il sorgente: evita di rileggere 12 000 righe.
 | `geodesic.hpp` | Hamiltonian RHS, adaptive RK4 (step-doubling) |
 | `camera.hpp` | BL camera, pixel→(α,β)→initial state, `angle_ray()` |
 | `ray_bundle.hpp` | Jacobi-field bundle: Hessian(H), variational equations, magnification |
-| `main.cpp` | Render loop, backend dispatch, PPM output |
+| `main.cpp` | Entry point only: stb implementations + `main()` |
+| `renderer/*.hpp` | The CPU renderer: CLI, phase 1/2, tracers, palettes, backend planner (see `docs/ARCHITETTURA.md`) |
 | `gpu/metal/tracer.metal` | MSL compute shader (one thread = one pixel) |
 | `gpu/metal/metal_renderer.hpp/.mm` | Objective-C++ Metal bridge |
 | `gpu/cuda/tracer.cu/.cuh` | CUDA kernel + host launcher |
@@ -78,10 +79,10 @@ Two adaptive integrators (`enum class Integrator` in `geodesic.hpp`):
 | Flag | Enum | Method | RHS evals/step | Notes |
 |------|------|--------|----------------|-------|
 | *(default)* | `RK4_DOUBLING` | RK4 + Richardson step-doubling | 12 | Simple, robust |
-| `--dopri5`  | `DOPRI5` | Dormand-Prince RK45 | 6 (FSAL→5 net) | `ode45` standard |
+| `--dopri5`  | `DOPRI5` | Dormand-Prince RK45 | 7 first, 6 with FSAL | `ode45` standard |
 
-DOPRI5 Butcher tableau: 6 stages, embedded 4th/5th order pair, error = `‖y5−y4‖`.
-FSAL: `k7 = f(y5)` reused as `k1` of the next step → 5 net evaluations per accepted step.
+DOPRI5 Butcher tableau: 7 stages, embedded 4th/5th order pair, error = `‖y5−y4‖`.
+FSAL: `k7 = f(y5)` reused as `k1` of the next step → 6 new evaluations per subsequent accepted step; rejected trials add evaluations.
 RK4-doubling: 1 full step + 2 half steps, Richardson factor = 2⁴−1 = 15.
 
 ### Ray bundles
@@ -93,8 +94,11 @@ Reference: James et al. (2015) CQG 32 065001.
 
 ### Disk redshift
 Full formula (Bardeen 1972):
-`g = ν_obs/ν_emit = √(−g_tt−2g_tφΩ−g_φφΩ²) / (1−Ω·b)`
-where `b = p_φ/(−p_t)` and `Ω_K = √M/(r^{3/2}+a√M)`.
+`g = ν_obs/ν_emit = u_obs^t · √(−g_tt−2g_tφΩ−g_φφΩ²) / (1−Ω·b)`
+where `b = p_φ/(−p_t)`, `u_obs^t = 1/√(−g_tt_obs)` for the static camera,
+and corotating Kerr `Ω_K = s√M/(r^{3/2}+|a|√M)`, with `s = −1` for `a<0`, otherwise `+1`.
+The KNdS implementation uses metric derivatives for the general circular orbit.
+The observer-at-infinity approximation is recovered when `u_obs^t → 1`.
 
 ---
 
@@ -232,7 +236,7 @@ parameter dispatch and image delivery, which simplifies integration.
 | `interactive/render_scheduler.hpp` | New: async multi-pass dispatch |
 | `interactive/ui.hpp` | New: Dear ImGui sidebar layout |
 | `gpu/metal/tracer.metal` | Add `phi_bg_offset` uniform to `CameraParams_C` |
-| `main.cpp` | Add `--interactive` flag dispatching to `InteractiveWindow::run()` |
+| `renderer/cli.hpp` | Add `--interactive` flag dispatching to `InteractiveWindow::run()` |
 
 ---
 
@@ -260,47 +264,41 @@ parameter dispatch and image delivery, which simplifies integration.
 
 ## Known Issues & Ongoing Work
 
-### elliptic-closed solver — Region III bug (2026-04-26)
+### elliptic-closed solver — fixed 2026-11-16 (audit B2)
 
-**Status**: Root cause fully identified. Fallback guard in place; ~53% fallback rate at
-default a=0.998 (near-extremal). Correct images produced; performance is suboptimal.
+The April diagnosis ("GL B75 evaluates r on a post-bounce leg") was wrong. The
+real causes, all fixed on CPU and Metal, each covered by `kerrtrace.elliptic` /
+`kerrtrace.metal_elliptic` (mutation-checked):
+- `ellint_F_incomplete` ignored the amplitude quadrant: F(pi-phi) returned F(phi)
+  instead of 2K-F(phi). Region III starts from acos(x3) > pi/2, so its map put the
+  photon ~59 M inside the camera at tau=0.
+- The radial quartic is made monic by dividing by E^2; the radial frequencies did
+  not restore the factor E, so r(tau) ran in a different Mino time from theta(tau)
+  (hit radii off by ~1.7% at E~0.98).
+- Metal only: `jacobi_sn_cn_from_u` did not flip cn for u in (2K,4K), and the FP32
+  Durand-Kerner, started from a conjugate-symmetric set, could not split two close
+  real roots (Region I/II taken for Region III). Starts are now radius*w^k on both.
+- Plunging photons (no turning point outside 1.03 r+): the map continues past the
+  horizon to an inner bounce or a pole. `elliptic_mino_time_to_cut` gives the Mino
+  time to reach the cut; a crossing after it falls back to numerical.
 
-**Symptom (original)**: enlarged black shadow, secondary image missing.
-**Fix applied (2026-04-24)**: guard `if (r_now < mp.r1) return fallback` rejects hits in
-the inner inaccessible region. This fixed the visual corruption.
+Result at 1280x720, a=0.998, blackbody: CPU elliptic vs numerical BL 66 693 -> 3
+pixels (>2 levels); Metal elliptic 116 715 -> 23 (Metal standard BL itself: 40).
+`direct-radial-invalid` fallbacks 76 988 -> 29 306; total fallback 73% -> 69%, the
+rest is sky rays (`direct-outside-disk`) that always trace numerically.
 
-**Remaining efficiency problem**: ~23 000 rays per 1920×1080 frame hit
-`r_now < rh_cut` (rh_cut = 1.03·r₊) and fall back to numerical.
-
-**Root cause of the 23k fallback rays (diagnosed 2026-04-26)**:
-These are **Region III** photons (2 real + 2 complex roots, both real roots inside r₊).
-The GL B75 radial formula for Region III computes r on the **hypothetical post-bounce
-leg**: in BL/GL coordinates the inner turning point r_hi is inside r₊, so the formula
-treats the photon as bouncing at r_hi and returning outward.  In reality these photons
-cross θ=π/2 **before reaching the horizon**, giving a genuine disk hit at r ≈ 2–2.4M.
-The GL formula evaluates r at τ_first on the (unphysical) outgoing leg, returning
-r ≈ 1.09M (sub-horizon) — completely wrong.
-
-**Confirmed**: diagnostic run showed 100% (5001/5001) of sub-horizon Region III rays
-give DISK_HIT (not HORIZON) under both BL and KS numerical tracers.
-
-**Guard in place**: `if (r_now < rh_cut) return fallback_trace(DIRECT_RADIAL_INVALID)`
-(lines ~1263 in `trace_single_elliptic_closed`) with explanatory comment.  This is
-correct and safe; do not replace it with a direct HORIZON return.
-
-**Correct long-term fix**:
-For Region III where r_hi < r₊, the GL B75 formula is only reliable for r > r_hi on
-the *ingoing* leg.  Properly handling these rays requires either:
-(a) Detecting when τ_first corresponds to the outgoing leg and computing τ_first for
-    the actual ingoing disk crossing instead, or
-(b) Switching to direct numerical integration for all Region III photons.
-Option (b) is already in effect via the fallback guard.
-
-**Standard renders confirmed correct** at both a=0.5 and a=0.998 (near-extremal).
+Still in place, to remove only after validation: the `r_now < rh_cut` guard, and
+the numerical re-trace of every direct disk hit for horizon precedence (now never
+overrides a hit in the tests, so it is pure cost). Not done: later crossings
+(`tau_period` unused), phi at the hit (non-blackbody palettes fall back).
 
 ### Build notes (2026-04-24)
 - CPU binary: `cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu`
 - Metal binary: `cmake -B build -DUSE_METAL=ON && cmake --build build`
+- Which binary has Metal: `kerr_tracer` when `USE_METAL=ON`, `kerr_tracer_metal`
+  when `USE_METAL=OFF` on macOS. A reconfigured dir keeps the other layout's old
+  executable on disk, so check `build*/kerrtrace-binaries.json` (written by CMake,
+  lists only what that configuration builds); the server picks binaries from it.
 - tracer.metal is loaded at runtime from `exeDir/../gpu/metal/tracer.metal`, i.e.
   **the source file**, not the copy in the build dir (`metal_renderer.mm:49`).
   The `build/tracer.metal` copy made by `configure_file` is only the fallback,

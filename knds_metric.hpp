@@ -342,9 +342,12 @@ public:
             double gLL[4][4];
             covariant_BL(rr, M_PI/2.0, gLL);
             double N2 = -(gLL[0][0] + 2.0*gLL[0][3]*Omega_K + gLL[3][3]*Omega_K*Omega_K);
-            if (N2 <= 0.0) return -1e30;
+            if (!(N2 > 0.0)) return std::numeric_limits<double>::quiet_NaN();
             double ut = 1.0/std::sqrt(N2);
-            return (gLL[3][0] + gLL[3][3]*Omega_K)*ut;
+            // L changes sign under (a, phi) -> (-a, -phi). Locate the
+            // minimum of the angular momentum along the corotating orbit.
+            const double orientation = (a < 0.0) ? -1.0 : 1.0;
+            return orientation * (gLL[3][0] + gLL[3][3]*Omega_K)*ut;
         };
         double L_prev  = L_circ(r);
         double dL_prev = 0.0;
@@ -355,7 +358,7 @@ public:
             dL_prev = dL;
             L_prev  = L;
         }
-        return r;  // fallback
+        return std::numeric_limits<double>::quiet_NaN(); // no stable circular orbit found
     }
 
     /// Prograde Keplerian Ω_K  (equatorial, circular orbit)
@@ -392,6 +395,30 @@ public:
             ? (-dg_tph + sq) / dg_phph
             : (-dg_tph - sq) / dg_phph;
         return -Omega_K;  // convention: disk_redshift uses Omega = -keplerian_omega
+    }
+
+    /// Clock normalization of the static observer used by Camera.
+    double static_observer_ut(double r, double theta) const {
+        double metric[4][4];
+        covariant_BL(r, theta, metric);
+        const double lapse2 = -metric[0][0];
+        return lapse2 > 0.0 ? 1.0/std::sqrt(lapse2)
+                            : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    /// Invariant nu_obs/nu_emit, using the observer's measured photon frequency.
+    double disk_frequency_shift(double r, double pt, double pphi,
+                                double observer_frequency) const {
+        const double omega = -keplerian_omega(r);
+        double metric[4][4];
+        covariant_BL(r, M_PI/2.0, metric);
+        const double d2 = -(metric[0][0] + 2.0*metric[0][3]*omega
+                            + metric[3][3]*omega*omega);
+        const double ut = 1.0/std::sqrt(std::max(d2, 1e-8));
+        const double emitted_frequency = -(pt + omega*pphi)*ut;
+        const double shift = observer_frequency/std::max(emitted_frequency, 1e-8);
+        if (!std::isfinite(shift)) return 0.0;
+        return std::max(0.0, std::min(shift, 6.0));
     }
 
     // ── BL ↔ KS Cartesian coordinate transforms (Λ=0) ─────────

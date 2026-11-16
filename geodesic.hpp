@@ -20,8 +20,7 @@
 //
 //  DOPRI5        — Dormand-Prince RK45 (same as MATLAB ode45).
 //                  Embedded 4th/5th order pair; error = y5 − y4.
-//                  6 RHS evals per step (FSAL: last k reused as
-//                  first k of next step → effectively 5 net evals).
+//                  7 RHS evals on the first step, then 6 with FSAL.
 //                  More efficient for smooth geodesics far from BH.
 // ============================================================
 #include "knds_metric.hpp"
@@ -279,16 +278,13 @@ inline bool rk4_adaptive(const KNdSMetric& g, GeodesicState& s,
 //  Returns true when step accepted; dlam updated in place.
 //  The caller must pass in k1 (= f at start of step) and receives
 //  k7_out (= f at accepted end) to feed as k1 of the next call.
-//  On first call set k1_fsal = {NaN,…} to trigger recomputation.
+//  On first call use a default-constructed (invalid) cache.
 
 // v[0]=dr  v[1]=dθ  v[2]=dp_r  v[3]=dp_θ  v[4]=dφ
 struct Vec4d {
-    double v[5];
-    static Vec4d nan_init() {
-        Vec4d x;
-        x.v[0]=x.v[1]=x.v[2]=x.v[3]=x.v[4]=std::numeric_limits<double>::quiet_NaN();
-        return x;
-    }
+    double v[5] = {};
+    bool valid = false; // explicit FSAL state; never use a NaN as control flow
+    static Vec4d invalid() { return {}; }
 };
 
 inline void eval_rhs(const KNdSMetric& g, const GeodesicState& s,
@@ -296,6 +292,8 @@ inline void eval_rhs(const KNdSMetric& g, const GeodesicState& s,
     geodesic_rhs(g, s.r, s.theta, s.pr, s.ptheta, s.pt, s.pphi,
                  k.v[0], k.v[1], k.v[2], k.v[3]);
     k.v[4] = dphi_vel(g, s.r, s.theta, s.pt, s.pphi);
+    k.valid = true;
+    for (double value : k.v) k.valid = k.valid && std::isfinite(value);
 }
 
 // Advance state by weighted sum of stages (includes φ via v[4])
@@ -317,7 +315,7 @@ inline bool dopri5_adaptive(const KNdSMetric& g, GeodesicState& s,
                              double tol = 1e-7) {
     // k1: reuse FSAL from previous step if valid
     Vec4d k1;
-    if (!std::isnan(k1_fsal.v[0])) {
+    if (k1_fsal.valid) {
         k1 = k1_fsal;
     } else {
         eval_rhs(g, s, k1);
@@ -392,7 +390,7 @@ inline bool dopri5_adaptive(const KNdSMetric& g, GeodesicState& s,
     if (!std::isfinite(err)) {
         h = (std::isfinite(h) && h > 1e-10) ? h * 0.5 : 1e-6;
         if (h < 1e-10) h = 1e-10;
-        k1_fsal.v[0] = std::numeric_limits<double>::quiet_NaN();
+        k1_fsal.valid = false;
         return false;
     }
 
@@ -415,7 +413,7 @@ inline bool dopri5_adaptive(const KNdSMetric& g, GeodesicState& s,
         double hnew = h * 0.9 * std::pow(1.0/err, 0.25);
         if (!std::isfinite(hnew)) hnew = h * 0.5;
         h = std::max(hnew, 1e-10);
-        k1_fsal.v[0] = std::numeric_limits<double>::quiet_NaN(); // force recompute
+        k1_fsal = k1; // rejected step leaves the starting state unchanged
     }
     return accepted;
 }
@@ -426,7 +424,7 @@ enum class Integrator { RK4_DOUBLING, DOPRI5 };
 // Unified adaptive step: hides the FSAL bookkeeping from callers
 // that just want a drop-in replacement for rk4_adaptive().
 // For DOPRI5 the caller must keep a persistent `fsal` Vec4d,
-// initialised with NaN to signal "no previous step yet".
+// default-constructed to signal "no previous step yet".
 inline bool adaptive_step(const KNdSMetric& g, GeodesicState& s,
                            double& h, Integrator intg,
                            Vec4d& fsal,        // only used by DOPRI5

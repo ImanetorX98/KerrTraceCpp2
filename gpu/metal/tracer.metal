@@ -16,13 +16,10 @@ constant float ADAPT_H_MIN = 1e-6f;
 constant float ADAPT_H_MAX = 50.0f;
 constant float ADAPT_ERR_TINY_DOPRI = 1e-12f;
 constant float ADAPT_ERR_TINY_RK4 = 1e-10f;
-// This shader is float32 throughout. Asking for a tolerance tighter than the
-// precision can express buys no accuracy at all -- measured against the float64
-// CPU renderer, tol=1e-7 and tol=1e-5 both land ~17/255 mean pixel difference,
-// because the residual is float32 itself, not truncation. It only shrinks the
-// step: ~99,500 accepted steps per ray instead of a few hundred, i.e. 103s
-// instead of 1.2s for an 854x480 frame. Floor the requested tolerance so the
-// CPU-side default of 1e-7 cannot drive the GPU integrator into that regime.
+// Error estimates subtract FP32 RK stage values. Retain a relative tolerance
+// floor so the CPU default (1e-7) does not demand differences at the scale of
+// state-rounding noise. Analytic BL forces remove finite-difference noise;
+// state advancement and event localization still use single precision.
 constant float ADAPT_TOL_MIN_F32 = 1e-5f;
 
 // ── Adaptive step-size helpers (shared by every integrator here) ──────────
@@ -119,6 +116,12 @@ struct CameraParams {
     int   interstellar_physical_profile; // 1 = Novikov-Thorne flux, 0 = artistic power law
     int   bundle_magnif_luma;   // 0 = off (physical), 1 = modulate luminance by 1/magnification
     float bundle_magnif_max;    // soft ceiling of that factor
+    float temp_scale;
+    float doppler_exp;
+    int   temp_redshift_clamp;
+    float temp_redshift_floor;
+    float observer_ut;
+    float interstellar_inner_taper_scale;
 };
 
 struct RenderParams {
@@ -202,14 +205,41 @@ static void geodesic_rhs(float r, float theta,
     dth_out = gu[2][2]*pth;
     dphi_out = gu[3][0]*pt + gu[3][3]*pphi;
 
-    const float er  = 1e-5f*(abs(r)+0.1f);
-    const float eth = 1e-6f;
+    // Differentiate H = N/(2 Sigma) analytically. Subtracting two FP32
+    // Hamiltonians at theta +/- 1e-6 loses the force in cancellation noise.
+    // Keep the N*dSigma term: RK stages need the off-null Hamiltonian too.
+    const float st = sin(theta), ct = cos(theta);
+    const float st2 = st*st, a2 = a*a;
+    const float sig = r*r + a2*ct*ct;
+    const float delta = Delta_r(r,M,a,Q,L);
+    const float polar = Delta_th(theta,a,L);
+    const float xi = Xi(a,L), xi2 = xi*xi;
+    const float A = r*r + a2;
+    const float B = A*pt + a*pphi;
+    const float delta_r = 2.0f*r*(1.0f-L*r*r/3.0f)
+                        - 2.0f*L*r*A/3.0f - 2.0f*M;
+    const float polar_th = -2.0f*L*a2*ct*st/3.0f;
+    float radial_num = B*B;
+    float polar_num, polar_num_th;
+    if (st2 > 1e-10f) {
+        const float C = a*st*pt + pphi/st;
+        polar_num = C*C;
+        polar_num_th = 2.0f*C*ct*(a*pt-pphi/st2);
+    } else {
+        // Match gUU's existing g^{phi phi}=0 guard at the singular BL axis.
+        radial_num -= a2*pphi*pphi;
+        polar_num = a2*st2*pt*pt + 2.0f*a*pt*pphi;
+        polar_num_th = 2.0f*a2*st*ct*pt*pt;
+    }
+    const float N = delta*pr*pr + polar*pth*pth
+                  + xi2*(polar_num/polar-radial_num/delta);
+    const float Nr = delta_r*pr*pr + xi2*(radial_num*delta_r/(delta*delta)
+                                                   -4.0f*r*pt*B/delta);
+    const float Nth = polar_th*pth*pth + xi2*(polar_num_th/polar
+                                           -polar_num*polar_th/(polar*polar));
+    dpr_out = -(Nr - N*(2.0f*r/sig))/(2.0f*sig);
+    dpth_out = -(Nth + N*(2.0f*a2*ct*st/sig))/(2.0f*sig);
 
-    dpr_out  = -(hamiltonian(r+er, theta, pr, pth, pt, pphi, M, a, Q, L)
-               - hamiltonian(r-er, theta, pr, pth, pt, pphi, M, a, Q, L)) / (2.0f*er);
-
-    dpth_out = -(hamiltonian(r, theta+eth, pr, pth, pt, pphi, M, a, Q, L)
-               - hamiltonian(r, theta-eth, pr, pth, pt, pphi, M, a, Q, L)) / (2.0f*eth);
 }
 
 // RK4 step
@@ -748,15 +778,44 @@ static void geodesic_rhs_KS(float X, float Y, float Z,
     dY = guu[2][0]*pT + guu[2][1]*pX + guu[2][2]*pY + guu[2][3]*pZ;
     dZ = guu[3][0]*pT + guu[3][1]*pX + guu[3][2]*pY + guu[3][3]*pZ;
 
-    const float eX = 1e-5f*(abs(X)+0.1f);
-    const float eY = 1e-5f*(abs(Y)+0.1f);
-    const float eZ = 1e-5f*(abs(Z)+0.1f);
-    dpX = -(hamiltonian_KS(X+eX, Y, Z, pT, pX, pY, pZ, M, a, Q)
-          - hamiltonian_KS(X-eX, Y, Z, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eX);
-    dpY = -(hamiltonian_KS(X, Y+eY, Z, pT, pX, pY, pZ, M, a, Q)
-          - hamiltonian_KS(X, Y-eY, Z, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eY);
-    dpZ = -(hamiltonian_KS(X, Y, Z+eZ, pT, pX, pY, pZ, M, a, Q)
-          - hamiltonian_KS(X, Y, Z-eZ, pT, pX, pY, pZ, M, a, Q)) / (2.0f*eZ);
+    // Force -dH/dx, analytic. H = (eta p p - F S^2)/2 with F = (2Mr - Q^2)/rho^2 and
+    // S = l^a p_a, so dp_i = F_i S^2/2 + F S S_i. Central differences of two FP32
+    // Hamiltonians lost most of their digits to cancellation (up to 9% force error,
+    // grainy lensed sky); the BL forces had the same fix on 2026-09-09. Guards match
+    // gUU_KS so the force and the velocity above describe the same Hamiltonian.
+    const float r    = r_KS(X, Y, Z, a);
+    const float rr   = max(r*r, 1e-12f);
+    const float rg   = max(r, 1e-6f);
+    const float a2   = a*a;
+    const float Z2   = Z*Z;
+    const float rho2 = rr + a2*Z2/rr;
+    const float A    = rr + a2;
+    const float F    = (2.0f*M*r - Q*Q) / rho2;
+    const float l1   = (r*X + a*Y) / A;
+    const float l2   = (r*Y - a*X) / A;
+    const float l3   = Z / rg;
+    const float S    = -pT + l1*pX + l2*pY + l3*pZ;
+
+    // r(X,Y,Z) is implicit in r^4 - (R^2 - a^2) r^2 - a^2 Z^2 = 0, which gives
+    // dr/dX = rX/rho^2, dr/dY = rY/rho^2, dr/dZ = Z (r^2 + a^2)/(r rho^2).
+    const float dr[3] = {r*X/rho2, r*Y/rho2, Z*A/(rg*rho2)};
+    const float rho2_r = 2.0f*r - 2.0f*a2*Z2/(rr*rg);   // d rho^2 / dr at fixed Z
+    float force[3];
+    for (int i = 0; i < 3; ++i) {
+        const float dri    = dr[i];
+        const float drho2  = rho2_r*dri + ((i == 2) ? 2.0f*a2*Z/rr : 0.0f);
+        const float dF     = (2.0f*M*dri - F*drho2) / rho2;
+        const float dN1    = dri*X + ((i == 0) ? r : 0.0f) + ((i == 1) ? a : 0.0f);
+        const float dN2    = dri*Y + ((i == 1) ? r : 0.0f) - ((i == 0) ? a : 0.0f);
+        const float dl1    = (dN1 - l1*2.0f*r*dri) / A;
+        const float dl2    = (dN2 - l2*2.0f*r*dri) / A;
+        const float dl3    = (((i == 2) ? 1.0f : 0.0f) - l3*dri) / rg;
+        const float dS     = pX*dl1 + pY*dl2 + pZ*dl3;
+        force[i] = 0.5f*dF*S*S + F*S*dS;
+    }
+    dpX = force[0];
+    dpY = force[1];
+    dpZ = force[2];
 }
 
 static void rk4_KS(thread float& X, thread float& Y, thread float& Z,
@@ -1109,19 +1168,22 @@ static float carlson_rf(float x, float y, float z) {
     return NAN;
 }
 
-static float ellint_F_incomplete(float phi, float m) {
-    const float s = sin(phi);
-    const float c = cos(phi);
-    const float x = c*c;
-    const float y = 1.0f - m*s*s;
-    if (y <= 0.0f) return NAN;
-    const float rf = carlson_rf(x, y, 1.0f);
-    return s * rf;
-}
-
 static float ellint_K_complete(float m) {
     if (!(m >= 0.0f && m < 1.0f)) return NAN;
     return carlson_rf(0.0f, 1.0f - m, 1.0f);
+}
+
+// F(phi|m) for any real amplitude: F(phi + n*pi) = 2nK + F(phi). Mirrors the CPU.
+static float ellint_F_incomplete(float phi, float m) {
+    const float n = rint(phi / M_PI_F);
+    const float p = phi - n * M_PI_F;            // in [-pi/2, pi/2]
+    const float s = sin(p);
+    const float c = cos(p);
+    const float y = 1.0f - m*s*s;
+    if (y <= 0.0f) return NAN;
+    const float principal = s * carlson_rf(c*c, y, 1.0f);
+    if (n == 0.0f) return principal;
+    return 2.0f * n * ellint_K_complete(m) + principal;
 }
 
 static float jacobi_sn2_from_u(float u, float m, float Kc) {
@@ -1152,12 +1214,13 @@ static Cx eval_monic_quartic(float b0, float b1, float b2, float b3, Cx z) {
 static void quartic_roots_monic_complex(float b0, float b1, float b2, float b3,
                                         thread Cx roots_out[4]) {
     const float radius = 1.0f + max(max(abs(b0), abs(b1)), max(abs(b2), abs(b3)));
-    Cx z[4] = {
-        cx_make( radius, 0.0f),
-        cx_make(0.0f,  radius),
-        cx_make(-radius, 0.0f),
-        cx_make(0.0f, -radius)
-    };
+    // Starts at radius * w^k, w = (0.4 + 0.9i)/|0.4 + 0.9i|. A start set symmetric
+    // about the real axis stays symmetric under the iteration for real
+    // coefficients, so its conjugate pair can never split into two real roots.
+    const Cx w = cx_make(0.40613847f, 0.91381155f);
+    Cx z[4];
+    z[0] = cx_make(radius, 0.0f);
+    for (int k = 1; k < 4; ++k) z[k] = cx_mul(z[k-1], w);
 
     for (int it = 0; it < 96; ++it) {
         float max_delta = 0.0f;
@@ -1213,8 +1276,9 @@ static bool jacobi_sn_cn_from_u(float u, float m, float Kc,
     float sn = sin(phi);
     float cn = cos(phi);
 
+    // sn(2K - u) = sn(u), cn(2K - u) = -cn(u); sn(u + 2K) = -sn(u), cn(u + 2K) = -cn(u).
     if ((quadrant & 1) != 0) cn = -cn;
-    if ((quadrant & 2) != 0) sn = -sn;
+    if ((quadrant & 2) != 0) { sn = -sn; cn = -cn; }
 
     sn_out = sn;
     cn_out = cn;
@@ -1331,6 +1395,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
     const float c1 = 2.0f*c.M*Kpot;
     const float c0 = A0*A0 - c.a*c.a*Kpot;
 
+    // Monic quartic R/E^2: radial frequencies carry a factor E (same Mino time as theta).
     Cx roots[4];
     quartic_roots_monic_complex(0.0f, c2/c4, c1/c4, c0/c4, roots);
 
@@ -1371,7 +1436,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
 
         const float den_omega = (out.r1 - out.r3) * (out.r2 - out.r4);
         if (!(den_omega > 0.0f)) return false;
-        out.omega = 0.5f * sqrt(den_omega);
+        out.omega = c.E * 0.5f * sqrt(den_omega);
 
         const float k_den = (out.r2 - out.r4) * (out.r1 - out.r3);
         if (!(k_den > 0.0f)) return false;
@@ -1441,7 +1506,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
         out.B = B;
         out.m = k3;
         out.Kc = K3;
-        out.omega = sqrt(A * B);
+        out.omega = c.E * sqrt(A * B);
         out.X0 = F0;
         out.phase_sign = (dr0 >= 0.0f) ? +1 : -1;
         out.tau_sign = +1;
@@ -1507,7 +1572,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
         out.radial_case = ELLIPTIC_REGION_IV_COMPLEX4;
         out.m = k4;
         out.Kc = K4;
-        out.omega = 0.5f * (C + D);
+        out.omega = c.E * 0.5f * (C + D);
         out.X0 = F0;
         out.phase_sign = +1;
         out.tau_sign = (dr0 >= 0.0f) ? +1 : -1;
@@ -1571,6 +1636,31 @@ static bool first_equator_crossing_mino_time(thread const SeparableConsts& c,
     return isfinite(tau_first);
 }
 
+// Mino time for a plunging photon to reach r_cut, +inf if it turns back
+// outside it. Without a turning point beyond the cut the map continues past the
+// horizon to an inner bounce or a pole and back out. Mirrors the CPU.
+static float elliptic_mino_time_to_cut(thread const EllipticRadialMap& mp, float r0,
+                                       float dr0, float r_cut) {
+    const bool outer_turn = mp.radial_case != ELLIPTIC_REGION_IV_COMPLEX4
+                         && mp.r1 >= r_cut;
+    if (dr0 >= 0.0f || outer_turn || r0 <= r_cut) return INFINITY;
+
+    float Xc = NAN;
+    if (mp.radial_case == ELLIPTIC_REGION_I_II_REAL4) {
+        const float u = ((r_cut - mp.r1) / (r_cut - mp.r2)) * ((mp.r2 - mp.r4) / (mp.r1 - mp.r4));
+        if (u >= 0.0f && u <= 1.0f) Xc = ellint_F_incomplete(asin(sqrt(u)), mp.m);
+    } else if (mp.radial_case == ELLIPTIC_REGION_III_REAL2_COMPLEX2) {
+        const float x3 = (mp.A * (r_cut - mp.r_lo) - mp.B * (r_cut - mp.r_hi))
+                       / (mp.A * (r_cut - mp.r_lo) + mp.B * (r_cut - mp.r_hi));
+        Xc = ellint_F_incomplete(acos(clamp(x3, -1.0f, 1.0f)), mp.m);
+    } else {
+        // The roots sum to zero (no cubic term), so the other pair's centre is -b1.
+        Xc = ellint_F_incomplete(atan((r_cut + mp.b1) / mp.a2) + atan(mp.g0), mp.m);
+    }
+    const float tau = (mp.X0 - Xc) / mp.omega;
+    return (isfinite(tau) && tau > 0.0f) ? tau : NAN;
+}
+
 // Returns: 0=inconclusive, 1=horizon, 2=disk
 static int elliptic_closed_first_hit(thread const SeparableConsts& c,
                                      float r0, float theta0, float dr0, float dtheta0,
@@ -1597,6 +1687,8 @@ static int elliptic_closed_first_hit(thread const SeparableConsts& c,
     // For Region I/II and III, require the crossing radius to stay in the
     // observer-accessible outer branch. Region IV has no real turning points.
     if (mp.radial_case != ELLIPTIC_REGION_IV_COMPLEX4 && r_now < mp.r1) return 0;
+    // A plunging photon reaches the horizon cut before the equator.
+    if (!(tau_first < elliptic_mino_time_to_cut(mp, r0, dr0, r_horizon * 1.03f))) return 0;
     if (r_now < r_horizon * 1.03f) return 0;
     if (r_now > r_escape) return 0;
     if (r_now >= r_isco && r_now <= r_disk_out) {
@@ -1634,8 +1726,8 @@ static float physical_nt_flux_proxy_raw_f(float r, float r_isco, float a, Camera
     const float r32 = max(r_safe * sqrt(max(r_safe, 1.0e-8f)), 1.0e-8f);
     const float a2 = a * a;
     const float A = 1.0f - 2.0f / max(r_safe, 1.0e-8f) + a2 / max(r2, 1.0e-8f);
-    const float B = 1.0f - 3.0f / max(r_safe, 1.0e-8f) + 2.0f * a / r32;
-    const float C = 1.0f - 4.0f * a / r32 + 3.0f * a2 / max(r2, 1.0e-8f);
+    const float B = 1.0f - 3.0f / max(r_safe, 1.0e-8f) + 2.0f * abs(a) / r32;
+    const float C = 1.0f - 4.0f * abs(a) / r32 + 3.0f * a2 / max(r2, 1.0e-8f);
     const float zero_torque = (cp.radial_term_zero_torque != 0)
         ? clamp(1.0f - sqrt(clamp(r_isco / max(r_safe, 1.0e-8f), 0.0f, 1.0f)), 0.0f, 1.0f)
         : 1.0f;
@@ -1682,16 +1774,16 @@ static float tonemap_ch(float x, float exposure, float gamma) {
     return pow(clamp(x, 0.0f, 1.0f), 1.0f / gamma);
 }
 
-static inline float doppler_intensity_scale(float redshift, int enable_doppler) {
+static inline float doppler_intensity_scale(float redshift, int enable_doppler, float exponent) {
     if (enable_doppler == 0) return 1.0f;
     // Physical g: >1 approaching side → use g^4 directly.
-    return pow(clamp(redshift, 0.01f, 10.0f), 4.0f);
+    return pow(clamp(redshift, 0.01f, 10.0f), exponent);
 }
 
 // Mirrors magnif_luma_scale() in main.cpp: off by default, because Liouville's
 // theorem makes the observed surface brightness g^4 times the emitted one,
 // independent of the bundle footprint.
-static inline float magnif_luma_scale_f(float magnif, constant CameraParams_C& cp) {
+static inline float magnif_luma_scale_f(float magnif, CameraParams cp) {
     if (cp.bundle_magnif_luma == 0) return 1.0f;
     const float cap = max(0.05f, cp.bundle_magnif_max);
     return clamp(1.0f / max(magnif, 1e-12f), 0.05f, cap);
@@ -1700,7 +1792,7 @@ static inline float magnif_luma_scale_f(float magnif, constant CameraParams_C& c
 static inline float robust_disk_redshift(float r_hit,
                                          float pt_cov,
                                          float pphi_cov,
-                                         float M, float a, float Q, float L) {
+                                         float M, float a, float Q, float L, float observer_ut) {
     // Frequency-shift factor used by colour pipeline.
     constexpr float kRadicandFloor = 1e-8f;
     constexpr float kDenomFloor = 1e-8f;
@@ -1713,7 +1805,7 @@ static inline float robust_disk_redshift(float r_hit,
     // Covariant momenta form: -u^t (p_t + Omega p_phi) = u^t (E - Omega L).
     const float denom = -(pt_cov * ut + pphi_cov * Omega * ut);
     const float denom_safe = max(denom, kDenomFloor);
-    const float g_factor = (-pt_cov) / denom_safe;
+    const float g_factor = (-pt_cov) * observer_ut / denom_safe;
     if (!isfinite(g_factor)) return 1.0f;
     return clamp(g_factor, 0.0f, kRedMax);
 }
@@ -1803,6 +1895,22 @@ static inline float hash2d_f(float x, float y, float seed) {
     return fract01_f(sin(x * 127.1f + y * 311.7f + seed) * 43758.5453123f);
 }
 
+// Mirrors pcg_hash / lattice_hash in renderer/palettes.hpp bit for bit: integer
+// arithmetic only, top 24 bits -> [0,1). The sin hash above stays for the
+// value_noise2d_f / opacity paths; the tiled texture noise uses this one.
+static inline uint pcg_hash(uint v) {
+    const uint s = v * 747796405u + 2891336453u;
+    const uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+static inline float lattice_hash_f(float x, float y, float seed) {
+    const uint ix = uint(int(x));
+    const uint iy = uint(int(y));
+    const uint is = uint(int(seed));
+    const uint h = pcg_hash(ix + pcg_hash(iy + pcg_hash(is)));
+    return float(h >> 8) * (1.0f / 16777216.0f);
+}
+
 static float value_noise2d_f(float x, float y, float seed) {
     const float ix = floor(x);
     const float iy = floor(y);
@@ -1836,6 +1944,38 @@ static float fbm2d_f(float x, float y, float seed, int octaves) {
     return (norm > 0.0f) ? (sum / norm) : 0.0f;
 }
 
+static float wrap_lattice_f(float v, int period) {
+    if (period <= 0) return v;
+    float m = fmod(v, float(period));
+    return m < 0.0f ? m + float(period) : m;
+}
+static float tiled_hash_f(float x, float y, float seed, int px, int py) {
+    return lattice_hash_f(wrap_lattice_f(x,px), wrap_lattice_f(y,py), seed);
+}
+static float value_noise2d_tiled_f(float x, float y, float seed, int px, int py) {
+    const float ix=floor(x), iy=floor(y), fx=x-ix, fy=y-iy;
+    const float ux=fx*fx*(3.0f-2.0f*fx), uy=fy*fy*(3.0f-2.0f*fy);
+    const float n00=tiled_hash_f(ix,iy,seed,px,py);
+    const float n10=tiled_hash_f(ix+1.0f,iy,seed,px,py);
+    const float n01=tiled_hash_f(ix,iy+1.0f,seed,px,py);
+    const float n11=tiled_hash_f(ix+1.0f,iy+1.0f,seed,px,py);
+    return mix(mix(n00,n10,ux), mix(n01,n11,ux), uy);
+}
+// Each octave doubles the frequency and the lattice period.
+static float fbm2d_tiled_f(float x, float y, float seed, int octaves,
+                          int per_x, int per_y) {
+    float sum = 0.0f, amp = 0.5f, freq = 1.0f, norm = 0.0f;
+    for (int i = 0; i < octaves; ++i) {
+        const int px = (per_x > 0) ? int(round(per_x * freq)) : 0;
+        const int py = (per_y > 0) ? int(round(per_y * freq)) : 0;
+        sum += amp * value_noise2d_tiled_f(x * freq, y * freq, seed + 17.0f * i, px, py);
+        norm += amp;
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return (norm > 0.0f) ? (sum / norm) : 0.0f;
+}
+
 static float interstellar_disk_soft_mask_f(float r, float phi,
                                            float r_in, float r_out,
                                            CameraParams cp) {
@@ -1843,8 +1983,8 @@ static float interstellar_disk_soft_mask_f(float r, float phi,
     const float phi_norm = fract01_f(phi / TWO_PI_F);
     const float t = cp.interstellar_time;
 
-    const float edgeInNoise = 2.0f * fbm2d_f(phi_norm * 3.0f, t * 0.10f, 11.0f, 4) - 1.0f;
-    const float edgeOutNoise = 2.0f * fbm2d_f(phi_norm * 2.0f, t * 0.07f, 29.0f, 4) - 1.0f;
+    const float edgeInNoise = 2.0f * fbm2d_tiled_f(phi_norm * 3.0f, t * 0.10f, 11.0f, 4, 3, 0) - 1.0f;
+    const float edgeOutNoise = 2.0f * fbm2d_tiled_f(phi_norm * 2.0f, t * 0.07f, 29.0f, 4, 2, 0) - 1.0f;
 
     const float rin_local = r_in * (1.0f + 0.03f * edgeInNoise);
     const float rout_local = r_out * (1.0f + 0.06f * edgeOutNoise);
@@ -1907,8 +2047,9 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
             : 1.0f;
         const float profile = radial * inner_glow;
 
-        const float n1 = 2.0f * fbm2d_f(r_hit * 1.2f, phit * 8.0f, 41.0f, 5) - 1.0f;
-        const float n2 = 2.0f * fbm2d_f(r_hit * 5.0f, phit * 25.0f + 2.0f * n1, 73.0f, 4) - 1.0f;
+        const float phit_w = fract01_f(phit / (2.0f * M_PI_F));
+        const float n1 = 2.0f * fbm2d_tiled_f(r_hit * 1.2f, phit_w * 50.0f, 41.0f, 5, 0, 50) - 1.0f;
+        const float n2 = 2.0f * fbm2d_tiled_f(r_hit * 5.0f, phit_w * 157.0f + 2.0f * n1, 73.0f, 4, 0, 157) - 1.0f;
         const float turbulence = 0.75f + cp.interstellar_turbulence_strength * (0.35f * n1 + 0.12f * n2);
 
         const float bands = 1.0f + cp.interstellar_band_strength *
@@ -1932,10 +2073,13 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
 
         const float lens = magnif_luma_scale_f(magnif, cp);
 
-        float intensity = mask * profile * turbulence * bands;
+        const float inner_sigma = max(1e-6f, cp.interstellar_inner_taper_scale * r_in);
+        const float inner_dr = max(0.0f, r_hit - r_in);
+        const float inner_taper = 1.0f - exp(-0.5f * (inner_dr/inner_sigma) * (inner_dr/inner_sigma));
+        float intensity = mask * profile * turbulence * bands * inner_taper;
         // Physical g: >1 approaching side → use g^4 directly.
         const float doppler_scale = (cp.enable_doppler != 0)
-            ? pow(clamp(red, 0.01f, 10.0f), 4.0f)
+            ? pow(clamp(red, 0.01f, 10.0f), cp.doppler_exp)
             : 1.0f;
         intensity *= doppler_scale;
         intensity *= lens;
@@ -1952,10 +2096,12 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
         );
     }
 
-    const float T = 6500.0f * sqrt(6.0f*M/r_hit) * clamp(red, 0.2f, 5.0f);
+    const float red_temperature = cp.temp_redshift_clamp != 0
+        ? clamp(red, cp.temp_redshift_floor, 5.0f) : max(0.0f, red);
+    const float T = 6500.0f * cp.temp_scale * sqrt(6.0f*M/r_hit) * red_temperature;
     float I = disk_flux_norm_f(r_hit, r_isco, a, cp);
     I = max(I, inner_emission_floor_value_f(r_hit, r_isco, r_disk_out, cp));
-    I *= doppler_intensity_scale(red, cp.enable_doppler);
+    I *= doppler_intensity_scale(red, cp.enable_doppler, cp.doppler_exp);
     I *= magnif_luma_scale_f(magnif, cp);
     I *= max(0.0f, cp.disk_brightness);
     const float4 bb = blackbody_rgb(T);
@@ -2055,6 +2201,14 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
 
     const int iter_cap = max(max_steps, 1);
     for (int iter = 0; iter < iter_cap; ++iter) {
+        // An adaptive RK estimate can miss the narrow centrifugal turning
+        // region if all its stages jump across the BL axis. Resolve approach
+        // to a pole before the trial, keeping the actual step for Hermite.
+        if (abs(pphi) > 1e-8f*max(abs(pt),1e-8f)) {
+            const float theta_rate = Delta_th(theta,a,L)*pth/Sigma(r,theta,a);
+            const float polar_step = 0.25f*abs(sin(theta))/max(abs(theta_rate),1e-20f);
+            dlam = min(dlam,max(ADAPT_H_MIN,polar_step));
+        }
         const float step_used = dlam;
         if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L,
                               integrator_mode, integrator_tol)) {
@@ -2092,7 +2246,7 @@ static RayTraceResultBL trace_standard_bl_from_angles(float alpha, float beta,
                     if (disk_tile_pass_through(r_hit, phi_hit, r_isco, r_disk_out, cp_cfg)) {
                         // Keep tracing: this Interstellar tile is intentionally transparent.
                     } else {
-                    const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
+                    const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L, cp_cfg.observer_ut);
 
                     res.r_hit = r_hit;
                     res.redshift = red;
@@ -2319,7 +2473,7 @@ static RayTraceResultBL trace_standard_ks_from_angles(float alpha, float beta,
                     float pr_hit, pth_hit, pphi_hit;
                     KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                       pr_hit, pth_hit, pphi_hit);
-                    const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
+                    const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L, cp_cfg.observer_ut);
 
                     res.r_hit = r_hit;
                     res.redshift = red;
@@ -2616,11 +2770,6 @@ static inline void trace_pixel_impl(
 
     // ── Trace ─────────────────────────────────────────────────
     float r = r0, theta = th0, phi = cp.phi_obs;
-    float dlam = max(cp.step_init, ADAPT_H_MIN);
-    float prev_r = r0;
-    float prev_theta = th0;
-    float prev_phi = phi;
-    float prev_cos = cos(th0);
 
     uint32_t colour = 0xFF000000u;  // black (ABGR)
     const bool can_separable_kerr = (abs(Q) <= 1e-8f) && (abs(L) <= 1e-8f);
@@ -2667,7 +2816,7 @@ static inline void trace_pixel_impl(
                 return;
             }
 
-            const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L);
+            const float red = robust_disk_redshift(r_hit_ell, pt, pphi, M, a, Q, L, cp.observer_ut);
             const float phi_hit_ell = (verify.outcome == 1) ? verify.phi_hit : cp.phi_obs;
             colour = disk_color_abgr(r_hit_ell, phi_hit_ell, red, 1.0f,
                                      M, a, kp.r_isco, kp.r_disk_out, cp);
@@ -2794,7 +2943,7 @@ static inline void trace_pixel_impl(
                             if (disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
                                 continue;
                             }
-                            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
+                            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L, cp.observer_ut);
                             colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
                                                      M, a, kp.r_isco, kp.r_disk_out, cp);
                             done = true;
@@ -2903,15 +3052,16 @@ static inline void trace_pixel_impl(
                         // ph_hit is the KS azimuth: KS_covector_to_BL wants it as
                         // such, everything downstream wants the BL one.
                         const float ph_hit_bl = ph_hit - ks_azimuth_twist(r_hit, a, M, Q);
-                        if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
-                            if (disk_tile_pass_through(r_hit, ph_hit_bl, kp.r_isco, kp.r_disk_out, cp)) {
-                                // Keep tracing: this Interstellar tile is intentionally transparent.
-                                continue;
-                            }
+                        // A transparent Interstellar edge lets the ray through: it must still
+                        // reach the horizon/escape checks and the prev-state update at the end
+                        // of this iteration. A `continue` here skipped both, so the stale prevZ
+                        // re-detected the same crossing every step and the ray ran to max_steps.
+                        if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out &&
+                            !disk_tile_pass_through(r_hit, ph_hit_bl, kp.r_isco, kp.r_disk_out, cp)) {
                             float pr_hit, pth_hit, pphi_hit;
                             KS_covector_to_BL(r_hit, th_hit, ph_hit, a, pXh, pYh, pZh,
                                               pr_hit, pth_hit, pphi_hit);
-                            const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L);
+                            const float red = robust_disk_redshift(r_hit, pT, pphi_hit, M, a, Q, L, cp.observer_ut);
                             colour = disk_color_abgr(r_hit, ph_hit_bl, red, 1.0f,
                                                      M, a, kp.r_isco, kp.r_disk_out, cp);
                             best_alpha = alpha;
@@ -2969,66 +3119,22 @@ static inline void trace_pixel_impl(
         }
     }
 
-    const int std_iter_cap = max(cp.max_steps, 1);
-    for (int iter = 0; iter < std_iter_cap; ++iter) {
-        if (!adaptive_step_bl(r, theta, phi, pr, pth, dlam, pt, pphi, M, a, Q, L,
-                              cp.integrator_mode, cp.integrator_tol)) {
-            continue;
-        }
-
-        if (!(isfinite(r) && isfinite(theta) && isfinite(phi) &&
-              isfinite(pr) && isfinite(pth))) {
-            break;
-        }
-
-        if (r < kp.r_horizon * 1.03f) break;
-        if (r > cp.r_obs * 1.05f) {
-            const float r_escape = cp.r_obs * 1.05f;
-            const float denom = r - prev_r;
-            float w = (abs(denom) > 1e-8f) ? ((r_escape - prev_r) / denom) : 1.0f;
-            w = clamp(w, 0.0f, 1.0f);
-            const float th_esc = prev_theta + w*(theta - prev_theta);
-            const float ph_esc = prev_phi   + w*(phi   - prev_phi);
-            float4 bgc = clamp(sample_background(bg_tex, bg_samp, th_esc, ph_esc), 0.0f, 1.0f);
-            colour = (0xFFu << 24)
-                   | (uint32_t(bgc.b*255.0f) << 16)
-                   | (uint32_t(bgc.g*255.0f) << 8)
-                   |  uint32_t(bgc.r*255.0f);
-            break;
-        }
-
-        const float cos_th = cos(theta);
-        if (prev_cos*cos_th <= 0.0f) {
-            const float denom = prev_cos - cos_th;
-            float w = (abs(denom) > 1e-8f) ? (prev_cos / denom) : 0.5f;
-            w = clamp(w, 0.0f, 1.0f);
-            const float r_hit = prev_r + w*(r - prev_r);
-            const float phi_hit = prev_phi + w*(phi - prev_phi);
-            if (!(r_hit >= kp.r_isco && r_hit <= kp.r_disk_out)) {
-                prev_cos = cos_th;
-                prev_r = r;
-                prev_theta = theta;
-                prev_phi = phi;
-                continue;
-            }
-            if (disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
-                prev_cos = cos_th;
-                prev_r = r;
-                prev_theta = theta;
-                prev_phi = phi;
-                continue;
-            }
-
-            // Disk hit
-            const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L);
-            colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
-                                     M, a, kp.r_isco, kp.r_disk_out, cp);
-            break;
-        }
-        prev_cos = cos_th;
-        prev_r = r;
-        prev_theta = theta;
-        prev_phi = phi;
+    // Use the shared BL event tracer for single rays and numerical fallbacks.
+    // The former duplicate loop always interpolated linearly in cos(theta),
+    // ignoring cp.intersection_mode and bending the disk edge at coarse steps.
+    const RayTraceResultBL result = trace_standard_bl_from_angles(
+        alpha, beta, M, a, Q, L,
+        cp.r_obs, cp.theta_obs, cp.phi_obs,
+        kp.r_horizon, kp.r_isco, kp.r_disk_out,
+        cp.intersection_mode, cp.integrator_mode,
+        cp.max_steps, cp.step_init, cp.integrator_tol, cp);
+    if (result.outcome == 1) {
+        colour = disk_color_abgr(result.r_hit, result.phi_hit, result.redshift, 1.0f,
+                                 M, a, kp.r_isco, kp.r_disk_out, cp);
+    } else if (result.outcome == 0) {
+        const float4 bgc = clamp(sample_background(bg_tex, bg_samp,
+                                                   result.theta_esc, result.phi_esc),0.0f,1.0f);
+        colour = pack_abgr(bgc.r,bgc.g,bgc.b);
     }
 
     output[py * width + px] = colour;

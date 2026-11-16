@@ -49,7 +49,7 @@ bool step_and_check(Integrator intg) {
     Camera cam(40.0, 80.0, 0.0, 45.0, 640, 360);
     GeodesicState s = cam.angle_ray(0.03, -0.02, g);
     double h = 1.0;
-    Vec4d fsal = Vec4d::nan_init();
+    Vec4d fsal = Vec4d::invalid();
 
     bool accepted = false;
     for (int i = 0; i < 32; ++i) {

@@ -10,17 +10,13 @@ const WebSocket  = require('ws');
 const path       = require('path');
 const fs         = require('fs');
 const { spawn, spawnSync } = require('child_process');
+const { MANIFEST, discoverBinaries, pickBinary, newestSourceMtime } = require('./binaries');
 
 const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server, path: '/ws' });
 
 const ROOT         = path.resolve(__dirname, '..');
-const BINARY_MAIN  = path.join(ROOT, 'build', 'kerr_tracer');
-const BINARY_CPU_ONLY = path.join(ROOT, 'build_cpu', 'kerr_tracer');
-const BINARY_METAL_CPU = path.join(ROOT, 'build_cpu', 'kerr_tracer_metal');
-const BINARY_METAL_LEGACY = path.join(ROOT, 'build', 'kerr_tracer_metal');
-const BINARY_CUDA  = path.join(ROOT, 'build', 'kerr_tracer_cuda');
 const OUT_DIR      = path.join(ROOT, 'out');
 const THUMB_DIR    = path.join(OUT_DIR, '.thumbs');
 const QUEUE_STATE_FILE = path.join(OUT_DIR, '.queue_state.json');
@@ -29,30 +25,29 @@ const DEFAULT_BACKGROUND = 'sfondo5.jpg';
 const NAV_BAKES_DIR = path.join(OUT_DIR, 'nav_bakes');
 fs.mkdirSync(NAV_BAKES_DIR, { recursive: true });
 
-function firstExisting(paths) {
-  for (const p of paths) {
-    if (p && fs.existsSync(p)) return p;
-  }
-  return null;
-}
-
-// Prefer dedicated CPU build when available.
-const BINARY_CPU = firstExisting([BINARY_CPU_ONLY, BINARY_MAIN]);
-// Prefer Metal binary built in build_cpu (kept most up-to-date in this workflow).
-const BINARY_METAL = firstExisting([BINARY_METAL_CPU, BINARY_MAIN, BINARY_METAL_LEGACY]);
+// Binaries come from the build manifests, never from file names: see binaries.js.
+const BINARIES     = discoverBinaries(ROOT);
+const BINARY_CPU   = pickBinary(BINARIES, 'cpu');
+const BINARY_METAL = pickBinary(BINARIES, 'metal');
+const BINARY_CUDA  = pickBinary(BINARIES, 'cuda');
 
 function resolveBinary(backend) {
   if (backend === 'metal' && BINARY_METAL) return BINARY_METAL;
-  if (backend === 'cuda'  && fs.existsSync(BINARY_CUDA)) return BINARY_CUDA;
-  if (BINARY_CPU) return BINARY_CPU;
-  return BINARY_MAIN;
+  if (backend === 'cuda'  && BINARY_CUDA)  return BINARY_CUDA;
+  return BINARY_CPU || BINARY_METAL || BINARY_CUDA;
+}
+
+// A path saved with a queued or recent job is reused only while a current
+// manifest still lists it; otherwise the job goes to today's binary.
+function isKnownBinary(p) {
+  return typeof p === 'string' && BINARIES.some(b => b.path === p);
 }
 
 function availableBackends() {
   const b = [];
   if (BINARY_CPU) b.push('cpu');
   if (BINARY_METAL) b.push('metal');
-  if (fs.existsSync(BINARY_CUDA))  b.push('cuda');
+  if (BINARY_CUDA)  b.push('cuda');
   return b;
 }
 
@@ -235,10 +230,7 @@ function hydrateJobFromState(raw, defaultStatus = 'queued') {
   if (!Number.isFinite(id) || id <= 0) return null;
   const kind = raw.kind === 'colorize' ? 'colorize' : 'render';
   const backend = String(raw.backend || 'cpu');
-  let binary = typeof raw.binary === 'string' ? raw.binary : '';
-  if (!binary || !fs.existsSync(binary)) {
-    binary = resolveBinary(backend);
-  }
+  const binary = isKnownBinary(raw.binary) ? raw.binary : resolveBinary(backend);
   if (!binary || !fs.existsSync(binary)) return null;
 
   const job = {
@@ -649,9 +641,7 @@ function enqueueFromRecentJobId(jobId) {
     return { error: `Recent job ${jobId} not found`, code: 404 };
   }
   const backend = String(source.backend || 'cpu');
-  const binary = (typeof source.binary === 'string' && fs.existsSync(source.binary))
-    ? source.binary
-    : resolveBinary(backend);
+  const binary = isKnownBinary(source.binary) ? source.binary : resolveBinary(backend);
   if (!binary || !fs.existsSync(binary)) {
     return { error: `Binary unavailable for backend ${backend}`, code: 503 };
   }
@@ -1191,7 +1181,9 @@ app.post('/api/colorize', (req, res) => {
 app.post('/api/render', (req, res) => {
   const p = req.body;
   const binary = resolveBinary(p.backend || 'cpu');
-  if (!fs.existsSync(binary)) return res.status(503).json({ error: `Binary not found: ${binary}` });
+  if (!binary || !fs.existsSync(binary)) {
+    return res.status(503).json({ error: `No renderer binary for backend ${p.backend || 'cpu'}` });
+  }
 
   // Build argv
   const args = [];
@@ -1689,8 +1681,16 @@ server.listen(PORT, () => {
   console.log(`Backends: ${availableBackends().join(', ')}`);
   console.log(`CPU:   ${BINARY_CPU ?? 'not found'}`);
   console.log(`Metal: ${BINARY_METAL ?? 'not found'}`);
-  if (BINARY_METAL_LEGACY && fs.existsSync(BINARY_METAL_LEGACY) && BINARY_METAL !== BINARY_METAL_LEGACY) {
-    console.log(`Metal legacy (ignored): ${BINARY_METAL_LEGACY}`);
+  if (BINARY_CUDA) console.log(`CUDA:  ${BINARY_CUDA}`);
+  if (!BINARIES.length) {
+    console.log(`No ${MANIFEST} found in build*/: configure and build with CMake first.`);
+  }
+  const sources = newestSourceMtime(ROOT);
+  for (const bin of new Set([BINARY_CPU, BINARY_METAL, BINARY_CUDA].filter(Boolean))) {
+    const entry = BINARIES.find(b => b.path === bin);
+    if (entry && entry.mtime < sources) {
+      console.log(`Warning: ${bin} is older than the sources; rebuild it.`);
+    }
   }
   console.log(`Output: ${OUT_DIR}`);
 });

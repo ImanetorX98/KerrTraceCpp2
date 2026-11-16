@@ -34,3 +34,8 @@ frontend/.angular/
 # Handoff locale per analisi esterna: non versionato di proposito, contiene
 # valutazioni di processo che non appartengono alla storia del repo.
 HANDOFF-ASTRA.md
+HANDOFF-OPUS55.md
+HANDOFF-CODEX-MIGLIORIE.md
+
+# Python bytecode (tests import render_fingerprint.py)
+__pycache__/
