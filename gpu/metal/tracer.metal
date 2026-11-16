@@ -84,7 +84,7 @@ struct CameraParams {
     float exposure; // tonemap exposure
     float gamma; // tonemap gamma
     float disk_brightness; // common disk brightness multiplier
-    float disk_opacity; // common disk opacity [0,1] shared by all palettes
+    float disk_opacity; // not read: frames with opacity < 1 run on the CPU
     int   disk_palette; // 0=blackbody, 1=stratified, 2=interstellar
     int   disk_radial_profile; // 0=page_thorne, 1=physical_nt
     float interstellar_omega0;
@@ -1914,13 +1914,8 @@ static inline float fract01_f(float x) {
     return x - floor(x);
 }
 
-static inline float hash2d_f(float x, float y, float seed) {
-    return fract01_f(sin(x * 127.1f + y * 311.7f + seed) * 43758.5453123f);
-}
-
 // Mirrors pcg_hash / lattice_hash in renderer/palettes.hpp bit for bit: integer
-// arithmetic only, top 24 bits -> [0,1). The sin hash above stays for the
-// value_noise2d_f / opacity paths; the tiled texture noise uses this one.
+// arithmetic only, top 24 bits -> [0,1).
 static inline uint pcg_hash(uint v) {
     const uint s = v * 747796405u + 2891336453u;
     const uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
@@ -1932,39 +1927,6 @@ static inline float lattice_hash_f(float x, float y, float seed) {
     const uint is = uint(int(seed));
     const uint h = pcg_hash(ix + pcg_hash(iy + pcg_hash(is)));
     return float(h >> 8) * (1.0f / 16777216.0f);
-}
-
-static float value_noise2d_f(float x, float y, float seed) {
-    const float ix = floor(x);
-    const float iy = floor(y);
-    const float fx = x - ix;
-    const float fy = y - iy;
-
-    const float ux = fx * fx * (3.0f - 2.0f * fx);
-    const float uy = fy * fy * (3.0f - 2.0f * fy);
-
-    const float n00 = hash2d_f(ix + 0.0f, iy + 0.0f, seed);
-    const float n10 = hash2d_f(ix + 1.0f, iy + 0.0f, seed);
-    const float n01 = hash2d_f(ix + 0.0f, iy + 1.0f, seed);
-    const float n11 = hash2d_f(ix + 1.0f, iy + 1.0f, seed);
-
-    const float nx0 = n00 + (n10 - n00) * ux;
-    const float nx1 = n01 + (n11 - n01) * ux;
-    return nx0 + (nx1 - nx0) * uy;
-}
-
-static float fbm2d_f(float x, float y, float seed, int octaves) {
-    float sum = 0.0f;
-    float amp = 0.5f;
-    float freq = 1.0f;
-    float norm = 0.0f;
-    for (int i = 0; i < octaves; ++i) {
-        sum += amp * value_noise2d_f(x * freq, y * freq, seed + 17.0f * float(i));
-        norm += amp;
-        freq *= 2.0f;
-        amp *= 0.5f;
-    }
-    return (norm > 0.0f) ? (sum / norm) : 0.0f;
 }
 
 static float wrap_lattice_f(float v, int period) {
@@ -2021,21 +1983,12 @@ static float interstellar_disk_soft_mask_f(float r, float phi,
     return clamp(inner_mask * outer_mask, 0.0f, 1.0f);
 }
 
-static inline bool global_disk_opacity_pass_through_f(float r_hit, float phi_hit,
-                                                       CameraParams cp) {
-    const float opacity = clamp(cp.disk_opacity, 0.0f, 1.0f);
-    if (opacity <= 1.0e-6f) return true;
-    if (opacity >= 1.0f - 1.0e-6f) return false;
-    const float phi_norm = fract01_f(phi_hit / (2.0f * M_PI_F));
-    const float r_term = log(max(r_hit, 1.0e-6f));
-    const float h = hash2d_f(r_term * 23.17f, phi_norm * 4096.0f, 97.0f);
-    return h > opacity;
-}
-
+// Rays the Interstellar rim lets through. Global disk opacity < 1 never reaches
+// the GPU: the CPU blends disk and sky behind it, a model a per-ray skip cannot
+// reproduce, so the planner (metal_cpu_reason) sends those frames to the CPU.
 static inline bool disk_tile_pass_through(float r_hit, float phi_hit,
                                           float r_isco, float r_disk_out,
                                           CameraParams cp) {
-    if (global_disk_opacity_pass_through_f(r_hit, phi_hit, cp)) return true;
     if (cp.disk_palette == 2) {
         const float mask = interstellar_disk_soft_mask_f(r_hit, phi_hit, r_isco, r_disk_out, cp);
         if (mask < max(0.0f, cp.interstellar_edge_transparency)) return true;
