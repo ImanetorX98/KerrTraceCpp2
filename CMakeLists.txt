@@ -299,6 +299,13 @@ if(BUILD_TESTING)
         $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra -Wno-unused-function>)
     add_test(NAME kerrtrace.separable COMMAND kerrtrace_separable_regression)
     set_tests_properties(kerrtrace.separable PROPERTIES TIMEOUT 300)
+    add_executable(kerrtrace_golden_regression tests/golden_regression.cpp)
+    target_include_directories(kerrtrace_golden_regression PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_golden_regression PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra -Wno-unused-function>)
+    add_test(NAME kerrtrace.golden COMMAND kerrtrace_golden_regression
+        ${CMAKE_SOURCE_DIR}/tests/golden/phase1_rays.txt)
+    set_tests_properties(kerrtrace.golden PROPERTIES TIMEOUT 300)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME kerrtrace.cli COMMAND ${Python3_EXECUTABLE}

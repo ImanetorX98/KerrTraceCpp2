@@ -51,7 +51,7 @@ KerrTraceCpp2/
 │   ├── tracer.cu                624  kernel CUDA + launcher
 │   └── tracer.cuh                26
 │
-├── tests/                             21 test nella build Metal, tutti via ctest
+├── tests/                             22 test nella build Metal, tutti via ctest
 │   ├── core_tests.cpp           124  unità pure
 │   ├── bump_detector.cpp        324  self-test
 │   ├── spin_orientation_regression.cpp   268
@@ -275,6 +275,17 @@ una ventina di configurazioni piccole (carte, solutori, bundle, palette, Q, Λ,
 wormhole, round trip `.kgeo`) e ne salva gli hash. Baseline col binario prima
 della modifica, poi `--compare`: ogni hash deve restare uguale. Gli hash valgono
 solo sulla stessa macchina e con gli stessi flag (`-march=native`, driver Metal).
+
+**Valori di riferimento versionati**: `tests/golden/phase1_rays.txt` contiene,
+per 14 configurazioni da 24×14 pixel, l'uscita della fase 1 pixel per pixel
+(esito, r, redshift, magnificazione, φ sul disco, direzione di fuga, copertura).
+`kerrtrace.golden` la ricalcola e confronta con tolleranza 1e-5: non dipende dal
+compilatore come gli hash, e non serve generare una baseline a mano. Se una
+modifica cambia la fisica di proposito, si rigenera con
+`kerrtrace_golden_regression tests/golden/phase1_rays.txt --update` nello stesso
+commit, scrivendo nel messaggio quali casi si sono mossi e perché. Verificato sui
+commit precedenti: prima di A1 fallisce solo `semi_analytic`, prima di B2 anche
+`elliptic_closed`.
 
 Su Apple Silicon il build è vincolato ad arm64: `CMakeLists.txt` interroga
 `sysctl hw.optional.arm64` **prima** di `project()` e fallisce se il toolchain
