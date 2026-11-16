@@ -46,19 +46,24 @@ static double carlson_rf(double x, double y, double z) {
     return std::numeric_limits<double>::quiet_NaN();
 }
 
-static double ellint_F_incomplete(double phi, double m) {
-    const double s = std::sin(phi);
-    const double c = std::cos(phi);
-    const double x = c*c;
-    const double y = 1.0 - m*s*s;
-    if (y <= 0.0) return std::numeric_limits<double>::quiet_NaN();
-    const double rf = carlson_rf(x, y, 1.0);
-    return s * rf;
-}
-
 static double ellint_K_complete(double m) {
     if (!(m >= 0.0 && m < 1.0)) return std::numeric_limits<double>::quiet_NaN();
     return carlson_rf(0.0, 1.0 - m, 1.0);
+}
+
+// F(phi|m) for any real amplitude. Carlson's sin(phi)*RF(cos^2,..) is only the
+// principal branch |phi| <= pi/2; beyond it F(phi + n*pi) = 2nK + F(phi).
+// Callers pass acos(..) and atan(..)+atan(..) amplitudes up to pi.
+static double ellint_F_incomplete(double phi, double m) {
+    const double n = std::round(phi / M_PI);
+    const double p = phi - n * M_PI;            // in [-pi/2, pi/2]
+    const double s = std::sin(p);
+    const double c = std::cos(p);
+    const double y = 1.0 - m*s*s;
+    if (y <= 0.0) return std::numeric_limits<double>::quiet_NaN();
+    const double principal = s * carlson_rf(c*c, y, 1.0);
+    if (n == 0.0) return principal;
+    return 2.0 * n * ellint_K_complete(m) + principal;
 }
 
 static double jacobi_sn2_from_u(double u, double m, double Kc) {
@@ -89,14 +94,15 @@ static std::complex<double> eval_monic_quartic(const std::array<double, 4>& b,
 
 static void quartic_roots_monic_complex(const std::array<double, 4>& b,
                                         std::array<std::complex<double>, 4>& roots_out) {
-    constexpr double PI = 3.141592653589793238462643383279502884;
     const double radius = 1.0 + std::max({std::abs(b[0]), std::abs(b[1]), std::abs(b[2]), std::abs(b[3])});
-    std::array<std::complex<double>, 4> z = {
-        std::polar(radius, 0.0 * PI),
-        std::polar(radius, 0.5 * PI),
-        std::polar(radius, 1.0 * PI),
-        std::polar(radius, 1.5 * PI)
-    };
+    // Starts at radius * w^k, w = (0.4 + 0.9i)/|0.4 + 0.9i|. A start set symmetric
+    // about the real axis stays symmetric under the iteration for real
+    // coefficients, so its conjugate pair can never split into two real roots
+    // (double precision escapes through rounding, the FP32 shader does not).
+    const std::complex<double> w = std::polar(1.0, std::atan2(0.9, 0.4));
+    std::array<std::complex<double>, 4> z;
+    z[0] = radius;
+    for (int k = 1; k < 4; ++k) z[k] = z[k-1] * w;
 
     for (int it = 0; it < 160; ++it) {
         double max_delta = 0.0;
@@ -266,7 +272,9 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
     const double c1 = 2.0*c.M*Kpot;
     const double c0 = A0*A0 - c.a*c.a*Kpot;
 
-    const std::array<double, 4> b = {0.0, c2/c4, c1/c4, c0/c4}; // monic quartic
+    // Monic quartic R(r)/E^2. The maps below solve dr/dtau = sqrt(R/E^2), so every
+    // radial frequency carries a factor E to run in the same Mino time as theta.
+    const std::array<double, 4> b = {0.0, c2/c4, c1/c4, c0/c4};
 
     std::array<std::complex<double>, 4> z{};
     quartic_roots_monic_complex(b, z);
@@ -315,7 +323,7 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
 
         const double den_omega = (out.r1 - out.r3) * (out.r2 - out.r4);
         if (!(den_omega > 0.0)) return false;
-        out.omega = 0.5 * std::sqrt(den_omega);
+        out.omega = c.E * 0.5 * std::sqrt(den_omega);
 
         // Alternative-form modulus consistent with the GL_r1 (code_r4) Möbius parametrization.
         // k'^2 = (r3_GL-r2_GL)*(r4_GL-r1_GL) / ((r3_GL-r1_GL)*(r4_GL-r2_GL))
@@ -391,7 +399,7 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
         out.B = B;
         out.m = k3;
         out.Kc = K3;
-        out.omega = std::sqrt(A * B);
+        out.omega = c.E * std::sqrt(A * B);
         out.X0 = F0;
         out.phase_sign = (dr0 >= 0.0) ? +1 : -1; // X3 = nu_r*F0 + omega*tau
         out.tau_sign = +1;
@@ -456,7 +464,7 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
         out.radial_case = EllipticRadialCase::REGION_IV_COMPLEX4;
         out.m = k4;
         out.Kc = K4;
-        out.omega = 0.5 * (C + D);
+        out.omega = c.E * 0.5 * (C + D);
         out.X0 = F0;
         out.phase_sign = +1;
         out.tau_sign = (dr0 >= 0.0) ? +1 : -1; // X4 = F0 + nu_r*omega*tau
@@ -469,6 +477,37 @@ static bool init_elliptic_radial_map(const SeparableKerrConsts& c,
     }
 
     return false;
+}
+
+// Mino time for a plunging photon to reach r_cut, or +inf if it turns back
+// outside it. Without a turning point beyond the cut (Region IV, or the
+// outermost real root inside it) the map does not stop at the horizon: it
+// continues to a bounce at that inner root, or through a pole, and comes back
+// out, so a crossing read after this time is one the photon never reaches.
+// On the ingoing leg the phase magnitude falls from X0 towards the turning
+// point (Regions I-III) or the phase runs down from X0 (Region IV), so the
+// time is (X0 - X(r_cut)) / omega with X(r) the inverse of the map.
+static double elliptic_mino_time_to_cut(const EllipticRadialMap& mp, double r0,
+                                        double dr0, double r_cut) {
+    constexpr double never = std::numeric_limits<double>::infinity();
+    const bool outer_turn = mp.radial_case != EllipticRadialCase::REGION_IV_COMPLEX4
+                         && mp.r1 >= r_cut;
+    if (dr0 >= 0.0 || outer_turn || r0 <= r_cut) return never;
+
+    double Xc = std::numeric_limits<double>::quiet_NaN();
+    if (mp.radial_case == EllipticRadialCase::REGION_I_II_REAL4) {
+        const double u = ((r_cut - mp.r1) / (r_cut - mp.r2)) * ((mp.r2 - mp.r4) / (mp.r1 - mp.r4));
+        if (u >= 0.0 && u <= 1.0) Xc = ellint_F_incomplete(std::asin(std::sqrt(u)), mp.m);
+    } else if (mp.radial_case == EllipticRadialCase::REGION_III_REAL2_COMPLEX2) {
+        const double x3 = (mp.A * (r_cut - mp.r_lo) - mp.B * (r_cut - mp.r_hi))
+                        / (mp.A * (r_cut - mp.r_lo) + mp.B * (r_cut - mp.r_hi));
+        Xc = ellint_F_incomplete(std::acos(clamp(x3, -1.0, 1.0)), mp.m);
+    } else {
+        // The roots sum to zero (no cubic term), so the other pair's centre is -b1.
+        Xc = ellint_F_incomplete(std::atan((r_cut + mp.b1) / mp.a2) + std::atan(mp.g0), mp.m);
+    }
+    const double tau = (mp.X0 - Xc) / mp.omega;
+    return (std::isfinite(tau) && tau > 0.0) ? tau : std::numeric_limits<double>::quiet_NaN();
 }
 
 static double separable_radial_potential(const SeparableKerrConsts& c, double r) {
@@ -581,11 +620,10 @@ static TraceResult trace_single_elliptic_closed(GeodesicState s_bl, const KNdSMe
     if (mp.radial_case != EllipticRadialCase::REGION_IV_COMPLEX4 && r_now < mp.r1)
         return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
 
-    // For Region III, the GL B75 radial formula evaluates r on the hypothetical
-    // post-bounce leg (after the inner turning point r_hi, which lies inside the
-    // outer horizon for near-extremal Kerr).  In reality those photons cross
-    // theta=pi/2 *before* the horizon and hit the disk — the formula gives the
-    // wrong r.  Fall back to numerical for any sub-horizon r_now to be safe.
+    // A plunging photon reaches the horizon cut before the equator.
+    if (!(tau_first < elliptic_mino_time_to_cut(mp, s_bl.r, dr0, rh_cut)))
+        return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
+    // Crossings at or inside the horizon cut: the numerical tracer decides.
     if (r_now < rh_cut)
         return fallback_trace(EllipticFallbackReason::DIRECT_RADIAL_INVALID);
     if (r_now > r_escape)

@@ -1168,19 +1168,22 @@ static float carlson_rf(float x, float y, float z) {
     return NAN;
 }
 
-static float ellint_F_incomplete(float phi, float m) {
-    const float s = sin(phi);
-    const float c = cos(phi);
-    const float x = c*c;
-    const float y = 1.0f - m*s*s;
-    if (y <= 0.0f) return NAN;
-    const float rf = carlson_rf(x, y, 1.0f);
-    return s * rf;
-}
-
 static float ellint_K_complete(float m) {
     if (!(m >= 0.0f && m < 1.0f)) return NAN;
     return carlson_rf(0.0f, 1.0f - m, 1.0f);
+}
+
+// F(phi|m) for any real amplitude: F(phi + n*pi) = 2nK + F(phi). Mirrors the CPU.
+static float ellint_F_incomplete(float phi, float m) {
+    const float n = rint(phi / M_PI_F);
+    const float p = phi - n * M_PI_F;            // in [-pi/2, pi/2]
+    const float s = sin(p);
+    const float c = cos(p);
+    const float y = 1.0f - m*s*s;
+    if (y <= 0.0f) return NAN;
+    const float principal = s * carlson_rf(c*c, y, 1.0f);
+    if (n == 0.0f) return principal;
+    return 2.0f * n * ellint_K_complete(m) + principal;
 }
 
 static float jacobi_sn2_from_u(float u, float m, float Kc) {
@@ -1211,12 +1214,13 @@ static Cx eval_monic_quartic(float b0, float b1, float b2, float b3, Cx z) {
 static void quartic_roots_monic_complex(float b0, float b1, float b2, float b3,
                                         thread Cx roots_out[4]) {
     const float radius = 1.0f + max(max(abs(b0), abs(b1)), max(abs(b2), abs(b3)));
-    Cx z[4] = {
-        cx_make( radius, 0.0f),
-        cx_make(0.0f,  radius),
-        cx_make(-radius, 0.0f),
-        cx_make(0.0f, -radius)
-    };
+    // Starts at radius * w^k, w = (0.4 + 0.9i)/|0.4 + 0.9i|. A start set symmetric
+    // about the real axis stays symmetric under the iteration for real
+    // coefficients, so its conjugate pair can never split into two real roots.
+    const Cx w = cx_make(0.40613847f, 0.91381155f);
+    Cx z[4];
+    z[0] = cx_make(radius, 0.0f);
+    for (int k = 1; k < 4; ++k) z[k] = cx_mul(z[k-1], w);
 
     for (int it = 0; it < 96; ++it) {
         float max_delta = 0.0f;
@@ -1272,8 +1276,9 @@ static bool jacobi_sn_cn_from_u(float u, float m, float Kc,
     float sn = sin(phi);
     float cn = cos(phi);
 
+    // sn(2K - u) = sn(u), cn(2K - u) = -cn(u); sn(u + 2K) = -sn(u), cn(u + 2K) = -cn(u).
     if ((quadrant & 1) != 0) cn = -cn;
-    if ((quadrant & 2) != 0) sn = -sn;
+    if ((quadrant & 2) != 0) { sn = -sn; cn = -cn; }
 
     sn_out = sn;
     cn_out = cn;
@@ -1390,6 +1395,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
     const float c1 = 2.0f*c.M*Kpot;
     const float c0 = A0*A0 - c.a*c.a*Kpot;
 
+    // Monic quartic R/E^2: radial frequencies carry a factor E (same Mino time as theta).
     Cx roots[4];
     quartic_roots_monic_complex(0.0f, c2/c4, c1/c4, c0/c4, roots);
 
@@ -1430,7 +1436,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
 
         const float den_omega = (out.r1 - out.r3) * (out.r2 - out.r4);
         if (!(den_omega > 0.0f)) return false;
-        out.omega = 0.5f * sqrt(den_omega);
+        out.omega = c.E * 0.5f * sqrt(den_omega);
 
         const float k_den = (out.r2 - out.r4) * (out.r1 - out.r3);
         if (!(k_den > 0.0f)) return false;
@@ -1500,7 +1506,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
         out.B = B;
         out.m = k3;
         out.Kc = K3;
-        out.omega = sqrt(A * B);
+        out.omega = c.E * sqrt(A * B);
         out.X0 = F0;
         out.phase_sign = (dr0 >= 0.0f) ? +1 : -1;
         out.tau_sign = +1;
@@ -1566,7 +1572,7 @@ static bool init_elliptic_radial_map(thread const SeparableConsts& c,
         out.radial_case = ELLIPTIC_REGION_IV_COMPLEX4;
         out.m = k4;
         out.Kc = K4;
-        out.omega = 0.5f * (C + D);
+        out.omega = c.E * 0.5f * (C + D);
         out.X0 = F0;
         out.phase_sign = +1;
         out.tau_sign = (dr0 >= 0.0f) ? +1 : -1;
@@ -1630,6 +1636,31 @@ static bool first_equator_crossing_mino_time(thread const SeparableConsts& c,
     return isfinite(tau_first);
 }
 
+// Mino time for a plunging photon to reach r_cut, +inf if it turns back
+// outside it. Without a turning point beyond the cut the map continues past the
+// horizon to an inner bounce or a pole and back out. Mirrors the CPU.
+static float elliptic_mino_time_to_cut(thread const EllipticRadialMap& mp, float r0,
+                                       float dr0, float r_cut) {
+    const bool outer_turn = mp.radial_case != ELLIPTIC_REGION_IV_COMPLEX4
+                         && mp.r1 >= r_cut;
+    if (dr0 >= 0.0f || outer_turn || r0 <= r_cut) return INFINITY;
+
+    float Xc = NAN;
+    if (mp.radial_case == ELLIPTIC_REGION_I_II_REAL4) {
+        const float u = ((r_cut - mp.r1) / (r_cut - mp.r2)) * ((mp.r2 - mp.r4) / (mp.r1 - mp.r4));
+        if (u >= 0.0f && u <= 1.0f) Xc = ellint_F_incomplete(asin(sqrt(u)), mp.m);
+    } else if (mp.radial_case == ELLIPTIC_REGION_III_REAL2_COMPLEX2) {
+        const float x3 = (mp.A * (r_cut - mp.r_lo) - mp.B * (r_cut - mp.r_hi))
+                       / (mp.A * (r_cut - mp.r_lo) + mp.B * (r_cut - mp.r_hi));
+        Xc = ellint_F_incomplete(acos(clamp(x3, -1.0f, 1.0f)), mp.m);
+    } else {
+        // The roots sum to zero (no cubic term), so the other pair's centre is -b1.
+        Xc = ellint_F_incomplete(atan((r_cut + mp.b1) / mp.a2) + atan(mp.g0), mp.m);
+    }
+    const float tau = (mp.X0 - Xc) / mp.omega;
+    return (isfinite(tau) && tau > 0.0f) ? tau : NAN;
+}
+
 // Returns: 0=inconclusive, 1=horizon, 2=disk
 static int elliptic_closed_first_hit(thread const SeparableConsts& c,
                                      float r0, float theta0, float dr0, float dtheta0,
@@ -1656,6 +1687,8 @@ static int elliptic_closed_first_hit(thread const SeparableConsts& c,
     // For Region I/II and III, require the crossing radius to stay in the
     // observer-accessible outer branch. Region IV has no real turning points.
     if (mp.radial_case != ELLIPTIC_REGION_IV_COMPLEX4 && r_now < mp.r1) return 0;
+    // A plunging photon reaches the horizon cut before the equator.
+    if (!(tau_first < elliptic_mino_time_to_cut(mp, r0, dr0, r_horizon * 1.03f))) return 0;
     if (r_now < r_horizon * 1.03f) return 0;
     if (r_now > r_escape) return 0;
     if (r_now >= r_isco && r_now <= r_disk_out) {

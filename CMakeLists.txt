@@ -287,6 +287,12 @@ if(BUILD_TESTING)
         $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wextra -Wno-unused-function>)
     add_test(NAME kerrtrace.audit COMMAND kerrtrace_audit_regression)
     set_tests_properties(kerrtrace.audit PROPERTIES TIMEOUT 120)
+    add_executable(kerrtrace_elliptic_regression tests/elliptic_regression.cpp)
+    target_include_directories(kerrtrace_elliptic_regression PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_elliptic_regression PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra -Wno-unused-function>)
+    add_test(NAME kerrtrace.elliptic COMMAND kerrtrace_elliptic_regression)
+    set_tests_properties(kerrtrace.elliptic PROPERTIES TIMEOUT 300)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME kerrtrace.cli COMMAND ${Python3_EXECUTABLE}
@@ -338,6 +344,13 @@ if(BUILD_TESTING)
         add_test(NAME kerrtrace.metal_noise COMMAND kerrtrace_metal_noise_test
             ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
         set_tests_properties(kerrtrace.metal_noise PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+        add_executable(kerrtrace_metal_elliptic_test tests/metal_elliptic_regression.mm)
+        target_include_directories(kerrtrace_metal_elliptic_test PRIVATE ${CMAKE_SOURCE_DIR})
+        target_compile_options(kerrtrace_metal_elliptic_test PRIVATE -O2 -fobjc-arc)
+        target_link_libraries(kerrtrace_metal_elliptic_test PRIVATE "-framework Metal" "-framework Foundation")
+        add_test(NAME kerrtrace.metal_elliptic COMMAND kerrtrace_metal_elliptic_test
+            ${CMAKE_SOURCE_DIR}/gpu/metal/tracer.metal)
+        set_tests_properties(kerrtrace.metal_elliptic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         add_executable(kerrtrace_metal_shader_test tests/metal_shader_test.mm)
         target_link_libraries(kerrtrace_metal_shader_test PRIVATE
             "-framework Metal" "-framework Foundation")

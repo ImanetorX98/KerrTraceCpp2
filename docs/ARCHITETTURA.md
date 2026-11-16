@@ -30,7 +30,7 @@ KerrTraceCpp2/
 │   ├── tracer_bl.hpp            197  BL numerico, il riferimento
 │   ├── tracer_ks.hpp            478  Kerr-Schild Cartesiano
 │   ├── tracer_separable.hpp     296  Kerr separabile (Q=0, Λ=0)
-│   ├── tracer_elliptic.hpp      613  forma chiusa, Carlson + Jacobi
+│   ├── tracer_elliptic.hpp      651  forma chiusa, Carlson + Jacobi
 │   ├── tracer_wormhole.hpp       47  integrazione DNEG di un raggio
 │   ├── colorize.hpp             172  fase 2: GeoPixel → RGB
 │   ├── palettes.hpp             649  palette del disco, profili radiali
@@ -51,7 +51,7 @@ KerrTraceCpp2/
 │   ├── tracer.cu                624  kernel CUDA + launcher
 │   └── tracer.cuh                26
 │
-├── tests/                             5 test, tutti via ctest
+├── tests/                             19 test nella build Metal, tutti via ctest
 │   ├── core_tests.cpp           124  unità pure
 │   ├── bump_detector.cpp        324  self-test
 │   ├── spin_orientation_regression.cpp   268
@@ -174,8 +174,10 @@ stessa logica stava in tre copie sincronizzate a mano.
 sbagliava il raggio d'ombra del 5%. Ora `kerrtrace.chart_consistency` lo verifica
 sia contro l'altra carta sia contro il valore analitico di Schwarzschild.
 
-Il solver ellittico ricade sul numerico in molti casi (~53% a `a=0.998`): vedi
-`CLAUDE.md`, sezione Region III.
+Il solver ellittico risolve in forma chiusa solo i colpi diretti sul disco; il cielo
+e i casi limite ricadono sul numerico (~69% dei raggi a `a=0.998`, 1280x720). I
+difetti trovati nel novembre 2026 e i loro test: `CLAUDE.md`, sezione
+elliptic-closed solver.
 
 ---
 
