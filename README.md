@@ -169,6 +169,9 @@ Experimental note:
 
 - `semi-analytic` and `elliptic-closed` modes currently target Kerr BL
   (`Q=0`, `Lambda=0`) and are optional, never default.
+- `semi-analytic` integrates the separated potentials in Mino time,
+  second order (`r'' = R'/2`, `theta'' = Theta'/2`): same image as BL,
+  about 4x faster on CPU and Metal.
 - `elliptic-closed` uses a closed-form elliptic CPU path (Carlson/Jacobi)
   with per-ray fallback to separable stepping when constraints are not met.
 - Metal executes `elliptic-closed` with a dedicated elliptic GPU path and

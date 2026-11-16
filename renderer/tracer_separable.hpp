@@ -7,9 +7,13 @@
 #include "tracer_bl.hpp"
 
 // ── Separable Kerr fast path (Q=0, Lambda=0, BL chart) ──────
-// Uses first integrals from Hamilton-Jacobi separation:
-//   R(r), Theta(theta), and dphi/dlambda from Carter constants.
-// This is a semi-analytic step toward fully elliptic inversion.
+// Uses first integrals from Hamilton-Jacobi separation: R(r), Theta(theta) and
+// the Carter constants. Integrated in Mino time tau (d lambda = Sigma d tau) in
+// second-order form,
+//   r'' = R'(r)/2,  theta'' = Theta'(theta)/2,  phi' = Lz/sin^2 + a(P/Delta - E),
+// with r'^2 = R and theta'^2 = Theta as first integrals. The first-order form
+// r' = +-sqrt(R) has r' = 0 as a solution at every turning point: a step into
+// R < 0 left the ray frozen there until the step cap (audit A1).
 struct SeparableKerrConsts {
     double M, a;
     double E;   // E = -p_t
@@ -19,8 +23,7 @@ struct SeparableKerrConsts {
 
 struct SeparableState {
     double r, theta, phi;
-    int sgn_r;
-    int sgn_th;
+    double ur, uth;   // dr/dtau, dtheta/dtau
 };
 
 static bool init_separable_consts(const GeodesicState& s, const KNdSMetric& g,
@@ -57,94 +60,108 @@ static inline double kerr_sep_Theta(const SeparableKerrConsts& c, double theta) 
     return c.Qc - ct*ct * (c.Lz*c.Lz/st2 - c.a*c.a*c.E*c.E);
 }
 
+struct SeparableRate { double r, theta, phi, ur, uth; };
+
 static bool kerr_sep_rhs(const SeparableKerrConsts& c, const SeparableState& s,
-                         double& dr, double& dth, double& dphi) {
-    const double st = std::sin(s.theta);
+                         SeparableRate& d) {
+    const double st = std::max(std::sin(s.theta), 1e-7);
     const double ct = std::cos(s.theta);
-    const double st2 = std::max(st*st, 1e-14);
-    const double sigma = std::max(s.r*s.r + c.a*c.a*ct*ct, 1e-14);
     const double delta = kerr_sep_delta(c, s.r);
     const double P = c.E*(s.r*s.r + c.a*c.a) - c.a*c.Lz;
-    const double R = kerr_sep_R(c, s.r);
-    const double Th = kerr_sep_Theta(c, s.theta);
+    const double K = c.Qc + (c.Lz - c.a*c.E)*(c.Lz - c.a*c.E);
 
-    dr  = double((s.sgn_r >= 0) ? 1 : -1) * std::sqrt(std::max(R,  0.0)) / sigma;
-    dth = double((s.sgn_th>= 0) ? 1 : -1) * std::sqrt(std::max(Th, 0.0)) / sigma;
-    dphi = (c.Lz/st2 + c.a*(P/std::max(delta, 1e-14) - c.E)) / sigma;
+    d.r     = s.ur;
+    d.theta = s.uth;
+    d.phi   = c.Lz/(st*st) + c.a*(P/std::max(delta, 1e-14) - c.E);
+    d.ur    = 2.0*c.E*s.r*P - (s.r - c.M)*K;                               // R'/2
+    d.uth   = c.Lz*c.Lz*ct/(st*st*st) - c.a*c.a*c.E*c.E*st*ct;             // Theta'/2
+    return std::isfinite(d.phi) && std::isfinite(d.ur) && std::isfinite(d.uth);
+}
 
-    return std::isfinite(dr) && std::isfinite(dth) && std::isfinite(dphi);
+static SeparableState sep_advance(const SeparableState& s, const SeparableRate& d, double h) {
+    return {s.r + h*d.r, s.theta + h*d.theta, s.phi + h*d.phi, s.ur + h*d.ur, s.uth + h*d.uth};
 }
 
 static bool rk4_step_separable_kerr(const SeparableKerrConsts& c, SeparableState& s, double h) {
-    double dr1,dth1,dphi1;
-    double dr2,dth2,dphi2;
-    double dr3,dth3,dphi3;
-    double dr4,dth4,dphi4;
-    const SeparableState s0 = s;
-
-    if (!kerr_sep_rhs(c, s0, dr1, dth1, dphi1)) return false;
-
-    SeparableState s2 = s0;
-    s2.r     = s0.r     + 0.5*h*dr1;
-    s2.theta = s0.theta + 0.5*h*dth1;
-    s2.phi   = s0.phi   + 0.5*h*dphi1;
-    if (!kerr_sep_rhs(c, s2, dr2, dth2, dphi2)) return false;
-
-    SeparableState s3 = s0;
-    s3.r     = s0.r     + 0.5*h*dr2;
-    s3.theta = s0.theta + 0.5*h*dth2;
-    s3.phi   = s0.phi   + 0.5*h*dphi2;
-    if (!kerr_sep_rhs(c, s3, dr3, dth3, dphi3)) return false;
-
-    SeparableState s4 = s0;
-    s4.r     = s0.r     + h*dr3;
-    s4.theta = s0.theta + h*dth3;
-    s4.phi   = s0.phi   + h*dphi3;
-    if (!kerr_sep_rhs(c, s4, dr4, dth4, dphi4)) return false;
-
-    s.r     += h/6.0*(dr1   + 2.0*dr2   + 2.0*dr3   + dr4);
-    s.theta += h/6.0*(dth1  + 2.0*dth2  + 2.0*dth3  + dth4);
-    s.phi   += h/6.0*(dphi1 + 2.0*dphi2 + 2.0*dphi3 + dphi4);
-    return std::isfinite(s.r) && std::isfinite(s.theta) && std::isfinite(s.phi);
+    SeparableRate k1, k2, k3, k4;
+    if (!kerr_sep_rhs(c, s, k1)) return false;
+    if (!kerr_sep_rhs(c, sep_advance(s, k1, 0.5*h), k2)) return false;
+    if (!kerr_sep_rhs(c, sep_advance(s, k2, 0.5*h), k3)) return false;
+    if (!kerr_sep_rhs(c, sep_advance(s, k3, h), k4)) return false;
+    s.r     += h/6.0*(k1.r     + 2.0*k2.r     + 2.0*k3.r     + k4.r);
+    s.theta += h/6.0*(k1.theta + 2.0*k2.theta + 2.0*k3.theta + k4.theta);
+    s.phi   += h/6.0*(k1.phi   + 2.0*k2.phi   + 2.0*k3.phi   + k4.phi);
+    s.ur    += h/6.0*(k1.ur    + 2.0*k2.ur    + 2.0*k3.ur    + k4.ur);
+    s.uth   += h/6.0*(k1.uth   + 2.0*k2.uth   + 2.0*k3.uth   + k4.uth);
+    return std::isfinite(s.r) && std::isfinite(s.theta) && std::isfinite(s.phi)
+        && std::isfinite(s.ur) && std::isfinite(s.uth);
 }
 
+// Step doubling; h is a Mino-time step.
 static bool rk4_adaptive_separable_kerr(const SeparableKerrConsts& c, SeparableState& s,
                                         double& h, double tol = 1e-8) {
     const SeparableState s0 = s;
 
     SeparableState sA = s0;
     if (!rk4_step_separable_kerr(c, sA, h)) {
-        h = std::max(h*0.5, 1e-10);
+        h *= 0.5;
         return false;
     }
 
     SeparableState sB = s0;
     if (!rk4_step_separable_kerr(c, sB, 0.5*h) ||
         !rk4_step_separable_kerr(c, sB, 0.5*h)) {
-        h = std::max(h*0.5, 1e-10);
+        h *= 0.5;
         return false;
     }
 
+    // Same phase-space norm as the BL integrator: p_r = ur/Delta, p_theta = uth.
+    const double delta = std::max(std::abs(kerr_sep_delta(c, sB.r)), 1e-14);
+    const double dpr = (sA.ur - sB.ur) / delta;
     const double err = std::sqrt(
         (sA.r     - sB.r)     * (sA.r     - sB.r) +
         (sA.theta - sB.theta) * (sA.theta - sB.theta) +
-        (sA.phi   - sB.phi)   * (sA.phi   - sB.phi)
+        (sA.phi   - sB.phi)   * (sA.phi   - sB.phi) +
+        dpr * dpr +
+        (sA.uth   - sB.uth)   * (sA.uth   - sB.uth)
     ) / 15.0;
 
     if (!std::isfinite(err)) {
-        h = std::max(h*0.5, 1e-10);
+        h *= 0.5;
         return false;
     }
 
-    if (err < tol || h < 1e-10) {
+    if (err < tol) {
         s = sB;
-        const double sc = (err > 1e-14) ? 0.9 * std::pow(tol/err, 0.2) : 4.0;
-        h = clamp(h*sc, 1e-10, 100.0);
+        h *= (err > 1e-14) ? std::min(4.0, 0.9 * std::pow(tol/err, 0.2)) : 4.0;
         return true;
     }
 
-    h = std::max(h * 0.9 * std::pow(tol/err, 0.25), 1e-10);
+    h *= std::max(0.1, 0.9 * std::pow(tol/err, 0.25));
     return false;
+}
+
+// The state at an event inside the accepted step s_prev -> s_prev + h: an RK4
+// sub-step of alpha*h from s_prev, alpha corrected by Newton on f(state) = 0
+// with df the rate of f. Cubic interpolation across a long Mino step is off by
+// O(h^4); this keeps the integrator's own accuracy.
+template <class F, class DF>
+static SeparableState sep_locate_event(const SeparableKerrConsts& c, const SeparableState& s_prev,
+                                       double h, double& alpha, F f, DF df) {
+    SeparableState x = s_prev;
+    for (int it = 0; it < 6; ++it) {
+        x = s_prev;
+        if (!rk4_step_separable_kerr(c, x, alpha*h)) return x;
+        const double rate = df(x) * h;
+        if (!(std::abs(rate) > 0.0)) return x;
+        const double next = clamp(alpha - f(x)/rate, 0.0, 1.0);
+        const bool done = std::abs(next - alpha) < 1e-13;
+        alpha = next;
+        if (done) break;
+    }
+    x = s_prev;
+    rk4_step_separable_kerr(c, x, alpha*h);
+    return x;
 }
 
 static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMetric& g,
@@ -163,50 +180,45 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
     if (!init_separable_consts(s_bl, g, c))
         return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
 
-    // Initial signs from BL canonical velocity directions.
-    double dr0=0.0, dth0=0.0, dpr0=0.0, dpth0=0.0;
-    geodesic_rhs(g, s_bl.r, s_bl.theta, s_bl.pr, s_bl.ptheta, s_bl.pt, s_bl.pphi,
-                 dr0, dth0, dpr0, dpth0);
+    // Mino-time velocities: dr/dtau = Delta p_r and dtheta/dtau = p_theta exactly.
     SeparableState s{ s_bl.r, s_bl.theta, s_bl.phi,
-                      (dr0 >= 0.0 ? 1 : -1),
-                      (dth0 >= 0.0 ? 1 : -1) };
+                      kerr_sep_delta(c, s_bl.r) * s_bl.pr, s_bl.ptheta };
 
     const double rh = g.r_horizon();
     const double rh_cut = rh * 1.03;
-    double h = std::max(ctl.step_init, 1e-10);
-    double prev_Rpot = kerr_sep_R(c, s.r);
-    double prev_Thpot = kerr_sep_Theta(c, s.theta);
-    const double R_turn_eps = 1e-9;
-    const double Th_turn_eps = 1e-11;
+    // step_init is an affine step; d tau = d lambda / Sigma.
+    const double sigma0 = s.r*s.r + c.a*c.a*std::cos(s.theta)*std::cos(s.theta);
+    double h = std::max(ctl.step_init, 1e-10) / sigma0;
+    const double h_min = 1e-12 * h;
 
     const int max_steps = std::max(1, ctl.max_steps);
     for (int it = 0; it < max_steps; ++it) {
         const SeparableState s_prev = s;
-        const double prev_Rpot_step = prev_Rpot;
-        const double prev_Thpot_step = prev_Thpot;
         double step_used = h;
         int rejects = 0;
         while (true) {
             step_used = h;
             if (rk4_adaptive_separable_kerr(c, s, h, ctl.tol)) break;
-            if (!std::isfinite(h) || ++rejects > 64)
+            if (!std::isfinite(h) || h < h_min || ++rejects > 64)
                 return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
         }
 
-        // Keep theta in [0, pi].
-        if (s.theta < 0.0) {
-            s.theta = -s.theta;
-            s.sgn_th *= -1;
-        } else if (s.theta > M_PI) {
-            s.theta = 2.0*M_PI - s.theta;
-            s.sgn_th *= -1;
-        }
-
-        // Turning points in separated potentials: flip branch signs.
+        // Back onto the first integrals: the second-order form keeps any error
+        // in ur forever (ur' = R'/2 does not depend on ur), so an error made at
+        // r_obs, where ur ~ E r^2, ruins the ray near the hole where ur ~ 1.
+        // Where R <= 0 (a step past the turning point) the integrated value
+        // stands: it is what carries the ray through the turn.
         const double Rnow = kerr_sep_R(c, s.r);
         const double Thnow = kerr_sep_Theta(c, s.theta);
-        if (Rnow <= R_turn_eps && prev_Rpot_step > R_turn_eps) s.sgn_r *= -1;
-        if (Thnow <= Th_turn_eps && prev_Thpot_step > Th_turn_eps) s.sgn_th *= -1;
+        if (Rnow > 0.0)  s.ur  = std::copysign(std::sqrt(Rnow),  s.ur);
+        if (Thnow > 0.0) s.uth = std::copysign(std::sqrt(Thnow), s.uth);
+
+        // Through a pole (only reachable with Lz = 0): back into [0, pi].
+        if (s.theta < 0.0 || s.theta > M_PI) {
+            s.theta = (s.theta < 0.0) ? -s.theta : 2.0*M_PI - s.theta;
+            s.uth = -s.uth;
+            s.phi += M_PI;
+        }
 
         double best_alpha = 2.0;
         enum class StepEvent { NONE, DISK, HORIZON, ESCAPE };
@@ -220,21 +232,16 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
         const bool maybe_equator = sign_change(q0, q1) ||
                                    (std::min(std::abs(q0), std::abs(q1)) < 0.35);
         if (maybe_equator) {
-            double dr0=0.0, dth0=0.0, dphi0=0.0;
-            double dr1=0.0, dth1=0.0, dphi1=0.0;
-            if (!kerr_sep_rhs(c, s_prev, dr0, dth0, dphi0) ||
-                !kerr_sep_rhs(c, s,      dr1, dth1, dphi1)) {
-                return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
-            }
-
             double alpha = 0.0;
             if (first_event_alpha_hermite(
-                    s_prev.theta, s.theta, dth0, dth1, step_used, M_PI/2.0,
+                    s_prev.theta, s.theta, s_prev.uth, s.uth, step_used, M_PI/2.0,
                     alpha, 8, 8)) {
-                const double r_hit = hermite_interp_scalar(
-                    s_prev.r, s.r, dr0, dr1, step_used, alpha);
+                const SeparableState x = sep_locate_event(c, s_prev, step_used, alpha,
+                    [](const SeparableState& v) { return v.theta - M_PI/2.0; },
+                    [](const SeparableState& v) { return v.uth; });
+                const double r_hit = x.r;
                 if (r_hit >= r_disk_in && r_hit <= r_disk_out) {
-                    const double phi_hit = s_prev.phi + alpha * (s.phi - s_prev.phi);
+                    const double phi_hit = x.phi;
                     bool pass_through = false;
                     if (cp_ptr && cp_ptr->palette == DiskPalette::STRATIFIED) {
                         pass_through = stratified_disk_tile_transparent(
@@ -284,13 +291,13 @@ static TraceResult trace_single_separable_kerr(GeodesicState s_bl, const KNdSMet
             return {Outcome::HORIZON, r_h, 0.0};
         }
         if (best_event == StepEvent::ESCAPE) {
-            const double th_esc = s_prev.theta + best_alpha * (s.theta - s_prev.theta);
-            const double ph_esc = s_prev.phi   + best_alpha * (s.phi   - s_prev.phi);
-            return {Outcome::ESCAPED, r_escape, 1.0, 0.0, th_esc, ph_esc};
+            const SeparableState x = sep_locate_event(c, s_prev, step_used, best_alpha,
+                [r_escape](const SeparableState& v) { return v.r - r_escape; },
+                [](const SeparableState& v) { return v.ur; });
+            return {Outcome::ESCAPED, r_escape, 1.0, 0.0, x.theta, x.phi};
         }
-        prev_Rpot = Rnow;
-        prev_Thpot = Thnow;
     }
 
-    return {Outcome::ESCAPED, s.r, 1.0, 0.0, s.theta, s.phi};
+    // The step cap is not evidence of escape: let BL decide.
+    return trace_single(s_bl, g, r_disk_in, r_disk_out, r_escape, Integrator::RK4_DOUBLING, ctl, cp_ptr);
 }

@@ -293,6 +293,12 @@ if(BUILD_TESTING)
         $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra -Wno-unused-function>)
     add_test(NAME kerrtrace.elliptic COMMAND kerrtrace_elliptic_regression)
     set_tests_properties(kerrtrace.elliptic PROPERTIES TIMEOUT 300)
+    add_executable(kerrtrace_separable_regression tests/separable_regression.cpp)
+    target_include_directories(kerrtrace_separable_regression PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(kerrtrace_separable_regression PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra -Wno-unused-function>)
+    add_test(NAME kerrtrace.separable COMMAND kerrtrace_separable_regression)
+    set_tests_properties(kerrtrace.separable PROPERTIES TIMEOUT 300)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME kerrtrace.cli COMMAND ${Python3_EXECUTABLE}
@@ -331,6 +337,14 @@ if(BUILD_TESTING)
         target_link_libraries(kerrtrace_metal_render_test PRIVATE
             "-framework Metal" "-framework Foundation" "-framework CoreGraphics")
         add_test(NAME kerrtrace.metal_render COMMAND kerrtrace_metal_render_test)
+        add_executable(kerrtrace_metal_separable_test tests/metal_separable_regression.mm
+            gpu/metal/metal_renderer.mm)
+        target_compile_definitions(kerrtrace_metal_separable_test PRIVATE USE_METAL)
+        target_compile_options(kerrtrace_metal_separable_test PRIVATE -O2 -Wno-unused-function)
+        target_link_libraries(kerrtrace_metal_separable_test PRIVATE
+            "-framework Metal" "-framework Foundation" "-framework CoreGraphics")
+        add_test(NAME kerrtrace.metal_separable COMMAND kerrtrace_metal_separable_test)
+        set_tests_properties(kerrtrace.metal_separable PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
         set_tests_properties(kerrtrace.metal_render PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
         add_executable(kerrtrace_metal_rhs_test tests/metal_rhs_regression.mm)
         target_compile_options(kerrtrace_metal_rhs_test PRIVATE -O2)
