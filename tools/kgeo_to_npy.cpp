@@ -61,7 +61,8 @@ int main(int argc, char** argv) {
 
     std::vector<GeoPixel> geo;
     KGeoMeta meta{};
-    if (!load_kgeo(argv[1], geo, meta)) { std::fprintf(stderr, "cannot read %s (KGEO v%u)\n", argv[1], KGEO_VERSION); return 1; }
+    KGeoProvenance prov;
+    if (!load_kgeo(argv[1], geo, meta, &prov)) { std::fprintf(stderr, "cannot read %s (KGEO v4 or v%u)\n", argv[1], KGEO_VERSION); return 1; }
 
     NumpyDescr<GeoPixel> d;
     SC::Reflection::Reflect<GeoPixel>::visit(d);
@@ -93,7 +94,14 @@ int main(int argc, char** argv) {
     const std::string json = std::string(argv[2]) + ".json";
     std::FILE* g = std::fopen(json.c_str(), "w");
     if (!g) { std::perror(json.c_str()); return 1; }
-    std::fprintf(g, "{\n  \"kgeo_version\": %u,\n%s\n}\n", KGEO_VERSION, j.out.c_str());
+    // The provenance block as read from the file (v4 files: incomplete).
+    std::string provenance = prov.to_json();
+    for (size_t i = 0; (i = provenance.find('\n', i)) != std::string::npos && i + 1 < provenance.size(); i += 3)
+        provenance.replace(i, 1, "\n  ");
+    provenance.pop_back();
+    const std::string* version = prov.find("kgeo_version");
+    std::fprintf(g, "{\n  \"kgeo_version\": %s,\n%s,\n  \"provenance\": %s\n}\n",
+                 version ? version->c_str() : "null", j.out.c_str(), provenance.c_str());
     std::fclose(g);
 
     std::printf("wrote %s (%ux%u, %zu bytes/record) and %s\ndtype %s\n",

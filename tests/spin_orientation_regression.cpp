@@ -1,3 +1,4 @@
+#include "render_data.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -13,27 +14,9 @@
 
 namespace {
 
-// Must mirror GeoPixel in main.cpp exactly: this is a raw binary record and the
-// reader has no way to discover the writer's layout. phi_disk was inserted here
-// by v0.2.3 without a KGEO_VERSION bump, so the version check below could not
-// catch the drift -- the reader simply walked the buffer with a 24-byte stride
-// over 28-byte records and every pixel after the first was misaligned.
-struct GeoPixelRaw {
-    uint8_t outcome;
-    uint8_t pad[3];
-    float r;
-    float redshift;
-    float magnif;
-    float phi_disk;
-    float theta_esc;
-    float phi_esc;
-    float fp_dr_a, fp_dphi_a;   // pixel footprint on the disk (bundle mode)
-    float fp_dr_b, fp_dphi_b;
-    float coverage;             // disk coverage of the pixel (bundle mode)
-    float sky_dth_a, sky_dph_a; // footprint on the celestial sphere
-    float sky_dth_b, sky_dph_b;
-};
-static_assert(sizeof(GeoPixelRaw) == 64, "GeoPixelRaw must match GeoPixel in main.cpp");
+// The records are the renderer's own (render_data.hpp), read by its own
+// load_kgeo: a format change cannot leave this test on a stale layout.
+using GeoPixelRaw = GeoPixel;
 
 struct GeoFrame {
     uint32_t W = 0;
@@ -65,46 +48,11 @@ double percentile_linear(std::vector<float> v, double p01) {
 }
 
 bool load_kgeo(const std::filesystem::path& path, GeoFrame& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-
-    char magic[4] = {};
-    f.read(magic, 4);
-    if (!f || std::memcmp(magic, "KGEO", 4) != 0) return false;
-
-    uint32_t version = 0;
-    f.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (!f || version != 4) return false;
-
-    f.read(reinterpret_cast<char*>(&out.W), sizeof(out.W));
-    f.read(reinterpret_cast<char*>(&out.H), sizeof(out.H));
-    if (!f || out.W == 0 || out.H == 0) return false;
-
-    // Skip remaining KGeoMeta payload after W/H (10 doubles = 80 bytes).
-    f.seekg(80, std::ios::cur);
-    if (!f) return false;
-
-    // The record layout is not self-describing, so verify it against the file
-    // size before trusting a single pixel. Without this a layout change in
-    // main.cpp silently yields a misaligned buffer and nonsense statistics
-    // instead of a failure that names the problem.
-    const std::uintmax_t total = std::filesystem::file_size(path);
-    const std::uintmax_t header = 4 + 4 + 4 + 4 + 80;
-    const std::uintmax_t payload = (total > header) ? (total - header) : 0;
-    const std::uintmax_t expected =
-        std::uintmax_t(out.W) * std::uintmax_t(out.H) * sizeof(GeoPixelRaw);
-    if (payload != expected) {
-        std::cerr << "kgeo record size mismatch: " << payload << " bytes of pixel data for "
-                  << out.W << "x" << out.H << " at " << sizeof(GeoPixelRaw)
-                  << " bytes/pixel (expected " << expected << "). "
-                  << "GeoPixelRaw is out of sync with GeoPixel in main.cpp.\n";
-        return false;
-    }
-
-    out.px.resize(size_t(out.W) * size_t(out.H));
-    f.read(reinterpret_cast<char*>(out.px.data()),
-           std::streamsize(out.px.size() * sizeof(GeoPixelRaw)));
-    return bool(f);
+    KGeoMeta meta{};
+    if (!::load_kgeo(path.string().c_str(), out.px, meta)) return false;
+    out.W = meta.W;
+    out.H = meta.H;
+    return true;
 }
 
 bool render_geo(const std::string& tracer_bin,

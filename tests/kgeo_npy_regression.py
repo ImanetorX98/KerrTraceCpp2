@@ -47,10 +47,20 @@ with tempfile.TemporaryDirectory(prefix='kerrtrace-npy-') as d:
     check(names[:3] == ['outcome', '_pad', 'r'] and 'sky_dph_b' in names and len(names) == 17,
           'all 17 GeoPixel fields named in declaration order')
 
-    pixels_kgeo = raw[8 + 88:]          # magic + version, then KGeoMeta (88 bytes)
+    # v5 header: magic, version, byte-order tag, header bytes, record size,
+    # meta size, KGeoMeta (W, H first), provenance length + JSON, records.
+    version, tag, header_bytes, record_size = struct.unpack('<IIII', raw[4:20])
+    check(version == 5 and tag == 0x01020304 and record_size == 64, 'v5 header, little-endian, 64-byte records')
+    pixels_kgeo = raw[header_bytes:]
     check(npy[10 + hlen:] == pixels_kgeo, 'records byte-identical to the .kgeo pixels')
-    W, H = struct.unpack('<II', raw[8:16])
-    check((meta['W'], meta['H']) == (W, H) and meta['kgeo_version'] == struct.unpack('<I', raw[4:8])[0],
+    W, H = struct.unpack('<II', raw[24:32])
+    check((meta['W'], meta['H']) == (W, H) and meta['kgeo_version'] == version,
           'metadata sidecar matches the .kgeo header')
+    prov = meta['provenance']
+    check(prov['provenance_complete'] is True and prov['spacetime'] == 'knds'
+          and prov['metric.a'] == 0.9 and prov['solver.bundles'] is True
+          and prov['solver.chart'] == 'bl' and prov['camera.width'] == 48,
+          'provenance names the metric, camera and solver it was traced with')
+    check(prov['fields'].startswith('outcome:u1:0:1,_pad:u1:1:3,r:f4:4:4'), 'record schema in the provenance')
 
 sys.exit(1 if failures else 0)

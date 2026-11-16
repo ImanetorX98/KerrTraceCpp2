@@ -4,7 +4,7 @@
 // Part of the single-translation-unit renderer included by main.cpp;
 // see docs/ARCHITETTURA.md for how the modules fit together.
 
-#include "render.hpp"
+#include "provenance.hpp"
 
 // ── File I/O ──────────────────────────────────────────────────
 static void write_png(const char* path, const std::vector<RGB>& img, int W, int H) {
@@ -472,9 +472,11 @@ static int run_cli(int argc, char** argv) {
         }
         std::vector<GeoPixel> geo;
         KGeoMeta meta;
-        if (!load_kgeo(geo_file.c_str(), geo, meta)) {
+        KGeoProvenance provenance;
+        if (!load_kgeo(geo_file.c_str(), geo, meta, &provenance)) {
             std::cerr << "Error: cannot load " << geo_file << "\n"; return 1;
         }
+        warn_kgeo_visibility(provenance, cp);
         int gW=(int)meta.W, gH=(int)meta.H;
         std::cout << "Loaded: " << geo_file << "  " << gW << "x" << gH
                   << "  a=" << meta.a_bh << "  r_isco=" << meta.r_isco << "\n"
@@ -672,7 +674,9 @@ static int run_cli(int argc, char** argv) {
                   +"_"+mode_backend_tag
                   +"_"+make_ts()+".kgeo"
                 : geo_file;
-            save_kgeo(kgeo_path.c_str(), geo, meta);
+            save_kgeo(kgeo_path.c_str(), geo, meta,
+                      kgeo_provenance(W, H, fp, use_bundles, solver_mode, chart, intg, int_ctl,
+                                      M_bh, Q_bh, Lam, cp, "cpu"));
             std::cout << "Geo saved: " << kgeo_path << "\n";
         } else {
             // Full render (Phase 1 + Phase 2, optionally save .kgeo)
@@ -705,7 +709,9 @@ static int run_cli(int argc, char** argv) {
                               M_bh,fp.a,Q_bh,Lam,
                               g_tmp.r_isco(),g_tmp.r_isco(),fp.disk_out,
                               fp.theta,fp.phi,fp.r_obs};
-                save_kgeo(geo_file.c_str(), geo, meta);
+                save_kgeo(geo_file.c_str(), geo, meta,
+                          kgeo_provenance(W, H, fp, use_bundles, solver_mode, chart, intg, int_ctl,
+                                          M_bh, Q_bh, Lam, cp, last_render_backend));
                 std::cout << "Geo saved: " << geo_file << "\n";
             }
         }

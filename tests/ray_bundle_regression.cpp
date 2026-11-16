@@ -22,6 +22,7 @@
 // of that fix; each assertion is followed by the value it takes when broken and
 // when correct, so the margins are not guesses.
 
+#include "render_data.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -38,24 +39,9 @@
 
 namespace {
 
-// Must mirror GeoPixel in main.cpp exactly: this is a raw binary record and the
-// reader has no way to discover the writer's layout.
-struct GeoPixelRaw {
-    uint8_t outcome;
-    uint8_t pad[3];
-    float r;
-    float redshift;
-    float magnif;
-    float phi_disk;
-    float theta_esc;
-    float phi_esc;
-    float fp_dr_a, fp_dphi_a;   // pixel footprint on the disk (bundle mode)
-    float fp_dr_b, fp_dphi_b;
-    float coverage;             // disk coverage of the pixel (bundle mode)
-    float sky_dth_a, sky_dph_a; // footprint on the celestial sphere
-    float sky_dth_b, sky_dph_b;
-};
-static_assert(sizeof(GeoPixelRaw) == 64, "GeoPixelRaw must match GeoPixel in main.cpp");
+// The records are the renderer's own (render_data.hpp), read by its own
+// load_kgeo: a format change cannot leave this test on a stale layout.
+using GeoPixelRaw = GeoPixel;
 
 struct GeoFrame {
     uint32_t W = 0;
@@ -88,43 +74,11 @@ double percentile_of(std::vector<float> v, double p01) {
 }
 
 bool load_kgeo(const std::filesystem::path& path, GeoFrame& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-
-    char magic[4] = {};
-    f.read(magic, 4);
-    if (!f || std::memcmp(magic, "KGEO", 4) != 0) return false;
-
-    uint32_t version = 0;
-    f.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (!f || version != 4) return false;
-
-    f.read(reinterpret_cast<char*>(&out.W), sizeof(out.W));
-    f.read(reinterpret_cast<char*>(&out.H), sizeof(out.H));
-    if (!f || out.W == 0 || out.H == 0) return false;
-
-    f.seekg(80, std::ios::cur);  // rest of KGeoMeta after W/H
-    if (!f) return false;
-
-    // The record layout is not self-describing, so verify it against the file
-    // size before trusting a single pixel.
-    const std::uintmax_t total = std::filesystem::file_size(path);
-    const std::uintmax_t header = 4 + 4 + 4 + 4 + 80;
-    const std::uintmax_t payload = (total > header) ? (total - header) : 0;
-    const std::uintmax_t expected =
-        std::uintmax_t(out.W) * std::uintmax_t(out.H) * sizeof(GeoPixelRaw);
-    if (payload != expected) {
-        std::cerr << "kgeo record size mismatch: " << payload << " bytes for "
-                  << out.W << "x" << out.H << " at " << sizeof(GeoPixelRaw)
-                  << " bytes/pixel (expected " << expected << "). "
-                  << "GeoPixelRaw is out of sync with GeoPixel in main.cpp.\n";
-        return false;
-    }
-
-    out.px.resize(size_t(out.W) * size_t(out.H));
-    f.read(reinterpret_cast<char*>(out.px.data()),
-           std::streamsize(out.px.size() * sizeof(GeoPixelRaw)));
-    return bool(f);
+    KGeoMeta meta{};
+    if (!::load_kgeo(path.string().c_str(), out.px, meta)) return false;
+    out.W = meta.W;
+    out.H = meta.H;
+    return true;
 }
 
 // Small enough to stay a unit test: 0.4 s single-ray, 2.7 s bundle on an M-series
@@ -160,24 +114,6 @@ bool render_geo(const std::string& tracer_bin,
     const int rc = std::system(cmd.str().c_str());
     seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return rc == 0;
-}
-
-bool files_identical(const std::filesystem::path& a, const std::filesystem::path& b) {
-    std::error_code ec;
-    if (std::filesystem::file_size(a, ec) != std::filesystem::file_size(b, ec)) return false;
-    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
-    if (!fa || !fb) return false;
-    constexpr size_t kChunk = 1 << 16;
-    std::vector<char> ba(kChunk), bb(kChunk);
-    while (fa && fb) {
-        fa.read(ba.data(), std::streamsize(kChunk));
-        fb.read(bb.data(), std::streamsize(kChunk));
-        const std::streamsize na = fa.gcount(), nb = fb.gcount();
-        if (na != nb) return false;
-        if (na == 0) break;
-        if (std::memcmp(ba.data(), bb.data(), size_t(na)) != 0) return false;
-    }
-    return true;
 }
 
 }  // namespace
@@ -268,10 +204,13 @@ int main(int argc, char** argv) {
     {
         // Every ray that stops on a real event is unaffected by a larger cap.
         // Rays that instead run out of steps return wherever they happened to
-        // be, so raising the cap changes their record.
-        const bool same = files_identical(p_bundle, p_bundle_big);
+        // be, so raising the cap changes their record. Records, not files: the
+        // .kgeo provenance names the cap, so the headers differ by design.
+        GeoFrame big;
+        const bool same = load_kgeo(p_bundle_big, big) && big.px.size() == b.px.size()
+            && std::memcmp(big.px.data(), b.px.data(), b.px.size() * sizeof(GeoPixel)) == 0;
         std::ostringstream d;
-        d << "max-steps 60000 vs 200000, byte-identical=" << (same ? "yes" : "no");
+        d << "max-steps 60000 vs 200000, records identical=" << (same ? "yes" : "no");
         check(same, "bundle output is independent of --max-steps", d.str());
     }
     {

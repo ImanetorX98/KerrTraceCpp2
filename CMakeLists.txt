@@ -147,6 +147,28 @@ target_include_directories(kerr_tracer PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(kerr_tracer PRIVATE
     OUT_DIR="${CMAKE_SOURCE_DIR}/out")
 
+# Code revision for the .kgeo provenance. Read at configure time; configure
+# re-runs when HEAD or the current branch moves, so it follows commits, but an
+# uncommitted edit after configuring is not seen (hence "at_configure").
+execute_process(COMMAND git describe --always --dirty --abbrev=12
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE KERRTRACE_SOURCE_REV OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT KERRTRACE_SOURCE_REV)
+    set(KERRTRACE_SOURCE_REV "unknown")
+endif()
+if(EXISTS ${CMAKE_SOURCE_DIR}/.git/HEAD)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/.git/HEAD)
+    file(READ ${CMAKE_SOURCE_DIR}/.git/HEAD _kt_head)
+    if(_kt_head MATCHES "^ref: ([^\n]+)")
+        string(STRIP "${CMAKE_MATCH_1}" _kt_ref)
+        if(EXISTS ${CMAKE_SOURCE_DIR}/.git/${_kt_ref})
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/.git/${_kt_ref})
+        endif()
+    endif()
+endif()
+set(KERRTRACE_BUILD_INFO KERRTRACE_VERSION="${PROJECT_VERSION}" KERRTRACE_SOURCE_REV="${KERRTRACE_SOURCE_REV}")
+target_compile_definitions(kerr_tracer PRIVATE ${KERRTRACE_BUILD_INFO})
+
 target_compile_options(kerr_tracer PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>: -O3 ${KERRTRACE_ARCH_FLAGS}
                                 -Wall -Wextra>)
@@ -190,7 +212,8 @@ if(APPLE AND NOT USE_METAL)
     target_include_directories(kerr_tracer_metal PRIVATE ${CMAKE_SOURCE_DIR})
     target_compile_definitions(kerr_tracer_metal PRIVATE
         USE_METAL
-        OUT_DIR="${CMAKE_SOURCE_DIR}/out")
+        OUT_DIR="${CMAKE_SOURCE_DIR}/out"
+        ${KERRTRACE_BUILD_INFO})
     target_compile_options(kerr_tracer_metal PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O3 ${KERRTRACE_ARCH_FLAGS} -Wall -Wextra>)
     target_link_libraries(kerr_tracer_metal PRIVATE

@@ -21,7 +21,7 @@ all’asse e il single-ray riusa gli eventi del tracciatore condiviso. Vedere
 KerrTraceCpp2/
 ├── main.cpp                      29  solo stb + main(): include renderer/cli.hpp
 ├── renderer/                         il renderer CPU, un header per argomento
-│   ├── cli.hpp                  836  parsing dei flag, frame singolo, animazione
+│   ├── cli.hpp                  843  parsing dei flag, frame singolo, animazione
 │   ├── render.hpp               350  fase 1 + fase 2 sul backend scelto
 │   ├── backend_select.hpp       168  pianificatore unico CPU/Metal/CUDA
 │   ├── phase1.hpp               280  trace_geodesics: setup del frame, resampling di bordo
@@ -35,6 +35,7 @@ KerrTraceCpp2/
 │   ├── colorize.hpp             172  fase 2: GeoPixel → RGB
 │   ├── palettes.hpp             649  palette del disco, profili radiali
 │   ├── frame.hpp                 54  FrameParams, Spacetime, spacetime_traits
+│   ├── provenance.hpp           117  provenienza dei .kgeo, controllo di --color-only
 │   └── …                             trace_types, color_params, background,
 │                                     disk_physics, util, common
 ├── knds_metric.hpp              444  metrica Kerr-Newman-de Sitter, carte BL e KS
@@ -103,9 +104,24 @@ sotto-campioni, ma noi mediamo la *geometria* e ombreggiamo una volta.
 
 ## `GeoPixel`: il contratto fra le fasi (`render_data.hpp`)
 
-64 byte, `KGEO_VERSION` = 4. **Il formato non è auto-descrittivo**: chi legge deve
-conoscere il layout. Cambiarlo senza incrementare la versione è già successo
-(v0.2.3) ed è passato inosservato per mesi.
+64 byte, `KGEO_VERSION` = 5. Dalla v5 il file **si descrive da solo**:
+l'intestazione dichiara ordine dei byte, dimensione del record e di `KGeoMeta`,
+e un blocco JSON di provenienza con lo schema dei campi (`nome:tipo:offset:byte`)
+e come è stato fatto il buffer:
+- metrica: `spacetime` è `knds` o `dneg-wormhole`, perché il wormhole riusa i
+  campi di `KGeoMeta` con altro significato;
+- camera e FOV, solver, carta, integratore e tolleranze, bundle;
+- versione e revisione git del codice (`source_rev_at_configure`: letta al
+  configure, che si ripete a ogni commit), backend;
+- le impostazioni di colore che decidono quali raggi attraversano il disco
+  (`visibility.*`: palette, opacità, bordo Interstellar, tessere stratificate).
+
+`load_kgeo` rifiuta ordine dei byte, dimensioni o schema diversi dai propri: uno
+schema che cambia a parità di dimensione non passa più. I file v4 si leggono
+ancora, con `provenance_complete = false`. `--color-only` avvisa se palette o
+impostazioni `visibility.*` correnti differiscono da quelle del tracciamento:
+la geometria resta quella vecchia. Se un campo cambia significato senza cambiare
+nome o dimensione, incrementa comunque `KGEO_VERSION`.
 
 | campo | significato |
 |---|---|
@@ -118,13 +134,12 @@ conoscere il layout. Cambiarlo senza incrementare la versione è già successo
 | `sky_dth_*`, `sky_dph_*` | impronta del pixel **sulla sfera celeste** |
 | `coverage` | frazione di pixel coperta dal disco |
 
-I tre test di regressione replicano questo layout e hanno uno `static_assert`
-sulla dimensione: se cambi `GeoPixel` e non i test, il build fallisce subito.
-È voluto.
+I test che leggono `.kgeo` usano `GeoPixel` e `load_kgeo` di `render_data.hpp`:
+non ne esistono più copie scritte a mano.
 
 **Lettura da Python.** `kgeo_to_npy file.kgeo out` scrive `out.npy` (array NumPy
 strutturato H×W, `numpy.load("out.npy")["redshift"]`) e `out.json` con
-`KGeoMeta`. Il dtype non è scritto a mano: viene da `tools/kgeo_reflection.hpp`,
+`KGeoMeta` e la provenienza. Il dtype non è scritto a mano: viene da `tools/kgeo_reflection.hpp`,
 che descrive ogni campo con Sane C++ Reflection (`third_party/sane_cpp/`). I suoi
 `static_assert` fermano il build se un campo aggiunto a `GeoPixel` non è descritto
 lì o se compare padding. Se cambi `GeoPixel`, aggiorna anche quel file
@@ -318,5 +333,6 @@ punta a x86_64, perché cmake stesso può girare sotto Rosetta e mentire.
    `elliptic-fallback-black=off`.
 5. **Guardare il frame prima di committare.** Le statistiche possono essere vere
    e indicare il colpevole sbagliato.
-6. **Il `.kgeo` non è auto-descrittivo**: cambi `GeoPixel` → incrementa
-   `KGEO_VERSION` → aggiorna i tre test.
+6. **Cambi `GeoPixel`** → aggiorna lo schema in `kgeo_geopixel_schema`
+   (`render_data.hpp`, fallisce se un campo manca) e `tools/kgeo_reflection.hpp`;
+   se cambia un significato, incrementa `KGEO_VERSION`.
