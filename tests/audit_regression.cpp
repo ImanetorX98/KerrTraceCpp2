@@ -143,6 +143,12 @@ void backend_tests() {
     for(auto palette : {DiskPalette::STRATIFIED,DiskPalette::INTERSTELLAR_NASA}) {
         c.palette=palette;check(metal_cpu_reason(c,false,false)!=nullptr,"Metal refuses unsupported palettes explicitly");
     }
+    for(double opacity : {0.0,0.5,0.999}) {
+        c=ColorParams{};c.disk_opacity=opacity;
+        check(metal_cpu_reason(c,false,false)!=nullptr,"Metal sends a transparent disk to CPU compositing");
+    }
+    c=ColorParams{};c.disk_opacity=1.0;
+    check(!metal_cpu_reason(c,false,false),"Metal keeps an opaque disk");
     c=ColorParams{};
     check(metal_cpu_reason(c,true,false)!=nullptr,"Metal routes Jacobi footprint filtering to CPU");
     check(metal_cpu_reason(c,false,true)!=nullptr,"Metal does not silently drop requested KGEO export");

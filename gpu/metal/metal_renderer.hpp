@@ -36,7 +36,7 @@ struct CameraParams_C {
     float exposure; // tonemap exposure
     float gamma; // tonemap gamma
     float disk_brightness; // common disk brightness multiplier
-    float disk_opacity; // common disk opacity [0,1] shared by all palettes
+    float disk_opacity; // not read by the shader: opacity < 1 runs on the CPU
     int   disk_palette; // 0=blackbody, 1=stratified, 2=interstellar
     int   disk_radial_profile; // 0=page_thorne, 1=physical_nt
     float interstellar_omega0;
