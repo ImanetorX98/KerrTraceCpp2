@@ -29,7 +29,7 @@ KerrTraceCpp2/
 │   ├── parallel.hpp              37  ciclo parallelo per righe (OpenMP o thread)
 │   ├── tracer_bl.hpp            197  BL numerico, il riferimento
 │   ├── tracer_ks.hpp            478  Kerr-Schild Cartesiano
-│   ├── tracer_separable.hpp     296  Kerr separabile (Q=0, Λ=0)
+│   ├── tracer_separable.hpp     303  Kerr separabile (Q=0, Λ=0)
 │   ├── tracer_elliptic.hpp      651  forma chiusa, Carlson + Jacobi
 │   ├── tracer_wormhole.hpp       47  integrazione DNEG di un raggio
 │   ├── colorize.hpp             172  fase 2: GeoPixel → RGB
@@ -51,7 +51,7 @@ KerrTraceCpp2/
 │   ├── tracer.cu                624  kernel CUDA + launcher
 │   └── tracer.cuh                26
 │
-├── tests/                             19 test nella build Metal, tutti via ctest
+├── tests/                             21 test nella build Metal, tutti via ctest
 │   ├── core_tests.cpp           124  unità pure
 │   ├── bump_detector.cpp        324  self-test
 │   ├── spin_orientation_regression.cpp   268
@@ -140,7 +140,7 @@ Selezionati da spaziotempo, `--solver-mode` e carta.
 |---|---|---|---|
 | `BlPixelTracer` | `trace_single` | tracer_bl.hpp | BL, numerico, il riferimento |
 | `KsPixelTracer` | `trace_single_ks` | tracer_ks.hpp | KS Cartesiana, default quando `Q=0, Λ=0` |
-| `SeparablePixelTracer` | `trace_single_separable_kerr` | tracer_separable.hpp | Kerr puro, potenziali separati |
+| `SeparablePixelTracer` | `trace_single_separable_kerr` | tracer_separable.hpp | Kerr puro, potenziali separati in tempo di Mino, ~4× più veloce di BL |
 | `EllipticPixelTracer` | `trace_single_elliptic_closed` | tracer_elliptic.hpp | forma chiusa con integrali ellittici |
 | `BundlePixelTracer` | `trace_bundle` | ray_bundle.hpp | modalità `--bundles` |
 | `WormholePixelTracer` | `trace_single_wormhole` | tracer_wormhole.hpp | metrica DNEG |

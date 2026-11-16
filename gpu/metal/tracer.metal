@@ -1001,10 +1001,15 @@ struct SeparableConsts {
     float Qc;  // Carter constant
 };
 
+// Mino time tau (d lambda = Sigma d tau), second order: r'' = R'/2,
+// theta'' = Theta'/2, with ur^2 = R, uth^2 = Theta as first integrals.
+// Mirrors renderer/tracer_separable.hpp.
 struct SeparableState {
     float r, theta, phi;
-    int sgn_r, sgn_th;
+    float ur, uth;   // dr/dtau, dtheta/dtau
 };
+
+struct SeparableRate { float r, theta, phi, ur, uth; };
 
 static float kerr_sep_delta(thread const SeparableConsts& c, float r) {
     return r*r - 2.0f*c.M*r + c.a*c.a;
@@ -1024,56 +1029,48 @@ static float kerr_sep_Theta(thread const SeparableConsts& c, float theta) {
     return c.Qc - ct*ct * (c.Lz*c.Lz/st2 - c.a*c.a*c.E*c.E);
 }
 
-static bool kerr_sep_rhs(thread const SeparableConsts& c, thread SeparableState& s,
-                         thread float& dr, thread float& dth, thread float& dphi) {
-    const float st = sin(s.theta);
+static bool kerr_sep_rhs(thread const SeparableConsts& c, thread const SeparableState& s,
+                         thread SeparableRate& d) {
+    const float st = max(sin(s.theta), 1e-7f);
     const float ct = cos(s.theta);
-    const float st2 = max(st*st, 1e-14f);
-    const float sigma = max(s.r*s.r + c.a*c.a*ct*ct, 1e-14f);
     const float delta = kerr_sep_delta(c, s.r);
     const float P = c.E*(s.r*s.r + c.a*c.a) - c.a*c.Lz;
-    const float R = kerr_sep_R(c, s.r);
-    const float Th = kerr_sep_Theta(c, s.theta);
+    const float K = c.Qc + (c.Lz - c.a*c.E)*(c.Lz - c.a*c.E);
 
-    dr = ((s.sgn_r >= 0) ? 1.0f : -1.0f) * sqrt(max(R, 0.0f)) / sigma;
-    dth = ((s.sgn_th >= 0) ? 1.0f : -1.0f) * sqrt(max(Th, 0.0f)) / sigma;
-    dphi = (c.Lz/st2 + c.a*(P/max(delta, 1e-14f) - c.E)) / sigma;
-    return isfinite(dr) && isfinite(dth) && isfinite(dphi);
+    d.r     = s.ur;
+    d.theta = s.uth;
+    d.phi   = c.Lz/(st*st) + c.a*(P/max(delta, 1e-14f) - c.E);
+    d.ur    = 2.0f*c.E*s.r*P - (s.r - c.M)*K;                     // R'/2
+    d.uth   = c.Lz*c.Lz*ct/(st*st*st) - c.a*c.a*c.E*c.E*st*ct;    // Theta'/2
+    return isfinite(d.phi) && isfinite(d.ur) && isfinite(d.uth);
+}
+
+static SeparableState sep_advance(thread const SeparableState& s, thread const SeparableRate& d, float h) {
+    SeparableState o;
+    o.r = s.r + h*d.r; o.theta = s.theta + h*d.theta; o.phi = s.phi + h*d.phi;
+    o.ur = s.ur + h*d.ur; o.uth = s.uth + h*d.uth;
+    return o;
 }
 
 static bool rk4_step_separable_kerr(thread const SeparableConsts& c, thread SeparableState& s, float h) {
-    float dr1,dth1,dphi1;
-    float dr2,dth2,dphi2;
-    float dr3,dth3,dphi3;
-    float dr4,dth4,dphi4;
-
-    SeparableState s0 = s;
-    if (!kerr_sep_rhs(c, s0, dr1, dth1, dphi1)) return false;
-
-    SeparableState s2 = s0;
-    s2.r     = s0.r     + 0.5f*h*dr1;
-    s2.theta = s0.theta + 0.5f*h*dth1;
-    s2.phi   = s0.phi   + 0.5f*h*dphi1;
-    if (!kerr_sep_rhs(c, s2, dr2, dth2, dphi2)) return false;
-
-    SeparableState s3 = s0;
-    s3.r     = s0.r     + 0.5f*h*dr2;
-    s3.theta = s0.theta + 0.5f*h*dth2;
-    s3.phi   = s0.phi   + 0.5f*h*dphi2;
-    if (!kerr_sep_rhs(c, s3, dr3, dth3, dphi3)) return false;
-
-    SeparableState s4 = s0;
-    s4.r     = s0.r     + h*dr3;
-    s4.theta = s0.theta + h*dth3;
-    s4.phi   = s0.phi   + h*dphi3;
-    if (!kerr_sep_rhs(c, s4, dr4, dth4, dphi4)) return false;
-
-    s.r     += h/6.0f*(dr1   + 2.0f*dr2   + 2.0f*dr3   + dr4);
-    s.theta += h/6.0f*(dth1  + 2.0f*dth2  + 2.0f*dth3  + dth4);
-    s.phi   += h/6.0f*(dphi1 + 2.0f*dphi2 + 2.0f*dphi3 + dphi4);
-    return isfinite(s.r) && isfinite(s.theta) && isfinite(s.phi);
+    SeparableRate k1, k2, k3, k4;
+    if (!kerr_sep_rhs(c, s, k1)) return false;
+    SeparableState t = sep_advance(s, k1, 0.5f*h);
+    if (!kerr_sep_rhs(c, t, k2)) return false;
+    t = sep_advance(s, k2, 0.5f*h);
+    if (!kerr_sep_rhs(c, t, k3)) return false;
+    t = sep_advance(s, k3, h);
+    if (!kerr_sep_rhs(c, t, k4)) return false;
+    s.r     += h/6.0f*(k1.r     + 2.0f*k2.r     + 2.0f*k3.r     + k4.r);
+    s.theta += h/6.0f*(k1.theta + 2.0f*k2.theta + 2.0f*k3.theta + k4.theta);
+    s.phi   += h/6.0f*(k1.phi   + 2.0f*k2.phi   + 2.0f*k3.phi   + k4.phi);
+    s.ur    += h/6.0f*(k1.ur    + 2.0f*k2.ur    + 2.0f*k3.ur    + k4.ur);
+    s.uth   += h/6.0f*(k1.uth   + 2.0f*k2.uth   + 2.0f*k3.uth   + k4.uth);
+    return isfinite(s.r) && isfinite(s.theta) && isfinite(s.phi)
+        && isfinite(s.ur) && isfinite(s.uth);
 }
 
+// Step doubling; h is a Mino-time step. Phase-space norm of the BL integrator.
 static bool rk4_adaptive_separable_kerr(thread const SeparableConsts& c,
                                         thread SeparableState& s,
                                         thread float& h,
@@ -1082,37 +1079,63 @@ static bool rk4_adaptive_separable_kerr(thread const SeparableConsts& c,
 
     SeparableState sA = s0;
     if (!rk4_step_separable_kerr(c, sA, h)) {
-        h = max(h*0.5f, 1e-10f);
+        h *= 0.5f;
         return false;
     }
 
     SeparableState sB = s0;
     if (!rk4_step_separable_kerr(c, sB, 0.5f*h) ||
         !rk4_step_separable_kerr(c, sB, 0.5f*h)) {
-        h = max(h*0.5f, 1e-10f);
+        h *= 0.5f;
         return false;
     }
 
-    const float err = sqrt(
-        (sA.r - sB.r)*(sA.r - sB.r) +
-        (sA.theta - sB.theta)*(sA.theta - sB.theta) +
-        (sA.phi - sB.phi)*(sA.phi - sB.phi)
-    ) / 15.0f;
+    // Relative, floored like rk4_scaled_err: an absolute 1e-7 is below FP32
+    // rounding of r ~ 60 and would never be met.
+    tol = max(tol, ADAPT_TOL_MIN_F32);
+    const float delta = max(abs(kerr_sep_delta(c, sB.r)), 1e-14f);
+    const float4 diff = float4(sA.r - sB.r, sA.theta - sB.theta,
+                               (sA.ur - sB.ur) / delta, sA.uth - sB.uth);
+    const float4 y = float4(sB.r, sB.theta, sB.ur / delta, sB.uth);
+    const float e_phi = (sA.phi - sB.phi) / (15.0f * tol * (1.0f + abs(sB.phi)));
+    const float e4 = rk4_scaled_err(diff, y, tol);
+    const float err = sqrt((4.0f*e4*e4 + e_phi*e_phi) / 5.0f);
 
     if (!isfinite(err)) {
-        h = max(h*0.5f, 1e-10f);
+        h *= 0.5f;
         return false;
     }
 
-    if (err < tol || h < 1e-10f) {
+    if (err <= 1.0f) {
         s = sB;
-        const float sc = (err > 1e-14f) ? 0.9f * pow(tol/err, 0.2f) : 4.0f;
-        h = clamp(h*sc, 1e-10f, 100.0f);
+        h *= (err > 1e-8f) ? min(4.0f, 0.9f * pow(1.0f/err, 0.2f)) : 4.0f;
         return true;
     }
 
-    h = max(h * 0.9f * pow(tol/err, 0.25f), 1e-10f);
+    h *= max(0.1f, 0.9f * pow(1.0f/err, 0.25f));
     return false;
+}
+
+// State where f = 0 inside the accepted step s_prev -> s_prev + h: RK4 sub-step
+// of alpha*h, alpha corrected by Newton. kind 0: theta = pi/2; kind 1: r = target.
+static SeparableState sep_locate_event(thread const SeparableConsts& c,
+                                       thread const SeparableState& s_prev,
+                                       float h, thread float& alpha, int kind, float target) {
+    SeparableState x = s_prev;
+    for (int it = 0; it < 6; ++it) {
+        x = s_prev;
+        if (!rk4_step_separable_kerr(c, x, alpha*h)) return x;
+        const float f = (kind == 0) ? (x.theta - M_PI_2_F) : (x.r - target);
+        const float rate = ((kind == 0) ? x.uth : x.ur) * h;
+        if (!(abs(rate) > 0.0f)) return x;
+        const float next = clamp(alpha - f/rate, 0.0f, 1.0f);
+        const bool done = abs(next - alpha) < 1e-7f;
+        alpha = next;
+        if (done) break;
+    }
+    x = s_prev;
+    rk4_step_separable_kerr(c, x, alpha*h);
+    return x;
 }
 
 // ── Elliptic-closed helpers (GPU) ────────────────────────────
@@ -2849,55 +2872,45 @@ static inline void trace_pixel_impl(
 
         bool semi_ok = isfinite(sc.E) && isfinite(sc.Lz) && isfinite(sc.Qc) && (sc.E > 0.0f);
         if (semi_ok) {
-            float dr0=0.0f, dth0=0.0f, dphi0=0.0f, dpr0=0.0f, dpth0=0.0f;
-            geodesic_rhs(r, theta, pr, pth, pt, pphi, M, a, Q, L, dr0, dth0, dphi0, dpr0, dpth0);
+            // dr/dtau = Delta p_r, dtheta/dtau = p_theta.
+            SeparableState s;
+            s.r = r; s.theta = theta; s.phi = phi;
+            s.ur = kerr_sep_delta(sc, r) * pr;
+            s.uth = pth;
 
-            SeparableState s{
-                r, theta, phi,
-                (dr0 >= 0.0f) ? 1 : -1,
-                (dth0 >= 0.0f) ? 1 : -1
-            };
-
-            float h = max(cp.step_init, ADAPT_H_MIN);
-            float prev_r_sep = s.r;
-            float prev_theta_sep = s.theta;
-            float prev_phi_sep = s.phi;
-            float prev_Rpot = kerr_sep_R(sc, s.r);
-            float prev_Thpot = kerr_sep_Theta(sc, s.theta);
-            constexpr float R_turn_eps = 1e-7f;
-            constexpr float Th_turn_eps = 1e-9f;
+            // step_init is an affine step; d tau = d lambda / Sigma.
+            float h = max(cp.step_init, ADAPT_H_MIN) / (r*r + a*a*ct*ct);
+            const float h_min = 1e-9f * h;
             bool done = false;
 
             const int semi_iter_cap = max(cp.max_steps, 1);
             for (int iter = 0; iter < semi_iter_cap; ++iter) {
-                SeparableState s_prev = s;
-                const float prev_Rpot_step = prev_Rpot;
-                const float prev_Thpot_step = prev_Thpot;
+                const SeparableState s_prev = s;
                 float step_used = h;
                 int rejects = 0;
                 while (true) {
                     step_used = h;
                     if (rk4_adaptive_separable_kerr(sc, s, h, cp.integrator_tol)) break;
-                    if (!isfinite(h) || ++rejects > 64) {
+                    if (!isfinite(h) || h < h_min || ++rejects > 64) {
                         semi_ok = false;
                         break;
                     }
                 }
                 if (!semi_ok) break;
 
-                // Keep theta in [0, pi] and flip polar branch at reflections.
-                if (s.theta < 0.0f) {
-                    s.theta = -s.theta;
-                    s.sgn_th *= -1;
-                } else if (s.theta > 3.14159265358979323846f) {
-                    s.theta = 6.28318530717958647692f - s.theta;
-                    s.sgn_th *= -1;
-                }
-
+                // Back onto the first integrals where they are positive; past a
+                // turning point (potential <= 0) the integrated velocity stands.
                 const float Rnow = kerr_sep_R(sc, s.r);
                 const float Thnow = kerr_sep_Theta(sc, s.theta);
-                if (Rnow <= R_turn_eps && prev_Rpot_step > R_turn_eps) s.sgn_r *= -1;
-                if (Thnow <= Th_turn_eps && prev_Thpot_step > Th_turn_eps) s.sgn_th *= -1;
+                if (Rnow > 0.0f)  s.ur  = copysign(sqrt(Rnow),  s.ur);
+                if (Thnow > 0.0f) s.uth = copysign(sqrt(Thnow), s.uth);
+
+                // Through a pole (only reachable with Lz = 0): back into [0, pi].
+                if (s.theta < 0.0f || s.theta > M_PI_F) {
+                    s.theta = (s.theta < 0.0f) ? -s.theta : 2.0f*M_PI_F - s.theta;
+                    s.uth = -s.uth;
+                    s.phi += M_PI_F;
+                }
 
                 if (s.r < kp.r_horizon * 1.03f) {
                     done = true; // black
@@ -2906,12 +2919,11 @@ static inline void trace_pixel_impl(
 
                 if (s.r > cp.r_obs * 1.05f) {
                     const float r_escape = cp.r_obs * 1.05f;
-                    const float denom = s.r - prev_r_sep;
-                    float w = (abs(denom) > 1e-8f) ? ((r_escape - prev_r_sep) / denom) : 1.0f;
+                    const float denom = s.r - s_prev.r;
+                    float w = (abs(denom) > 1e-8f) ? ((r_escape - s_prev.r) / denom) : 1.0f;
                     w = clamp(w, 0.0f, 1.0f);
-                    const float th_esc = prev_theta_sep + w*(s.theta - prev_theta_sep);
-                    const float ph_esc = prev_phi_sep + w*(s.phi - prev_phi_sep);
-                    float4 bgc = clamp(sample_background(bg_tex, bg_samp, th_esc, ph_esc), 0.0f, 1.0f);
+                    const SeparableState x = sep_locate_event(sc, s_prev, step_used, w, 1, r_escape);
+                    float4 bgc = clamp(sample_background(bg_tex, bg_samp, x.theta, x.phi), 0.0f, 1.0f);
                     colour = (0xFFu << 24)
                            | (uint32_t(bgc.b*255.0f) << 16)
                            | (uint32_t(bgc.g*255.0f) << 8)
@@ -2925,24 +2937,15 @@ static inline void trace_pixel_impl(
                 const bool maybe_equator_sep = sign_change_f(q0, q1) ||
                                                (min(abs(q0), abs(q1)) < 0.35f);
                 if (maybe_equator_sep) {
-                    float dr_prev=0.0f, dth_prev=0.0f, dphi_prev=0.0f;
-                    float dr_now=0.0f, dth_now=0.0f, dphi_now=0.0f;
-                    semi_ok = kerr_sep_rhs(sc, s_prev, dr_prev, dth_prev, dphi_prev) &&
-                              kerr_sep_rhs(sc, s,      dr_now,  dth_now,  dphi_now);
-                    if (!semi_ok) break;
-
                     float alpha = 0.0f;
                     if (first_event_alpha_hermite_f(
-                            s_prev.theta, s.theta, dth_prev, dth_now, step_used, M_PI_2_F,
+                            s_prev.theta, s.theta, s_prev.uth, s.uth, step_used, M_PI_2_F,
                             alpha, 8, 7)) {
-                        const float r_hit = hermite_interp_f(
-                            s_prev.r, s.r, dr_prev, dr_now, step_used, alpha);
-                        const float phi_hit = interp_scalar_mode_f(
-                            s_prev.phi, s.phi, dphi_prev, dphi_now, step_used, alpha, cp.intersection_mode);
-                        if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out) {
-                            if (disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
-                                continue;
-                            }
+                        const SeparableState x = sep_locate_event(sc, s_prev, step_used, alpha, 0, 0.0f);
+                        const float r_hit = x.r;
+                        const float phi_hit = x.phi;
+                        if (r_hit >= kp.r_isco && r_hit <= kp.r_disk_out &&
+                            !disk_tile_pass_through(r_hit, phi_hit, kp.r_isco, kp.r_disk_out, cp)) {
                             const float red = robust_disk_redshift(r_hit, pt, pphi, M, a, Q, L, cp.observer_ut);
                             colour = disk_color_abgr(r_hit, phi_hit, red, 1.0f,
                                                      M, a, kp.r_isco, kp.r_disk_out, cp);
@@ -2951,12 +2954,6 @@ static inline void trace_pixel_impl(
                         }
                     }
                 }
-
-                prev_r_sep = s.r;
-                prev_theta_sep = s.theta;
-                prev_phi_sep = s.phi;
-                prev_Rpot = Rnow;
-                prev_Thpot = Thnow;
             }
 
             if (semi_ok && done) {
