@@ -31,6 +31,10 @@ It includes CPU and GPU backends, plus a basic web UI.
 - `frontend/`, `server/`: web UI and API layer
 - `tests/`: regression and geometry tests
 
+Developer documentation (Italian): [architecture and workflow](docs/ARCHITETTURA.md),
+[physics and conventions](docs/FISICA.md), [roadmap and status](docs/ROADMAP.md),
+[open issues](docs/OPEN-ISSUES.md).
+
 ## Build
 
 Requirements:

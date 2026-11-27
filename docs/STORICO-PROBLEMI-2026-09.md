@@ -1,0 +1,265 @@
+# Storico dei problemi (settembre 2026)
+
+Diario conservato per le misure e le diagnosi, comprese quelle sbagliate. **Non è
+lo stato corrente**: per quello vedi [OPEN-ISSUES.md](OPEN-ISSUES.md) e
+[ROADMAP.md](ROADMAP.md). Stato al 27 novembre 2026 delle voci ancora aperte qui:
+0 → A6; 2 → E2; 4 → C1 (il clamp g ≥ 0,2 è spento di default); 5 → risolto da D2
+(`.kgeo` v5); 6 → C2; 8 → il dev server LAN è ora uno script opzionale
+(`start:lan`), `.gitignore` copre build e `out/`, `CMakeLists.txt.tmp` è sparito,
+la frase su `build/tracer.metal` in CLAUDE.md è corretta; resta la pulizia di
+build e rami (D5).
+
+## Com'era il 2026-09-09
+
+Aggiornamento sul contorno Metal; le diagnosi storiche restano sotto con il loro stato.
+
+## 0. Gradino Metal BL risolto; residui sull'anello sottile — APERTO
+
+Il punto cerchiato a circa (178,95) nel frame 640×360 è corretto:
+le derivate BL sono ora analitiche e il passo risolve l'avvicinamento all'asse.
+Lo scarto locale passa da 5 a 1 pixel, e da 9 a 0 pixel a 1280×720.
+Il renderer single-ray usa inoltre l'intersezione Hermite richiesta.
+
+Resta un residuo di **2 pixel** nella regione `upper`: in BL a 1280×720
+un punto candidato presso (590,173), e in KS a 640×360 undici confronti
+diretti fuori soglia. Il punto cerchiato passa in tutte le scene provate.
+La matrice estesa passa 102/108 controlli, gli altri 11 test passano.
+Il test globale del contorno rimane fallito; nessuna soglia è stata allargata.
+
+Diagnosi, prove intermedie e frame prima/dopo in
+[METAL-BUMP-FIX-2026-09-09.md](METAL-BUMP-FIX-2026-09-09.md).
+
+---
+
+## 1. ~~La magnificazione dei bundle è a metà strada~~ — RISOLTO in v0.2.15 (`dfde570`)
+
+La diagnosi qui sotto era **sbagliata**. La chiazza bianca non veniva dalla
+magnificazione: tolta la modulazione, l'anello restava identico. La causa vera
+era in `ray_bundle.hpp`, segno di Ω:
+
+```cpp
+const double Omega = g.keplerian_omega(r_hit);   // manca il meno
+```
+
+`keplerian_omega()` restituisce **−Ω_K** per convenzione. Senza la negazione,
+`d2 = −(g_tt + 2·g_tφ·Ω + g_φφ·Ω²)` finiva sul ramo retrogrado e diventava
+negativo sotto r ≈ 1.5M → fallback `red = 1.0` → disco interno non spostato,
+con g⁴ un fattore 10⁴ di troppo. Un secondo errore di segno su `b` mascherava
+il primo annullandosi nel denominatore.
+
+Dopo il fix, su 326 845 pixel comuni: `|Δg|` mediano 0.0285 → 0.0153, p99
+0.924 → 0.069, e i 4864 pixel bloccati a g esatto 1.000 sono spariti.
+
+Normalizzazione **rimossa del tutto** (`disk_magnif_reference()` cancellata).
+La modulazione da magnificazione è ora opzione spenta di default
+(`--bundle-magnification`), perché per un disco risolto Liouville dà brillanza
+superficiale `g⁴ ×` emessa, indipendente dal footprint del fascio.
+
+**Nota di processo, ancora valida**: `1ded000` era stato spedito senza guardare
+l'immagine, sulle sole statistiche. Le statistiche erano vere ma non
+catturavano il difetto — e per giunta indicavano il colpevole sbagliato.
+**Guardare sempre il frame, e confrontare i `.kgeo` prima di attribuire una
+causa.**
+
+---
+
+## 1-bis. ~~La geodetica del bundle diverge da quella single-ray~~ — DIAGNOSI SBAGLIATA
+
+Confrontavo bundle **in BL** con single-ray **in KS** (la carta di default). A
+parità di carta il fascio segue la geodetica centrale in modo esatto:
+
+| confronto | `\|Δr\|` mediano | p99 |
+|---|---|---|
+| single KS vs bundle BL | 0.5313 | 2.531 |
+| single **BL** vs bundle **BL** | **0.0000** | 0.001 (max) |
+
+Il difetto è reale ma sta altrove → punto **1-ter**.
+
+---
+
+## 1-ter. ~~BL e KS non danno la stessa immagine~~ — RISOLTO in v0.2.18 → v0.2.20
+
+Causa: `bl_covector_to_ks()` trattava Kerr-Schild ingoing come una semplice
+rietichettatura spaziale di Boyer-Lindquist. Non lo è:
+
+```
+dT      = dt   + (2Mr − Q²)/Δ_r · dr
+dφ_KS   = dφ   + a/Δ_r         · dr
+```
+
+quindi sia `t` sia `φ_BL` dipendono dalle coordinate **spaziali** KS attraverso
+`r(X,Y,Z)`, e il covettore prende due termini in più lungo `∂r/∂X^i`. Passando
+`p_r` grezzo si iniettava un momento radiale spurio: a r=40M, a=0 il termine
+mancante `(2Mr/Δ)p_t` vale il **5.3%** di E — esattamente l'ordine dell'errore
+osservato.
+
+Verifica assoluta contro la teoria (ombra di Schwarzschild, osservatore statico
+a r=40M, valore analitico 7.2740°):
+
+| | prima | dopo |
+|---|---|---|
+| BL | 7.2803° (+0.09%) | 7.2803° (+0.09%) |
+| **KS** | **7.6566° (+5.26%)** | **7.2803° (+0.09%)** |
+
+BL era sempre stata corretta; KS, **la carta di default**, sbagliava del 5%.
+Accordo fra carte: `|Δr|` mediano da 0.658 a **1.6e-5**, differenza di hit da
+10.6% a **0**, `|Δg|` da 0.0136 a **4.8e-7**.
+
+Test `kerrtrace.chart_consistency`: contro il binario pre-fix fallisce 7
+controlli su 8 (passa solo BL, che era giusta).
+
+**Lo shader Metal aveva lo stesso identico difetto** (`BL_covector_to_KS` in
+`tracer.metal` non riceveva nemmeno `p_t`), quindi ogni render GPU aveva l'ombra
+del 5% troppo grande. Corretto in v0.2.20 in entrambi i kernel. Metal ora dà
+7.2803° come la CPU, e il confronto diretto GPU↔CPU a `a=0.9` dà `|Δr|` mediano
+2.8e-5 con lo stesso numero di hit (19 435).
+
+**Pezzo φ chiuso in v0.2.19**: la torsione `φ_KS = φ_BL + G(r)` con
+`G(r) = a/(r₊−r₋)·ln|(r−r₊)/(r−r₋)|` (limite estremale `−a/(r−M)`) ora è
+applicata in entrata e tolta in uscita. `|Δφ_disk|` a `a=0.9` da **0.1267** a
+**2.9e-5** rad, cioè lo stesso residuo numerico del caso `a=0` dove torsione non
+ce n'è. Sull'azimut di fuga l'effetto era già piccolo (G→0 all'infinito):
+da 0.00115 a 2.9e-5.
+
+---
+
+## 1-ter (storico). Come si presentava
+
+E la differenza **non cala stringendo la tolleranza**, quindi non è errore
+d'integrazione: BL vs KS dà `|Δr|` mediano 0.5313 a `tol=1e-7` e 0.5312 a
+`tol=1e-11`, mentre ciascuna carta confrontata con se stessa a tolleranza
+diversa dà 0.0000.
+
+- KS trova 23 541 hit sul disco, BL 21 208: **2699 pixel** di differenza, situati
+  a **r ≈ 11.4**, cioè sul bordo **esterno** del disco, non vicino all'orizzonte.
+- `|Δr|` **cresce con r** (0.27 dentro 2M, 0.68 fra 4M e 8M): il contrario di
+  quello che darebbe un problema di carta vicino all'orizzonte.
+- Un riallineamento rigido porta la mediana solo da 0.53 a 0.42 → c'è anche un
+  piccolo disallineamento della camera fra le carte, ma non è la causa principale.
+- Il solver ellittico trova esattamente lo stesso insieme di hit di KS (23 541),
+  indizio a favore di KS ma debole, perché i suoi fallback girano in KS.
+
+Piano in `PLAN-2026-09-05.md`, voce **P0**. È bloccante: il bundle esiste solo in
+BL, quindi eredita la carta eventualmente sbagliata.
+
+---
+
+## 2. Ricerca DNGR — appena iniziata
+
+Il paper primario è in locale: `sources/DNGR_James_Thorne_2015_1502.03808.pdf`,
+47 pagine. Conteggi grezzi: "caustic" 84 occorrenze, "bundle" 42,
+**"magnification" zero**. Suggerisce che DNGR tratti le caustiche come struttura
+geometrica da risolvere infittendo i fasci, non come valori da tagliare.
+
+Dalla scheda del paper: DNGR usa **filtraggio spaziale** per raccordare le
+interfacce fra fasci adiacenti e **filtraggio temporale** fra fotogrammi. Non
+un clamp.
+
+Da fare: leggere le sezioni pertinenti del PDF. È la fonte primaria, meglio dei
+forum. Link: <https://iopscience.iop.org/article/10.1088/0264-9381/32/6/065001>
+
+---
+
+## 3. ~~Metal non coperto dalla normalizzazione~~ — non si applica più
+
+Con la normalizzazione rimossa non c'è nessuna statistica frame-wide da
+replicare sulla GPU. Lo shader ha già il segno di Ω corretto
+(`tracer.metal:1678`), quindi il bug del punto 1 era solo lato CPU.
+
+---
+
+## 4. Mappatura temperatura→colore (diagnosticato, non toccato)
+
+Due difetti indipendenti in `disk_colour` (blackbody):
+
+**Clamp che morde.** `red_phys = clamp(g, 0.2, 5.0)`. Il tetto è inerte (0.00%),
+ma il **fondo a 0.2 blocca il 3.7%** dei pixel: le regioni fortemente
+redshiftate non diventano rosse quanto dovrebbero. Il minimo misurato di `g` è
+0.031, sei volte sotto il clamp.
+
+**Esponente sbagliato.** Il codice usa `T ∝ √(6M/r)` = `r^-0.50`. La fisica dà
+`T = (F/σ)^(1/4)` con `F ∝ r^-3`, quindi **`r^-0.75`**. Il disco esterno esce
+troppo caldo (giallo-bianco invece di rosso profondo): a 14M il codice dà 0.378
+contro 0.232 fisico, normalizzato a 2M.
+
+Asimmetria da notare: la **luminosità** usa già il flusso corretto via
+`disk_flux_raw`; è solo la **temperatura di colore** ad avere l'esponente
+diverso.
+
+Il fattore Doppler in sé è stato verificato ed **è corretto**: `disk_redshift`
+implementa il fattore di Bardeen `g = E/[u^t(E−ΩL)]`, equivalente alla forma
+`√d2/(1−Ωb)`; `doppler_exp = 4` è giusto per l'intensità bolometrica; su 106 681
+pixel di disco l'intervallo è 0.031–1.460 con mediana 0.763 e **zero** pixel al
+clamp `kGMax=6`.
+
+---
+
+## 5. KGEO: versione corretta, formato autodescrittivo ancora da progettare
+
+Il formato attuale è v4, con record da 64 byte. Dalla v0.2.34 il lettore reale
+controlla header, overflow delle dimensioni e lunghezza completa prima di
+allocare; i fallimenti di scrittura vengono propagati. Resta da introdurre un
+header con passo del record, tipo di metrica e provenienza della geometria.
+Le cache v4 precedenti rimangono leggibili ma conservano il vecchio redshift:
+occorre ritracciarle per applicare la normalizzazione dell'osservatore finito.
+
+---
+
+## 6. Discontinuità del verso di rotazione del disco a `a = 0`
+
+`s = (a < 0) ? 1 : −1` fa cadere `a = 0` nel ramo positivo. Misurato: offset del
+lato brillante −89.2 a `a=0` contro +87.2 a `a=−0.2`. Legittimo — in
+Schwarzschild non esiste un verso preferito e bisogna sceglierne uno — ma se si
+anima lo spin attraverso lo zero il disco si ribalta di colpo.
+
+---
+
+## 7. ~~Modalità bundle senza copertura di test~~ — RISOLTO in v0.2.16 (`5e16819`)
+
+`tests/ray_bundle_regression.cpp`, test ctest `kerrtrace.ray_bundle`, 5.9 s.
+Tre render 320×180 (single-ray, bundle, bundle con `--max-steps 200000`) e otto
+controlli sui `.kgeo`. Soglie calibrate su binari costruiti da entrambi i lati
+di `dfde570`: contro un build pre-fix fallisce esattamente i tre controlli sul
+redshift e passa gli altri cinque.
+
+Terminazione coperta due volte: tetto di 300 s per render e **identità byte a
+byte** dell'output a `--max-steps` 60000 e 200000 — un raggio che si ferma su un
+evento vero non risente di un cap più alto, uno che esaurisce i passi sì.
+
+---
+
+## 8. Pulizia
+
+- `frontend/package.json`: modifica `ng serve --host 0.0.0.0` mai committata,
+  mai decisa. Espone il dev server alla LAN.
+- `.gitignore`: `build*/`, `out/`, `*.tmp` sono untracked ma **non ignorati** —
+  un `git add -A` distratto se li porta dentro.
+- `CMakeLists.txt.tmp` e sei directory `build_*/` da rimuovere.
+- Cinque branch integrati su origin, cancellabili.
+- `CLAUDE.md` afferma che `tracer.metal` è caricato da `build/tracer.metal`:
+  **è falso**, il bridge carica `exeDir/../gpu/metal/tracer.metal`, cioè il
+  sorgente.
+
+---
+
+## Trappole incontrate, da non ripetere
+
+**zsh non fa word-splitting.** `ARGS="--a --b"` poi `cmd $ARGS` passa **un solo
+argomento**. Mi ha ingannato tre volte, producendo render coi default e facendomi
+annunciare due regressioni inesistenti. Usare array o flag espliciti; verificare
+con `set -- $VAR; echo $#`.
+
+**Misurare sul disco, non sul frame.** Le statistiche sull'intera immagine sono
+dominate dallo sfondo stellato. Correlare sempre col `.kgeo` filtrando
+`outcome == 1`.
+
+**`grep "fallback"` matcha la riga `Mode:`**, che contiene
+`elliptic-fallback-black=off`. Ha prodotto falsi "nero" su render riusciti.
+Verificare la luminanza reale del PNG.
+
+**Lo shader Metal si carica dal sorgente**, non dalla copia in build. Patchare
+`build_cpu/tracer.metal` non ha alcun effetto.
+
+**Il bisect va fatto per davvero.** Testare due estremi e chiamarlo bisect ha
+prodotto un'attribuzione sbagliata (`d3f28da` invece di `1587f19`), con 16
+commit non esaminati in mezzo.

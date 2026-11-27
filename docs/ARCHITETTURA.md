@@ -3,8 +3,10 @@
 Scopo: capire dov'è cosa senza rileggere 12 000 righe. Se una riga qui contraddice
 il codice, ha ragione il codice — e va corretta questa.
 
-Ultimo allineamento: v0.2.34 + refactor modulare (17 ottobre 2026). Numeri di riga
-e conteggi storici sono indicativi; cercare i simboli nel sorgente.
+Ultimo allineamento: 27 novembre 2026 (dopo le voci D1–D4, B2, A1, A5 dell'audit).
+Numeri di riga e conteggi storici sono indicativi; cercare i simboli nel sorgente.
+Fisica e convenzioni: [FISICA.md](FISICA.md). Stato e backlog:
+[ROADMAP.md](ROADMAP.md). Problemi aperti: [OPEN-ISSUES.md](OPEN-ISSUES.md).
 
 Aggiornamento Metal BL (9 settembre 2026): `geodesic_rhs` nello shader usa
 derivate analitiche della Hamiltoniana, mentre il riferimento CPU conserva
@@ -190,9 +192,28 @@ sbagliava il raggio d'ombra del 5%. Ora `kerrtrace.chart_consistency` lo verific
 sia contro l'altra carta sia contro il valore analitico di Schwarzschild.
 
 Il solver ellittico risolve in forma chiusa solo i colpi diretti sul disco; il cielo
-e i casi limite ricadono sul numerico (~69% dei raggi a `a=0.998`, 1280x720). I
-difetti trovati nel novembre 2026 e i loro test: `CLAUDE.md`, sezione
-elliptic-closed solver.
+e i casi limite ricadono sul numerico (~69% dei raggi a `a=0.998`, 1280x720). Su
+Metal gira anche in carta KS: lo shader controlla solo Q ≈ 0 e Λ ≈ 0.
+
+**Difetti corretti nel novembre 2026 (B2)**, coperti da `kerrtrace.elliptic` e
+`kerrtrace.metal_elliptic`. La diagnosi di aprile ("B75 valuta r sul ramo dopo il
+rimbalzo") era sbagliata; le cause vere:
+- `ellint_F_incomplete` ignorava il quadrante dell'ampiezza: F(π−φ) dava F(φ)
+  invece di 2K−F(φ), e la Region III partiva ~59 M dentro la camera;
+- il quartico radiale è reso monico dividendo per E², ma le frequenze radiali non
+  ripristinavano E: r(τ) e θ(τ) correvano su tempi di Mino diversi (~1,7% su r);
+- solo Metal: segno di cn per u in (2K, 4K), e Durand–Kerner FP32 partito da punti
+  simmetrici che non separava due radici reali vicine;
+- fotoni che cadono nel buco senza punto d'inversione fuori da 1,03 r₊: la mappa
+  proseguiva oltre l'orizzonte; `elliptic_mino_time_to_cut` dà il tempo d'arrivo
+  e un attraversamento successivo ricade sul numerico.
+
+Risultato a 1280×720, a = 0,998, blackbody, pixel con scarto > 2 livelli dal BL
+numerico: CPU 66 693 → 3, Metal 116 715 → 23. Cosa resta: [OPEN-ISSUES.md](OPEN-ISSUES.md).
+
+**Solver semi-analitico (A1)**: in tempo di Mino al secondo ordine, con proiezione
+sugli integrali primi; prima l'82% dei raggi si fermava ai punti d'inversione.
+Coperto da `kerrtrace.separable` e `kerrtrace.metal_separable`.
 
 ---
 
@@ -273,10 +294,15 @@ e tipo in `render.service.ts`).
 ## Build e test
 
 ```bash
-cmake -B build_cpu -DUSE_METAL=OFF && cmake --build build_cpu -j8
-cmake -B build -DUSE_METAL=ON     && cmake --build build -j8
-ctest --test-dir build_cpu
+cmake -B build_rcpu -DUSE_METAL=OFF && cmake --build build_rcpu -j8   # CPU + kerr_tracer_metal
+cmake -B build      -DUSE_METAL=ON  && cmake --build build -j8        # Metal: kerr_tracer
+cmake -B build      -DUSE_CUDA=ON   && cmake --build build -j8        # CUDA (Linux/Windows, nvcc)
+ctest --test-dir build_rcpu && ctest --test-dir build                 # 22 test ciascuna
 ```
+
+Su questa macchina `build_cpu/` è una build vecchia, configurata con un cmake x86
+che non gira più: non usarla (vedi D5). Dopo un build controllare la data del
+binario.
 
 **Quale binario ha Metal.** Con `USE_METAL=ON` è `kerr_tracer`; con `USE_METAL=OFF`
 su macOS è il `kerr_tracer_metal` costruito accanto. Una cartella riconfigurata da
@@ -308,16 +334,36 @@ punta a x86_64, perché cmake stesso può girare sotto Rosetta e mentire.
 
 ---
 
+## Come si lavora
+
+Regole comuni a chiunque modifichi il codice, persona o agente:
+
+1. **Un test che fallisce prima della correzione**, e una verifica che fallisca
+   davvero sul codice vecchio (mutazione o build del commit precedente).
+2. **Una voce, una PR** su `main`, unita quando `build/` e `build_rcpu/` passano.
+   La descrizione dice cosa cambia e con quali numeri.
+3. **Refactor**: impronte identiche (`render_fingerprint.py --compare`) e valori
+   golden invariati. **Cambi voluti della fisica**: `--update` dei golden nello
+   stesso commit, dicendo quali casi si muovono.
+4. **Guardare il frame**, non solo le statistiche, e misurare sulla maschera giusta.
+5. **Riportare le misure come sono**, anche quando smentiscono una diagnosi
+   precedente: lo storico ne conserva diverse, ed è utile proprio per questo.
+
 ## Dove sta scritto cosa
 
 | file | contenuto |
 |---|---|
-| `CLAUDE.md` | fisica, convenzioni, roadmap, note sul solver ellittico |
-| `PLAN-2026-09-05.md` | piano P0–P8 con criteri di verifica |
-| `PROGRESS-P1.md` | diario del campo di Jacobi e dei filtri |
-| `PROGRESS-P2.md` | diario dello sfondo e dei pixel di bordo |
-| `RESOLVED-2026-09-05.md` | difetti chiusi, con le misure |
-| `OPEN-ISSUES.md` | quel che resta |
+| `CLAUDE.md`, `AGENTS.md` | punti d'ingresso brevi per gli agenti, rimandano qui |
+| `docs/ARCHITETTURA.md` | questa mappa: codice, build, test, regole, trappole |
+| `docs/FISICA.md` | formule, convenzioni del codice, riferimenti |
+| `docs/ROADMAP.md` | cosa funziona, backlog con priorità, piano interattivo |
+| `docs/OPEN-ISSUES.md` | problemi aperti oggi |
+| `docs/AUDIT-MIGLIORIE-2026-11-15.md` | audit di fattibilità del backlog (Codex) |
+| `docs/STORICO-PROBLEMI-2026-09.md` | diario delle diagnosi di settembre, misure comprese |
+| `docs/PLAN-2026-09-05.md` | piano P0–P8 con criteri di verifica (storico) |
+| `docs/PROGRESS-P1.md`, `PROGRESS-P2.md` | diari del campo di Jacobi e dello sfondo |
+| `docs/RESOLVED-2026-09-05.md` | difetti chiusi a settembre, con le misure |
+| `docs/*-2026-*.md` | resoconti datati: GPU a 4K, pass-through Metal, contorno |
 
 ---
 
@@ -328,7 +374,10 @@ punta a x86_64, perché cmake stesso può girare sotto Rosetta e mentire.
 2. **Misurare sulla maschera giusta.** Le statistiche sul fotogramma intero sono
    dominate dallo sfondo: a 720p sono 776 000 pixel contro 145 000 di disco. Due
    diagnosi sbagliate sono nate da qui.
-3. **Lo shader si carica dal sorgente**, non dalla build dir.
+3. **Lo shader si carica dal sorgente** (`exeDir/../gpu/metal/tracer.metal`,
+   `metal_renderer.mm`), non dalla build dir: modificare `gpu/metal/tracer.metal`
+   vale al prossimo avvio senza ricompilare, patchare `build*/tracer.metal` non
+   fa nulla.
 4. **`grep "fallback"` matcha la riga `Mode:`**, che contiene
    `elliptic-fallback-black=off`.
 5. **Guardare il frame prima di committare.** Le statistiche possono essere vere
