@@ -137,6 +137,27 @@ void io_tests() {
     check(failed,"PNG writing propagates filesystem errors");
     std::filesystem::remove_all(dir);
 }
+// Disk colour laws (audit C1). Blackbody: T ~ r^-3/4 by default, the thin-disk
+// law, 6500 K at r = 6M; 1/2 still available for old frames. Interstellar: the
+// colour ramp follows T ~ r^-3/4 instead of the linear fraction of the width.
+void colour_law_tests() {
+    ColorParams c;
+    const double T6=disk_colour_temperature(6,1,1,c), T12=disk_colour_temperature(12,1,1,c);
+    check(near(T6,6500,1e-9) && near(T12/T6,std::pow(0.5,0.75),1e-12),
+          "blackbody temperature falls as r^-3/4 from 6500 K at r = 6M");
+    check(near(disk_colour_temperature(6,1,1.3,c),1.3*6500,1e-9),"blackbody temperature scales with g");
+    c.temp_exponent=0.5;
+    check(near(disk_colour_temperature(24,1,1,c)/6500,0.5,1e-12),"legacy exponent 1/2 reproduces sqrt(6M/r)");
+    c=ColorParams{};
+    const double rin=2,rout=12,mid=7;
+    check(near(interstellar_ramp_position(rin,rin,rout,c),0,1e-12) && near(interstellar_ramp_position(rout,rin,rout,c),1,1e-12),
+          "Interstellar ramp spans 0 at r_in to 1 at r_out");
+    const double expected=(1-std::pow(mid/rin,-0.75))/(1-std::pow(rout/rin,-0.75));
+    check(near(interstellar_ramp_position(mid,rin,rout,c),expected,1e-12) && expected>0.5,
+          "Interstellar ramp follows T ~ r^-3/4, past the linear midpoint at mid-width");
+    c.interstellar_ramp_exponent=0;
+    check(near(interstellar_ramp_position(mid,rin,rout,c),0.5,1e-12),"ramp exponent 0 restores the linear ramp");
+}
 void backend_tests() {
     ColorParams c;
     check(!metal_cpu_reason(c,false,false),"Metal accepts supported blackbody shading");
@@ -185,6 +206,6 @@ void cuda_trace_tests() {
 }
 }
 int main() {
-    physics_tests();io_tests();backend_tests();cuda_trace_tests();
+    physics_tests();colour_law_tests();io_tests();backend_tests();cuda_trace_tests();
     return failures?1:0;
 }

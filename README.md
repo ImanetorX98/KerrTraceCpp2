@@ -167,6 +167,11 @@ Useful flags:
 - `--legacy-noise` (CPU only: the pre-v0.3 sin hash for the Interstellar/NASA
   disk texture, to reproduce older frames; the default integer hash gives the
   same bits on CPU and Metal)
+- `--disk-temp-exponent q` (blackbody colour temperature `T ∝ (6M/r)^q`,
+  default `0.75`, the thin-disk law; `0.5` reproduces frames made before 2026-11)
+- `--disk-interstellar-ramp-exponent q` (Interstellar colour ramp placed by a
+  temperature `T ∝ r^-q`, default `0.75`, keeping the white near the inner edge;
+  `0` restores the old linear ramp)
 - `--4k`, `--2k`, `--720p`, `--custom-res W H`
 
 Experimental note:

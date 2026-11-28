@@ -13,9 +13,12 @@ int main() {
         IntegratorControls controls; controls.max_steps=60000;
         int failures=0;
         for (auto chart : {CoordinateChart::BL, CoordinateChart::KS}) {
-            for (bool custom : {false,true}) {
+            for (int variant : {0,1,2}) {
+                const bool custom = variant==1;
                 ColorParams colors;
                 if (custom) { colors.temp_scale=.65; colors.doppler_exp=2; }
+                // Interstellar: its colour ramp exponent must reach the shader too.
+                if (variant==2) colors.palette=DiskPalette::INTERSTELLAR;
                 auto gpu=render_image(width,height,frame,background,false,RaySolverMode::STANDARD,
                     chart,Integrator::RK4_DOUBLING,controls,1,1,0,0,
                     IntersectionMode::HERMITE,0,false,false,false,colors);
@@ -42,9 +45,11 @@ int main() {
                     total+=error; large+=error>20; ++samples;
                 }
                 const double mean=total/std::max(samples,1);
-                std::cout << "Metal chart=" << int(chart) << " custom=" << custom
+                std::cout << "Metal chart=" << int(chart) << " variant=" << variant
                     << " interior=" << samples << " RGB MAE=" << mean << " large=" << large << '\n';
-                if(samples<500 || mean>5 || large>samples*.05) ++failures;
+                // Measured MAE 0.02-0.43; 1.5 still flags a colour law left behind
+                // in the shader (the old r^-1/2 blackbody gives 2.1-5.2).
+                if(samples<500 || mean>1.5 || large>samples*.05) ++failures;
             }
         }
         return failures?1:0;

@@ -425,6 +425,19 @@ static double interstellar_disk_soft_mask(double r, double phi,
     return clamp(inner_mask * outer_mask, 0.0, 1.0);
 }
 
+// Where r sits on the Interstellar colour ramp: 0 at r_in, 1 at r_out. With
+// q > 0 it is the drop of a temperature T ~ r^-q, (1 - (r/r_in)^-q) normalised
+// to its value at r_out; with q = 0, the linear fraction of the disk width.
+static double interstellar_ramp_position(double r, double r_in, double r_out,
+                                         const ColorParams& cp) {
+    const double x = clamp((r - r_in) / std::max(r_out - r_in, 1e-12), 0.0, 1.0);
+    const double q = cp.interstellar_ramp_exponent;
+    if (!(q > 0.0)) return x;
+    const double rr = std::max(r / std::max(r_in, 1e-12), 1.0);
+    const double span = 1.0 - std::pow(std::max(r_out / std::max(r_in, 1e-12), 1.0 + 1e-9), -q);
+    return clamp((1.0 - std::pow(rr, -q)) / span, 0.0, 1.0);
+}
+
 // Interstellar cinematic disk coloring (artist-driven):
 // annulus mask + radial emissivity + differential rotation advection +
 // stretched turbulence + logarithmic radial bands + warm HDR palette.
@@ -480,11 +493,12 @@ static RGB disk_colour_interstellar(double r, double phi,
                  out_g   = clamp(cp.interstellar_outer_g, 0.0, 1.0),
                  out_b   = clamp(cp.interstellar_outer_b, 0.0, 1.0);
 
-    const double t1 = smoothstep_range(0.08, 0.38, x);
+    const double xc = interstellar_ramp_position(r, r_in, r_out, cp);
+    const double t1 = smoothstep_range(0.08, 0.38, xc);
     double cr = inner_r + (mid_r - inner_r) * t1;
     double cg = inner_g + (mid_g - inner_g) * t1;
     double cb = inner_b + (mid_b - inner_b) * t1;
-    const double t2 = smoothstep_range(0.35, 1.0, x);
+    const double t2 = smoothstep_range(0.35, 1.0, xc);
     cr += (out_r - cr) * t2;
     cg += (out_g - cg) * t2;
     cb += (out_b - cb) * t2;
@@ -609,6 +623,12 @@ static RGB disk_colour_interstellar_nasa(double r, double phi,
     };
 }
 
+// Blackbody colour temperature: 6500 K at r = 6M for g = 1, times (6M/r)^exponent
+// (3/4 by default, see ColorParams::temp_exponent) and the redshift g.
+static double disk_colour_temperature(double r, double M, double g, const ColorParams& cp) {
+    return 6500.0 * cp.temp_scale * std::pow(6.0*M/std::max(r, 1e-12), cp.temp_exponent) * g;
+}
+
 static RGB disk_colour(double r, double red, double magnif,
                        double M, double a, double r_isco, double r_disk_out,
                        const ColorParams& cp,
@@ -623,7 +643,7 @@ static RGB disk_colour(double r, double red, double magnif,
     const double red_phys = cp.temp_redshift_clamp
         ? clamp(red, cp.temp_redshift_floor, 5.0)
         : std::max(red, 0.0);
-    double T = 6500.0 * cp.temp_scale * std::sqrt(6.0*M/r) * red_phys;
+    double T = disk_colour_temperature(r, M, red_phys, cp);
     const double flux = disk_flux_raw(r, r_isco, a, cp);
     const double safe_ref = std::max(1.0e-12, flux_ref);
     double I = flux / safe_ref;

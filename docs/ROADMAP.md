@@ -36,13 +36,12 @@ quando le due suite (`build/` Metal, `build_rcpu/` CPU) passano.
 
 ## Backlog
 
-Fatte: D1, D3, B2, A1, D2, A5 (PR #1–#5), D4 (questa riorganizzazione).
+Fatte: D1, D3, B2, A1, D2, A5, D4 (PR #1–#6), C1 (temperatura r^-3/4 nel corpo nero e rampa Interstellar).
 
 | ID | voce | effort | note |
 |---|---|---|---|
 | D5 | inventario e pulizia di build e rami vecchi | S | mostrare l'elenco prima di cancellare; tenere `falling-camera-wip` |
 | C3 | significato di `magnif` (determinante grezzo della mappa angolare) | S–M | validare contro raggi vicini, non imporre mediana ≈ 1 |
-| C1 | temperatura del disco r^-0,5 → r^-0,75 | M | opzione di profilo con legacy riproducibile |
 | B4 | export NumPy integrato nella CLI | M | oggi c'è `kgeo_to_npy` |
 | A3 | palette NASA e stratificata su Metal | M / L | |
 | A2 | blackbody Metal "slavato" | M diagnosi | non riprodotto: prima un caso |

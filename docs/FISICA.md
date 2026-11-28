@@ -50,6 +50,14 @@ Jacobi matrix `W[:,0]` = deviation in α, `W[:,1]` = deviation in β.
 `|det J|` at disk crossing → magnification → flux correction.
 Reference: James et al. (2015) CQG 32 065001.
 
+### Disk colour temperature
+Blackbody palette: `T = 6500 K · temp_scale · (6M/r)^q · g`, with `q = 3/4` by
+default: for a thin disk `σT⁴ = F ∝ r^-3` away from the inner edge, so
+`T ∝ r^-3/4`. Before 2026-11 the code used `q = 1/2` (`--disk-temp-exponent 0.5`).
+The luminosity uses the radial flux profile, not this temperature. The
+Interstellar palette has no temperature, but its colour ramp is placed by the
+same law (`interstellar_ramp_position`, `q = 3/4`; `0` = linear in radius).
+
 ### Disk redshift
 Full formula (Bardeen 1972):
 `g = ν_obs/ν_emit = u_obs^t · √(−g_tt−2g_tφΩ−g_φφΩ²) / (1−Ω·b)`

@@ -17,6 +17,14 @@ struct ColorParams {
     double exposure    = 1.0;   // intensity multiplier before tonemapping
     double gamma       = 2.2;   // gamma correction exponent
     double temp_scale  = 1.0;   // disk blackbody temperature scale
+    // Blackbody colour temperature T = 6500 K * temp_scale * (6M/r)^temp_exponent * g.
+    // 3/4 is the thin-disk law (T^4 ~ F ~ r^-3 away from the inner edge); frames
+    // made before 2026-11 used 1/2 (--disk-temp-exponent 0.5).
+    double temp_exponent = 0.75;
+    // Interstellar colour ramp (warm white -> orange -> outer colour): placed by a
+    // temperature T ~ r^-q, so the white stays near the inner edge. 0 = the old
+    // linear ramp in radius (--disk-interstellar-ramp-exponent 0).
+    double interstellar_ramp_exponent = 0.75;
     // A redshifted blackbody is still a blackbody, at T_obs = g * T_emit, so the
     // colour temperature should follow g all the way down. The old code floored g
     // at 0.2 before that multiplication, which rendered the innermost, most
