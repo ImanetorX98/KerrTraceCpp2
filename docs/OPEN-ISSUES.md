@@ -5,13 +5,10 @@ Solo ciò che è aperto oggi, con un rimando alla voce del backlog in
 le misure nel commit o nella PR. Il diario storico con le diagnosi è in
 [STORICO-PROBLEMI-2026-09.md](STORICO-PROBLEMI-2026-09.md).
 
-Ultimo allineamento: 27 novembre 2026.
+Ultimo allineamento: 28 novembre 2026.
 
 ## Fisica e resa
 
-- **Temperatura di colore del disco** (C1). Il blackbody usa `T ∝ r^-0,5`; con
-  flusso `F ∝ r^-3` la fisica dà `r^-0,75`. La luminosità usa già il flusso
-  corretto. Disco esterno troppo caldo.
 - **Verso di rotazione a `a = 0`** (C2). Il segno di Ω segue quello di a: animando
   lo spin attraverso lo zero il disco si ribalta.
 - **Residui Metal sul bordo del disco visto di taglio** (A6): 21 pixel con errore

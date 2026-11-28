@@ -221,7 +221,9 @@ static std::vector<RGB> render_image(
                            (float)cp.temp_scale, (float)cp.doppler_exp,
                            cp.temp_redshift_clamp ? 1 : 0, (float)cp.temp_redshift_floor,
                            (float)g.static_observer_ut(cam.r_obs, cam.theta_obs),
-                           (float)cp.interstellar_inner_taper_scale};
+                           (float)cp.interstellar_inner_taper_scale,
+                           (float)cp.temp_exponent,
+                           (float)cp.interstellar_ramp_exponent};
         const uint8_t* bg_ptr = bg.px.empty() ? nullptr : bg.px.data();
         const int bg_w = bg.px.empty() ? 0 : bg.w;
         const int bg_h = bg.px.empty() ? 0 : bg.h;

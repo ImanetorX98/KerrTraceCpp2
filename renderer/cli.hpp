@@ -209,6 +209,8 @@ static int run_cli(int argc, char** argv) {
         if (arg=="--exposure"   && i+1<argc) cp.exposure   = std::stod(argv[++i]);
         if (arg=="--gamma"      && i+1<argc) cp.gamma      = std::stod(argv[++i]);
         if (arg=="--temp-scale" && i+1<argc) cp.temp_scale = std::stod(argv[++i]);
+        if (arg=="--disk-temp-exponent" && i+1<argc) cp.temp_exponent = std::stod(argv[++i]);
+        if (arg=="--disk-interstellar-ramp-exponent" && i+1<argc) cp.interstellar_ramp_exponent = std::stod(argv[++i]);
         if (arg=="--disk-brightness" && i+1<argc) cli_disk_brightness = std::stod(argv[++i]);
         if (arg=="--disk-opacity" && i+1<argc) cli_disk_opacity = std::stod(argv[++i]);
         if (arg=="--disk-blackbody")    cp.palette = DiskPalette::BLACKBODY;

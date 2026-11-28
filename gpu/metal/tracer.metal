@@ -122,6 +122,8 @@ struct CameraParams {
     float temp_redshift_floor;
     float observer_ut;
     float interstellar_inner_taper_scale;
+    float temp_exponent;              // blackbody T ~ (6M/r)^temp_exponent
+    float interstellar_ramp_exponent; // colour ramp by T ~ r^-q; 0 = linear
 };
 
 struct RenderParams {
@@ -2038,11 +2040,18 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
         const float out_g = clamp(cp.interstellar_outer_g, 0.0f, 1.0f);
         const float out_b = clamp(cp.interstellar_outer_b, 0.0f, 1.0f);
 
-        const float t1 = smoothstep_range_f(0.08f, 0.38f, x);
+        // Mirrors interstellar_ramp_position (renderer/palettes.hpp).
+        float xc = x;
+        if (cp.interstellar_ramp_exponent > 0.0f) {
+            const float q = cp.interstellar_ramp_exponent;
+            const float span = 1.0f - pow(max(r_out / r_in, 1.0f + 1e-6f), -q);
+            xc = clamp((1.0f - pow(max(r_hit / r_in, 1.0f), -q)) / span, 0.0f, 1.0f);
+        }
+        const float t1 = smoothstep_range_f(0.08f, 0.38f, xc);
         float cr = inner_r + (mid_r - inner_r) * t1;
         float cg = inner_g + (mid_g - inner_g) * t1;
         float cb = inner_b + (mid_b - inner_b) * t1;
-        const float t2 = smoothstep_range_f(0.35f, 1.0f, x);
+        const float t2 = smoothstep_range_f(0.35f, 1.0f, xc);
         cr += (out_r - cr) * t2;
         cg += (out_g - cg) * t2;
         cb += (out_b - cb) * t2;
@@ -2074,7 +2083,7 @@ static uint32_t disk_color_abgr(float r_hit, float phi_hit,
 
     const float red_temperature = cp.temp_redshift_clamp != 0
         ? clamp(red, cp.temp_redshift_floor, 5.0f) : max(0.0f, red);
-    const float T = 6500.0f * cp.temp_scale * sqrt(6.0f*M/r_hit) * red_temperature;
+    const float T = 6500.0f * cp.temp_scale * pow(6.0f*M/r_hit, cp.temp_exponent) * red_temperature;
     float I = disk_flux_norm_f(r_hit, r_isco, a, cp);
     I = max(I, inner_emission_floor_value_f(r_hit, r_isco, r_disk_out, cp));
     I *= doppler_intensity_scale(red, cp.enable_doppler, cp.doppler_exp);

@@ -74,6 +74,8 @@ struct CameraParams_C {
     float temp_redshift_floor;
     float observer_ut;
     float interstellar_inner_taper_scale;
+    float temp_exponent;              // blackbody T ~ (6M/r)^temp_exponent
+    float interstellar_ramp_exponent; // colour ramp by T ~ r^-q; 0 = linear
 };
 
 /// Renders the image on the default Metal GPU device.
